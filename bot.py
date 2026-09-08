@@ -49,14 +49,8 @@ REVERT_RISK_API = (
 # LIMITES
 # =========================================================
 
-# Primeiro filtro:
-# só buscamos o diff quando o modelo Wikimedia
-# considera a edição bastante suspeita.
 REVERT_RISK_THRESHOLD = 0.85
-
-# Score final necessário para publicar.
 VANDALISM_THRESHOLD = 0.80
-
 MAX_DIFF_CHARS = 6000
 
 
@@ -81,10 +75,13 @@ HEADERS = {
 
 
 # =========================================================
-# TELEGRAM
+# TELEGRAM - ENVIO
 # =========================================================
 
-def send_telegram_message(text):
+def send_telegram_message(text, chat_id=None):
+
+    if chat_id is None:
+        chat_id = TELEGRAM_CHANNEL
 
     while True:
 
@@ -93,7 +90,7 @@ def send_telegram_message(text):
             response = requests.post(
                 f"{TELEGRAM_API}/sendMessage",
                 json={
-                    "chat_id": TELEGRAM_CHANNEL,
+                    "chat_id": chat_id,
                     "text": text,
                     "disable_web_page_preview": True
                 },
@@ -151,8 +148,124 @@ def telegram_sender():
 
             telegram_queue.task_done()
 
-        # Nunca envia mais de uma mensagem por segundo.
         time.sleep(1)
+
+
+# =========================================================
+# TELEGRAM - COMANDOS
+# =========================================================
+
+def telegram_command_listener():
+
+    offset = None
+
+    print(
+        "Listener de comandos Telegram iniciado."
+    )
+
+    while True:
+
+        try:
+
+            params = {
+                "timeout": 30
+            }
+
+            if offset is not None:
+                params["offset"] = offset
+
+            response = requests.get(
+                f"{TELEGRAM_API}/getUpdates",
+                params=params,
+                timeout=40
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            for update in data.get(
+                "result",
+                []
+            ):
+
+                offset = (
+                    update["update_id"]
+                    + 1
+                )
+
+                message = update.get(
+                    "message"
+                )
+
+                if not message:
+                    continue
+
+                text = message.get(
+                    "text",
+                    ""
+                )
+
+                chat = message.get(
+                    "chat",
+                    {}
+                )
+
+                chat_id = chat.get(
+                    "id"
+                )
+
+                if not chat_id:
+                    continue
+
+
+                # /start
+
+                if text.startswith(
+                    "/start"
+                ):
+
+                    send_telegram_message(
+                        (
+                            "🤖 Bot de monitoramento da "
+                            "Wikipédia em português ativo.\n\n"
+                            "Acompanho edições em tempo real "
+                            "e publico no @ptwiki aquelas "
+                            "consideradas possíveis vandalismos."
+                        ),
+                        chat_id=chat_id
+                    )
+
+
+                # /status
+
+                elif text.startswith(
+                    "/status"
+                ):
+
+                    send_telegram_message(
+                        (
+                            "✅ Bot online.\n\n"
+                            f"Canal: {TELEGRAM_CHANNEL}\n"
+                            f"Revert Risk mínimo: "
+                            f"{REVERT_RISK_THRESHOLD:.0%}\n"
+                            f"Score mínimo final: "
+                            f"{VANDALISM_THRESHOLD:.0%}\n"
+                            f"Fila de análise: "
+                            f"{analysis_queue.qsize()}"
+                        ),
+                        chat_id=chat_id
+                    )
+
+
+        except Exception as e:
+
+            print(
+                "Erro no listener Telegram:",
+                e
+            )
+
+            time.sleep(5)
 
 
 # =========================================================
@@ -184,7 +297,7 @@ def clean_html(text):
 
 
 # =========================================================
-# BUSCA O DIFF DA EDIÇÃO
+# BUSCA O DIFF
 # =========================================================
 
 def get_revision_diff(
@@ -524,7 +637,6 @@ def analyze_vandalism(
     )
 
 
-    # Revert Risk tem maior peso.
     score = (
         revert_risk * 0.75
         +
@@ -604,7 +716,7 @@ def analyze_vandalism(
 
 
 # =========================================================
-# FORMATA A MENSAGEM DO TELEGRAM
+# FORMATA MENSAGEM
 # =========================================================
 
 def format_message(
@@ -707,8 +819,6 @@ def analysis_worker():
                 continue
 
 
-            # Primeiro consulta o modelo da Wikimedia.
-
             revert_risk = get_revert_risk(
                 new_revision
             )
@@ -725,9 +835,6 @@ def analysis_worker():
                 change.get("title")
             )
 
-
-            # Edições de baixo risco são descartadas
-            # antes de buscarmos o diff.
 
             if (
                 revert_risk
@@ -846,8 +953,6 @@ def wikimedia_loop():
                     continue
 
 
-                # Apenas Wikipédia em português.
-
                 if (
                     change.get("wiki")
                     !=
@@ -856,8 +961,6 @@ def wikimedia_loop():
                     continue
 
 
-                # Apenas edições.
-
                 if (
                     change.get("type")
                     !=
@@ -865,8 +968,6 @@ def wikimedia_loop():
                 ):
                     continue
 
-
-                # Ignora edições marcadas como bot.
 
                 if change.get(
                     "bot",
@@ -942,7 +1043,6 @@ def main():
         daemon=True
     )
 
-
     telegram_thread.start()
 
 
@@ -951,8 +1051,15 @@ def main():
         daemon=True
     )
 
-
     analysis_thread.start()
+
+
+    command_thread = threading.Thread(
+        target=telegram_command_listener,
+        daemon=True
+    )
+
+    command_thread.start()
 
 
     wikimedia_loop()
