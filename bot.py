@@ -50,7 +50,7 @@ REVERT_RISK_API = (
 # =========================================================
 
 REVERT_RISK_THRESHOLD = 0.85
-VANDALISM_THRESHOLD = 0.80
+VANDALISM_THRESHOLD = 0.75
 MAX_DIFF_CHARS = 6000
 
 
