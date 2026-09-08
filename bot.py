@@ -1,74 +1,961 @@
 import os
+import json
+import time
+import queue
+import threading
+import re
+import html
+
 import requests
-
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-
-if not TOKEN:
-    raise RuntimeError("A variável TELEGRAM_BOT_TOKEN não foi configurada.")
-
-API_URL = f"https://api.telegram.org/bot{TOKEN}"
+from sseclient import SSEClient
 
 
-def get_updates():
-    response = requests.get(
-        f"{API_URL}/getUpdates",
-        timeout=30
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+TELEGRAM_CHANNEL = os.environ.get(
+    "TELEGRAM_CHANNEL_ID",
+    "@ptwiki"
+)
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError(
+        "TELEGRAM_BOT_TOKEN não configurado."
     )
-    response.raise_for_status()
-    return response.json()
 
 
-def send_message(chat_id, text):
-    response = requests.post(
-        f"{API_URL}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text
-        },
-        timeout=30
+TELEGRAM_API = (
+    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+)
+
+WIKIMEDIA_STREAM = (
+    "https://stream.wikimedia.org/v2/stream/recentchange"
+)
+
+WIKIPEDIA_API = (
+    "https://pt.wikipedia.org/w/api.php"
+)
+
+REVERT_RISK_API = (
+    "https://api.wikimedia.org/service/lw/inference/v1/"
+    "models/revertrisk-multilingual:predict"
+)
+
+
+# =========================================================
+# LIMITES
+# =========================================================
+
+# Primeiro filtro:
+# só buscamos o diff quando o modelo Wikimedia
+# considera a edição bastante suspeita.
+REVERT_RISK_THRESHOLD = 0.85
+
+# Score final necessário para publicar.
+VANDALISM_THRESHOLD = 0.80
+
+MAX_DIFF_CHARS = 6000
+
+
+# =========================================================
+# FILAS
+# =========================================================
+
+analysis_queue = queue.Queue()
+telegram_queue = queue.Queue()
+
+
+# =========================================================
+# USER AGENT
+# =========================================================
+
+HEADERS = {
+    "User-Agent": (
+        "PtWikiVandalismTelegramBot/1.0 "
+        "(https://t.me/ptwiki)"
     )
-    response.raise_for_status()
+}
 
 
-def main():
-    print("Bot iniciado.")
+# =========================================================
+# TELEGRAM
+# =========================================================
 
-    last_update_id = None
+def send_telegram_message(text):
 
     while True:
-        params = {
-            "timeout": 30
-        }
 
-        if last_update_id is not None:
-            params["offset"] = last_update_id + 1
+        try:
 
-        response = requests.get(
-            f"{API_URL}/getUpdates",
-            params=params,
-            timeout=35
-        )
+            response = requests.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_CHANNEL,
+                    "text": text,
+                    "disable_web_page_preview": True
+                },
+                timeout=30
+            )
 
-        response.raise_for_status()
-        data = response.json()
+            if response.status_code == 429:
 
-        for update in data.get("result", []):
-            last_update_id = update["update_id"]
+                data = response.json()
 
-            message = update.get("message")
-            if not message:
+                retry_after = data.get(
+                    "parameters",
+                    {}
+                ).get(
+                    "retry_after",
+                    2
+                )
+
+                print(
+                    f"Rate limit Telegram. "
+                    f"Aguardando {retry_after}s."
+                )
+
+                time.sleep(retry_after)
+
                 continue
 
-            chat_id = message["chat"]["id"]
-            text = message.get("text", "")
+            response.raise_for_status()
 
-            if text == "/start":
-                send_message(
-                    chat_id,
-                    "Olá! 👋\n\n"
-                    "Estou conectado ao Telegram.\n"
-                    "Em breve vou acompanhar as edições da Wikipédia em tempo real."
+            return
+
+        except Exception as e:
+
+            print(
+                "Erro Telegram:",
+                e
+            )
+
+            time.sleep(5)
+
+
+def telegram_sender():
+
+    while True:
+
+        message = telegram_queue.get()
+
+        try:
+
+            send_telegram_message(
+                message
+            )
+
+        finally:
+
+            telegram_queue.task_done()
+
+        # Nunca envia mais de uma mensagem por segundo.
+        time.sleep(1)
+
+
+# =========================================================
+# LIMPEZA DO HTML DO DIFF
+# =========================================================
+
+def clean_html(text):
+
+    if not text:
+        return ""
+
+    text = re.sub(
+        r"<[^>]+>",
+        " ",
+        text
+    )
+
+    text = html.unescape(
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+# =========================================================
+# BUSCA O DIFF DA EDIÇÃO
+# =========================================================
+
+def get_revision_diff(
+    old_revision,
+    new_revision
+):
+
+    params = {
+        "action": "compare",
+        "format": "json",
+        "formatversion": 2,
+        "fromrev": old_revision,
+        "torev": new_revision,
+        "prop": "diff"
+    }
+
+    response = requests.get(
+        WIKIPEDIA_API,
+        params=params,
+        headers=HEADERS,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    compare = data.get(
+        "compare",
+        {}
+    )
+
+    diff_html = compare.get(
+        "body",
+        ""
+    )
+
+    if not diff_html:
+
+        return {
+            "added": "",
+            "removed": ""
+        }
+
+
+    added_matches = re.findall(
+        r'<td class="diff-addedline"[^>]*>(.*?)</td>',
+        diff_html,
+        flags=re.I | re.S
+    )
+
+
+    removed_matches = re.findall(
+        r'<td class="diff-deletedline"[^>]*>(.*?)</td>',
+        diff_html,
+        flags=re.I | re.S
+    )
+
+
+    added = "\n".join(
+        clean_html(x)
+        for x in added_matches
+    )
+
+
+    removed = "\n".join(
+        clean_html(x)
+        for x in removed_matches
+    )
+
+
+    return {
+        "added": added[:MAX_DIFF_CHARS],
+        "removed": removed[:MAX_DIFF_CHARS]
+    }
+
+
+# =========================================================
+# MODELO REVERT RISK DA WIKIMEDIA
+# =========================================================
+
+def get_revert_risk(revision_id):
+
+    try:
+
+        response = requests.post(
+            REVERT_RISK_API,
+            headers={
+                **HEADERS,
+                "Content-Type": "application/json"
+            },
+            json={
+                "rev_id": revision_id,
+                "lang": "pt"
+            },
+            timeout=30
+        )
+
+
+        if response.status_code == 429:
+
+            print(
+                "Rate limit do Wikimedia Lift Wing."
+            )
+
+            return None
+
+
+        response.raise_for_status()
+
+        data = response.json()
+
+
+        probability = (
+            data
+            .get("output", {})
+            .get("probabilities", {})
+            .get("true")
+        )
+
+
+        if probability is None:
+
+            print(
+                "Resposta inesperada do Lift Wing:",
+                data
+            )
+
+            return None
+
+
+        return float(
+            probability
+        )
+
+
+    except Exception as e:
+
+        print(
+            "Erro no Lift Wing:",
+            e
+        )
+
+        return None
+
+
+# =========================================================
+# REGRAS AUXILIARES
+# =========================================================
+
+BAD_WORDS = [
+    "merda",
+    "porra",
+    "caralho",
+    "bosta",
+    "foda-se",
+    "fdp",
+    "idiota",
+    "imbecil",
+    "otário",
+    "otario",
+    "vagabundo"
+]
+
+
+def profanity_score(text):
+
+    text = text.lower()
+
+    count = sum(
+        1
+        for word in BAD_WORDS
+        if word in text
+    )
+
+
+    if count >= 3:
+        return 1.0
+
+    if count == 2:
+        return 0.90
+
+    if count == 1:
+        return 0.75
+
+    return 0.0
+
+
+def repetition_score(text):
+
+    if not text:
+        return 0.0
+
+
+    patterns = [
+        r"(.)\1{8,}",
+        r"[!?]{8,}",
+        r"\b(\w{2,5})\1{4,}\b",
+        r"(ha){6,}",
+        r"(kk){4,}"
+    ]
+
+
+    for pattern in patterns:
+
+        if re.search(
+            pattern,
+            text.lower()
+        ):
+
+            return 0.95
+
+
+    return 0.0
+
+
+def destructive_score(
+    added,
+    removed
+):
+
+    added_len = len(
+        added.strip()
+    )
+
+    removed_len = len(
+        removed.strip()
+    )
+
+
+    if (
+        removed_len > 1500
+        and
+        added_len < 100
+    ):
+        return 0.95
+
+
+    if (
+        removed_len > 700
+        and
+        added_len < 60
+    ):
+        return 0.85
+
+
+    if (
+        removed_len > 300
+        and
+        added_len < 20
+    ):
+        return 0.75
+
+
+    return 0.0
+
+
+def nonsense_score(text):
+
+    text = text.strip()
+
+    if not text:
+        return 0.0
+
+
+    if len(text) >= 10:
+
+        alphabetic = sum(
+            1
+            for character in text
+            if character.isalpha()
+        )
+
+        ratio = (
+            alphabetic /
+            len(text)
+        )
+
+
+        if ratio < 0.25:
+
+            return 0.80
+
+
+    return 0.0
+
+
+# =========================================================
+# CLASSIFICAÇÃO FINAL
+# =========================================================
+
+def analyze_vandalism(
+    change,
+    diff,
+    revert_risk
+):
+
+    added = diff.get(
+        "added",
+        ""
+    )
+
+    removed = diff.get(
+        "removed",
+        ""
+    )
+
+
+    profanity = profanity_score(
+        added
+    )
+
+    repetition = repetition_score(
+        added
+    )
+
+    destructive = destructive_score(
+        added,
+        removed
+    )
+
+    nonsense = nonsense_score(
+        added
+    )
+
+
+    signals = [
+        profanity,
+        repetition,
+        destructive,
+        nonsense
+    ]
+
+
+    heuristic = max(
+        signals
+    )
+
+
+    # Revert Risk tem maior peso.
+    score = (
+        revert_risk * 0.75
+        +
+        heuristic * 0.25
+    )
+
+
+    strong_signals = sum(
+        1
+        for signal in signals
+        if signal >= 0.75
+    )
+
+
+    if strong_signals >= 2:
+
+        score += 0.08
+
+
+    score = min(
+        score,
+        1.0
+    )
+
+
+    reasons = []
+
+
+    if revert_risk >= 0.90:
+
+        reasons.append(
+            "alto risco de reversão"
+        )
+
+
+    if profanity >= 0.75:
+
+        reasons.append(
+            "linguagem ofensiva"
+        )
+
+
+    if repetition >= 0.75:
+
+        reasons.append(
+            "repetição anormal"
+        )
+
+
+    if destructive >= 0.75:
+
+        reasons.append(
+            "remoção potencialmente destrutiva"
+        )
+
+
+    if nonsense >= 0.75:
+
+        reasons.append(
+            "texto possivelmente sem sentido"
+        )
+
+
+    if not reasons:
+
+        reasons.append(
+            "edição considerada suspeita pelo modelo"
+        )
+
+
+    return {
+        "score": score,
+        "revert_risk": revert_risk,
+        "heuristic": heuristic,
+        "reason": ", ".join(reasons)
+    }
+
+
+# =========================================================
+# FORMATA A MENSAGEM DO TELEGRAM
+# =========================================================
+
+def format_message(
+    change,
+    result
+):
+
+    title = change.get(
+        "title",
+        "Sem título"
+    )
+
+    user = change.get(
+        "user",
+        "Desconhecido"
+    )
+
+    comment = (
+        change.get("comment")
+        or
+        "Sem resumo"
+    )
+
+
+    revision = change.get(
+        "revision",
+        {}
+    )
+
+
+    old_revision = revision.get(
+        "old"
+    )
+
+    new_revision = revision.get(
+        "new"
+    )
+
+
+    final_score = round(
+        result["score"] * 100
+    )
+
+
+    revert_score = round(
+        result["revert_risk"] * 100
+    )
+
+
+    diff_url = (
+        "https://pt.wikipedia.org/w/index.php"
+        f"?diff={new_revision}"
+        f"&oldid={old_revision}"
+    )
+
+
+    return (
+        f"🚨 Possível vandalismo — {final_score}%\n\n"
+        f"📝 {title}\n"
+        f"👤 {user}\n"
+        f"💬 {comment}\n\n"
+        f"🤖 Risco de reversão Wikimedia: "
+        f"{revert_score}%\n"
+        f"⚠️ Sinais: {result['reason']}\n\n"
+        f"🔗 {diff_url}"
+    )
+
+
+# =========================================================
+# WORKER DE ANÁLISE
+# =========================================================
+
+def analysis_worker():
+
+    while True:
+
+        change = analysis_queue.get()
+
+        try:
+
+            revision = change.get(
+                "revision",
+                {}
+            )
+
+
+            old_revision = revision.get(
+                "old"
+            )
+
+            new_revision = revision.get(
+                "new"
+            )
+
+
+            if not old_revision:
+                continue
+
+            if not new_revision:
+                continue
+
+
+            # Primeiro consulta o modelo da Wikimedia.
+
+            revert_risk = get_revert_risk(
+                new_revision
+            )
+
+
+            if revert_risk is None:
+                continue
+
+
+            print(
+                "Revert Risk:",
+                f"{revert_risk:.0%}",
+                "|",
+                change.get("title")
+            )
+
+
+            # Edições de baixo risco são descartadas
+            # antes de buscarmos o diff.
+
+            if (
+                revert_risk
+                <
+                REVERT_RISK_THRESHOLD
+            ):
+                continue
+
+
+            diff = get_revision_diff(
+                old_revision,
+                new_revision
+            )
+
+
+            result = analyze_vandalism(
+                change,
+                diff,
+                revert_risk
+            )
+
+
+            print(
+                "Score final:",
+                f"{result['score']:.0%}",
+                "|",
+                change.get("title")
+            )
+
+
+            if (
+                result["score"]
+                >=
+                VANDALISM_THRESHOLD
+            ):
+
+                message = format_message(
+                    change,
+                    result
                 )
+
+
+                telegram_queue.put(
+                    message
+                )
+
+
+                print(
+                    "🚨 Possível vandalismo enviado:",
+                    change.get("title")
+                )
+
+
+        except Exception as e:
+
+            print(
+                "Erro na análise:",
+                e
+            )
+
+
+        finally:
+
+            analysis_queue.task_done()
+
+
+# =========================================================
+# WIKIMEDIA EVENTSTREAMS
+# =========================================================
+
+def wikimedia_loop():
+
+    while True:
+
+        try:
+
+            print(
+                "Conectando ao Wikimedia EventStreams..."
+            )
+
+
+            response = requests.get(
+                WIKIMEDIA_STREAM,
+                headers=HEADERS,
+                stream=True,
+                timeout=90
+            )
+
+
+            response.raise_for_status()
+
+
+            client = SSEClient(
+                response
+            )
+
+
+            print(
+                "✅ EventStreams conectado."
+            )
+
+
+            for event in client.events():
+
+                if not event.data:
+                    continue
+
+
+                try:
+
+                    change = json.loads(
+                        event.data
+                    )
+
+                except json.JSONDecodeError:
+                    continue
+
+
+                # Apenas Wikipédia em português.
+
+                if (
+                    change.get("wiki")
+                    !=
+                    "ptwiki"
+                ):
+                    continue
+
+
+                # Apenas edições.
+
+                if (
+                    change.get("type")
+                    !=
+                    "edit"
+                ):
+                    continue
+
+
+                # Ignora edições marcadas como bot.
+
+                if change.get(
+                    "bot",
+                    False
+                ):
+                    continue
+
+
+                analysis_queue.put(
+                    change
+                )
+
+
+                print(
+                    "Nova edição:",
+                    change.get("title"),
+                    "| Fila:",
+                    analysis_queue.qsize()
+                )
+
+
+        except Exception as e:
+
+            print(
+                "EventStreams desconectado:",
+                e
+            )
+
+
+            print(
+                "Reconectando em 5 segundos..."
+            )
+
+
+            time.sleep(5)
+
+
+# =========================================================
+# INICIALIZAÇÃO
+# =========================================================
+
+def main():
+
+    print(
+        "================================="
+    )
+
+    print(
+        "Detector de vandalismo ptwiki"
+    )
+
+    print(
+        "Modelo: Wikimedia Revert Risk"
+    )
+
+    print(
+        "Canal:",
+        TELEGRAM_CHANNEL
+    )
+
+    print(
+        "Threshold:",
+        f"{VANDALISM_THRESHOLD:.0%}"
+    )
+
+    print(
+        "================================="
+    )
+
+
+    telegram_thread = threading.Thread(
+        target=telegram_sender,
+        daemon=True
+    )
+
+
+    telegram_thread.start()
+
+
+    analysis_thread = threading.Thread(
+        target=analysis_worker,
+        daemon=True
+    )
+
+
+    analysis_thread.start()
+
+
+    wikimedia_loop()
 
 
 if __name__ == "__main__":
