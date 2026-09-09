@@ -8,6 +8,7 @@ import html
 import ipaddress
 
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import requests
 from sseclient import SSEClient
@@ -17,7 +18,9 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN"
+)
 
 TELEGRAM_CHANNEL = os.environ.get(
     "TELEGRAM_CHANNEL_ID",
@@ -49,40 +52,51 @@ REVERT_RISK_API = (
 
 
 # =========================================================
-# LIMITES DE DETECÇÃO
+# DETECÇÃO
 # =========================================================
 
-# A partir deste valor o bot busca o diff.
 REVERT_RISK_THRESHOLD = 0.35
 
-# Score final mínimo para postagem.
 VANDALISM_THRESHOLD = 0.55
 
 MAX_DIFF_CHARS = 6000
 
 
 # =========================================================
-# FILTRO DE USUÁRIOS
+# FILTRO DE CONTAS
 # =========================================================
 
-# Contas com MAIS de 30 dias são ignoradas.
+# Mais de 30 dias -> edição normal ignorada.
 MAX_ACCOUNT_AGE_DAYS = 30
 
-# Contas com MAIS de 10 edições são ignoradas.
+# Mais de 10 edições -> edição normal ignorada.
 MAX_USER_EDITS = 10
 
-# Cache das informações das contas.
 USER_CACHE_SECONDS = 3600
 
 user_cache = {}
 
 
 # =========================================================
+# PÁGINAS VIGIADAS
+# =========================================================
+
+# Para persistência no Railway,
+# monte um Volume em /data.
+WATCHLIST_FILE = os.environ.get(
+    "WATCHLIST_FILE",
+    "/data/watchlist.json"
+)
+
+watched_pages = set()
+
+watchlist_lock = threading.Lock()
+
+
+# =========================================================
 # WATCHDOG
 # =========================================================
 
-# Se não chegar nenhum evento GLOBAL da Wikimedia
-# durante 120 segundos, tenta reconectar.
 STREAM_STALL_SECONDS = 120
 
 
@@ -114,7 +128,7 @@ current_stream_response = None
 
 HEADERS = {
     "User-Agent": (
-        "PtWikiVandalismTelegramBot/1.2 "
+        "PtWikiVandalismTelegramBot/1.3 "
         "(https://t.me/ptwiki)"
     )
 }
@@ -147,15 +161,16 @@ def format_age(timestamp):
     hours = minutes // 60
     remaining_minutes = minutes % 60
 
-    return (
-        f"há {hours}h "
-        f"{remaining_minutes}min"
-    )
+    if hours < 24:
+        return (
+            f"há {hours}h "
+            f"{remaining_minutes}min"
+        )
 
+    days = hours // 24
 
-# =========================================================
-# IDENTIFICA IP
-# =========================================================
+    return f"há {days} dias"
+
 
 def is_ip_address(username):
 
@@ -176,31 +191,346 @@ def is_ip_address(username):
 
 
 # =========================================================
-# CONSULTA INFORMAÇÕES DA CONTA
+# TELEGRAM - IDENTIFICA O CANAL
 # =========================================================
 
-def get_user_info(username):
+def is_target_channel(chat):
+
+    if not chat:
+        return False
+
+    chat_id = chat.get(
+        "id"
+    )
+
+    username = chat.get(
+        "username",
+        ""
+    )
+
+
+    if TELEGRAM_CHANNEL.startswith("@"):
+
+        expected = (
+            TELEGRAM_CHANNEL[1:]
+            .lower()
+        )
+
+        return (
+            username.lower()
+            ==
+            expected
+        )
+
+
+    return (
+        str(chat_id)
+        ==
+        str(TELEGRAM_CHANNEL)
+    )
+
+
+# =========================================================
+# PERSISTÊNCIA DAS PÁGINAS VIGIADAS
+# =========================================================
+
+def save_watchlist_snapshot(snapshot):
+
+    directory = os.path.dirname(
+        WATCHLIST_FILE
+    )
+
+    if directory:
+
+        os.makedirs(
+            directory,
+            exist_ok=True
+        )
+
+
+    temporary_file = (
+        WATCHLIST_FILE
+        +
+        ".tmp"
+    )
+
+
+    with open(
+        temporary_file,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            sorted(snapshot),
+            file,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+    os.replace(
+        temporary_file,
+        WATCHLIST_FILE
+    )
+
+
+def load_watchlist():
+
+    global watched_pages
+
+
+    try:
+
+        if not os.path.exists(
+            WATCHLIST_FILE
+        ):
+
+            print(
+                "👁 Nenhuma lista de páginas "
+                "vigiadas encontrada."
+            )
+
+            return
+
+
+        with open(
+            WATCHLIST_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(
+                file
+            )
+
+
+        if not isinstance(
+            data,
+            list
+        ):
+
+            raise ValueError(
+                "Formato inválido da watchlist."
+            )
+
+
+        with watchlist_lock:
+
+            watched_pages = set(
+                str(item)
+                for item in data
+            )
+
+
+        print(
+            "👁 Páginas vigiadas carregadas:",
+            len(watched_pages)
+        )
+
+
+    except Exception as e:
+
+        print(
+            "⚠️ Erro ao carregar páginas vigiadas:",
+            e
+        )
+
+
+def add_watched_page(title):
+
+    with watchlist_lock:
+
+        if title in watched_pages:
+
+            return True, False
+
+
+        snapshot = set(
+            watched_pages
+        )
+
+        snapshot.add(
+            title
+        )
+
+
+    try:
+
+        save_watchlist_snapshot(
+            snapshot
+        )
+
+    except Exception as e:
+
+        print(
+            "❌ Erro ao salvar página vigiada:",
+            e
+        )
+
+        return False, False
+
+
+    with watchlist_lock:
+
+        watched_pages.add(
+            title
+        )
+
+
+    return True, True
+
+
+def remove_watched_page(title):
+
+    with watchlist_lock:
+
+        if title not in watched_pages:
+
+            return True, False
+
+
+        snapshot = set(
+            watched_pages
+        )
+
+        snapshot.remove(
+            title
+        )
+
+
+    try:
+
+        save_watchlist_snapshot(
+            snapshot
+        )
+
+    except Exception as e:
+
+        print(
+            "❌ Erro ao salvar watchlist:",
+            e
+        )
+
+        return False, False
+
+
+    with watchlist_lock:
+
+        watched_pages.discard(
+            title
+        )
+
+
+    return True, True
+
+
+def is_watched_page(title):
+
+    with watchlist_lock:
+
+        return (
+            title
+            in
+            watched_pages
+        )
+
+
+# =========================================================
+# NORMALIZA TÍTULO DA WIKIPÉDIA
+# =========================================================
+
+def normalize_page_title(title):
+
+    title = title.strip()
+
+    if not title:
+        return None
+
+
+    try:
+
+        response = requests.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "titles": title
+            },
+            headers=HEADERS,
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        pages = (
+            data
+            .get("query", {})
+            .get("pages", [])
+        )
+
+
+        if not pages:
+
+            return None
+
+
+        canonical_title = (
+            pages[0]
+            .get("title")
+        )
+
+
+        return canonical_title
+
+
+    except Exception as e:
+
+        print(
+            "⚠️ Erro ao normalizar página:",
+            title,
+            "|",
+            e
+        )
+
+        return None
+
+
+# =========================================================
+# INFORMAÇÕES DA CONTA
+# =========================================================
+
+def get_user_info(
+    username,
+    use_cache=True
+):
 
     now = time.time()
 
-    cached = user_cache.get(
-        username
-    )
 
-    if cached:
+    if use_cache:
 
-        cached_at = cached.get(
-            "cached_at",
-            0
+        cached = user_cache.get(
+            username
         )
 
-        if (
-            now - cached_at
-            <
-            USER_CACHE_SECONDS
-        ):
+        if cached:
 
-            return cached
+            cached_at = cached.get(
+                "cached_at",
+                0
+            )
+
+            if (
+                now - cached_at
+                <
+                USER_CACHE_SECONDS
+            ):
+
+                return cached
 
 
     try:
@@ -214,7 +544,8 @@ def get_user_info(username):
                 "list": "users",
                 "ususers": username,
                 "usprop": (
-                    "editcount|registration"
+                    "editcount|registration|"
+                    "groups|blockinfo"
                 )
             },
             headers=HEADERS,
@@ -224,6 +555,7 @@ def get_user_info(username):
         response.raise_for_status()
 
         data = response.json()
+
 
         users = (
             data
@@ -246,13 +578,41 @@ def get_user_info(username):
 
 
         result = {
+            "name": user.get(
+                "name",
+                username
+            ),
+
             "editcount": user.get(
                 "editcount",
                 0
             ),
+
             "registration": user.get(
                 "registration"
             ),
+
+            "groups": user.get(
+                "groups",
+                []
+            ),
+
+            "blockid": user.get(
+                "blockid"
+            ),
+
+            "blockedby": user.get(
+                "blockedby"
+            ),
+
+            "blockreason": user.get(
+                "blockreason"
+            ),
+
+            "blockexpiry": user.get(
+                "blockexpiry"
+            ),
+
             "cached_at": now
         }
 
@@ -276,20 +636,213 @@ def get_user_info(username):
 
 
 # =========================================================
-# DECIDE SE A CONTA DEVE SER AVALIADA
+# HISTÓRICO DE BLOQUEIOS
+# =========================================================
+
+def has_previous_block(username):
+
+    try:
+
+        response = requests.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "list": "logevents",
+                "letype": "block",
+                "letitle": (
+                    f"Usuário:{username}"
+                ),
+                "lelimit": 1,
+                "leprop": (
+                    "ids|title|type|"
+                    "user|timestamp|comment|details"
+                )
+            },
+            headers=HEADERS,
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        events = (
+            data
+            .get("query", {})
+            .get("logevents", [])
+        )
+
+
+        return bool(
+            events
+        )
+
+
+    except Exception as e:
+
+        print(
+            "⚠️ Erro ao consultar histórico "
+            "de bloqueios:",
+            username,
+            "|",
+            e
+        )
+
+        return False
+
+
+# =========================================================
+# DIREITOS / GRUPOS
+# =========================================================
+
+GROUP_NAMES = {
+
+    "*": "usuário",
+
+    "user": (
+        "usuário registrado"
+    ),
+
+    "autoconfirmed": (
+        "autoconfirmado"
+    ),
+
+    "confirmed": (
+        "confirmado"
+    ),
+
+    "extendedconfirmed": (
+        "autoconfirmado estendido"
+    ),
+
+    "autoreviewer": (
+        "autorrevisor"
+    ),
+
+    "rollbacker": (
+        "reversor"
+    ),
+
+    "eliminator": (
+        "eliminador"
+    ),
+
+    "sysop": (
+        "administrador"
+    ),
+
+    "bureaucrat": (
+        "burocrata"
+    ),
+
+    "interface-admin": (
+        "administrador de interface"
+    ),
+
+    "accountcreator": (
+        "criador de contas"
+    ),
+
+    "checkuser": (
+        "verificador"
+    ),
+
+    "suppress": (
+        "oversight"
+    ),
+
+    "ipblock-exempt": (
+        "isento de bloqueio de IP"
+    )
+}
+
+
+def format_groups(groups):
+
+    if not groups:
+
+        return "nenhum grupo especial"
+
+
+    formatted = []
+
+
+    for group in groups:
+
+        name = GROUP_NAMES.get(
+            group,
+            group
+        )
+
+        if name not in formatted:
+
+            formatted.append(
+                name
+            )
+
+
+    return ", ".join(
+        formatted
+    )
+
+
+# =========================================================
+# VERIFICA SE É ADMINISTRADOR DA WIKIPÉDIA
+# =========================================================
+
+def is_wikipedia_admin(username):
+
+    if is_ip_address(
+        username
+    ):
+
+        return False
+
+
+    info = get_user_info(
+        username
+    )
+
+
+    # Se a API falhar, preferimos não perder
+    # uma edição de página vigiada.
+    if info is None:
+
+        print(
+            "⚠️ Não foi possível verificar "
+            "se é administrador:",
+            username
+        )
+
+        return False
+
+
+    groups = info.get(
+        "groups",
+        []
+    )
+
+
+    return (
+        "sysop"
+        in
+        groups
+    )
+
+
+# =========================================================
+# FILTRO NORMAL DAS CONTAS
 # =========================================================
 
 def should_evaluate_user(username):
 
     if not username:
-
         return True
 
 
-    # -----------------------------------------
-    # IPs SEMPRE SÃO AVALIADOS
-    # -----------------------------------------
-
+    # IP sempre é avaliado.
     if is_ip_address(
         username
     ):
@@ -303,18 +856,14 @@ def should_evaluate_user(username):
         return True
 
 
-    # -----------------------------------------
-    # CONSULTA CONTA REGISTRADA
-    # -----------------------------------------
-
-    user_info = get_user_info(
+    info = get_user_info(
         username
     )
 
 
-    # Em caso de falha na API,
-    # preferimos avaliar a edição.
-    if user_info is None:
+    # Falha da API:
+    # preferimos avaliar.
+    if info is None:
 
         print(
             "⚠️ Não foi possível verificar a conta:",
@@ -325,16 +874,13 @@ def should_evaluate_user(username):
         return True
 
 
-    editcount = user_info.get(
+    editcount = info.get(
         "editcount",
         0
     )
 
 
-    # -----------------------------------------
-    # MAIS DE 10 EDIÇÕES
-    # -----------------------------------------
-
+    # Mais de 10 edições -> ignora.
     if (
         editcount
         >
@@ -351,46 +897,33 @@ def should_evaluate_user(username):
         return False
 
 
-    registration = user_info.get(
+    registration = info.get(
         "registration"
     )
 
-
-    # -----------------------------------------
-    # MAIS DE 30 DIAS
-    # -----------------------------------------
 
     if registration:
 
         try:
 
-            created = (
-                datetime
-                .fromisoformat(
-                    registration.replace(
-                        "Z",
-                        "+00:00"
-                    )
+            created = datetime.fromisoformat(
+                registration.replace(
+                    "Z",
+                    "+00:00"
                 )
             )
 
 
-            age_seconds = (
+            age_days = (
                 datetime.now(
                     timezone.utc
                 )
                 -
                 created
-            ).total_seconds()
+            ).total_seconds() / 86400
 
 
-            age_days = (
-                age_seconds
-                /
-                86400
-            )
-
-
+            # Mais de 30 dias -> ignora.
             if (
                 age_days
                 >
@@ -428,73 +961,118 @@ def should_evaluate_user(username):
             )
 
 
-    else:
-
-        print(
-            "⚠️ Conta sem data de registro:",
-            username,
-            "|",
-            f"{editcount} edições"
-        )
-
-
     return True
 
 
 # =========================================================
-# TELEGRAM - ENVIO
+# TELEGRAM
 # =========================================================
 
 def send_telegram_message(
     text,
-    chat_id=None
+    chat_id=None,
+    parse_mode=None
 ):
 
     if chat_id is None:
-
-        chat_id = (
-            TELEGRAM_CHANNEL
-        )
+        chat_id = TELEGRAM_CHANNEL
 
 
     while True:
 
         try:
 
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True
+            }
+
+
+            if parse_mode:
+
+                payload[
+                    "parse_mode"
+                ] = parse_mode
+
+
             response = requests.post(
                 f"{TELEGRAM_API}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "disable_web_page_preview": True
-                },
+                json=payload,
                 timeout=30
             )
 
 
+            # -----------------------------------------
+            # RATE LIMIT
+            # -----------------------------------------
+
             if response.status_code == 429:
 
-                data = response.json()
+                try:
 
-                retry_after = (
-                    data
-                    .get("parameters", {})
-                    .get(
-                        "retry_after",
-                        2
+                    data = response.json()
+
+                    retry_after = (
+                        data
+                        .get(
+                            "parameters",
+                            {}
+                        )
+                        .get(
+                            "retry_after",
+                            2
+                        )
                     )
-                )
+
+                except Exception:
+
+                    retry_after = 2
 
 
                 print(
-                    "Rate limit Telegram. "
+                    "⚠️ Rate limit Telegram. "
                     f"Aguardando {retry_after}s."
                 )
-
 
                 time.sleep(
                     retry_after
                 )
+
+                continue
+
+
+            # -----------------------------------------
+            # ERROS PERMANENTES
+            # -----------------------------------------
+
+            if response.status_code in (
+                400,
+                401,
+                403
+            ):
+
+                print(
+                    "❌ Telegram rejeitou mensagem:",
+                    response.status_code,
+                    response.text
+                )
+
+                return False
+
+
+            # -----------------------------------------
+            # ERRO DO SERVIDOR
+            # -----------------------------------------
+
+            if response.status_code >= 500:
+
+                print(
+                    "⚠️ Erro temporário Telegram:",
+                    response.status_code
+                )
+
+                time.sleep(5)
 
                 continue
 
@@ -504,10 +1082,10 @@ def send_telegram_message(
             return True
 
 
-        except Exception as e:
+        except requests.RequestException as e:
 
             print(
-                "❌ Erro Telegram:",
+                "⚠️ Erro de rede Telegram:",
                 e
             )
 
@@ -515,16 +1093,14 @@ def send_telegram_message(
 
 
 # =========================================================
-# FILA DE ENVIO TELEGRAM
+# SENDER TELEGRAM
 # =========================================================
 
 def telegram_sender():
 
     while True:
 
-        item = (
-            telegram_queue.get()
-        )
+        item = telegram_queue.get()
 
 
         try:
@@ -537,16 +1113,30 @@ def telegram_sender():
                 "title"
             ]
 
-
-            send_telegram_message(
-                message
+            parse_mode = item.get(
+                "parse_mode"
             )
 
 
-            print(
-                "✅ Telegram confirmou envio:",
-                title
+            success = send_telegram_message(
+                message,
+                parse_mode=parse_mode
             )
+
+
+            if success:
+
+                print(
+                    "✅ Telegram confirmou envio:",
+                    title
+                )
+
+            else:
+
+                print(
+                    "❌ Falha ao enviar:",
+                    title
+                )
 
 
         except Exception as e:
@@ -562,13 +1152,613 @@ def telegram_sender():
             telegram_queue.task_done()
 
 
-        # Não envia mais de uma mensagem
-        # por segundo.
         time.sleep(1)
 
 
 # =========================================================
-# TELEGRAM - COMANDOS
+# /CONTA
+# =========================================================
+
+def build_account_message(username):
+
+    info = get_user_info(
+        username,
+        use_cache=False
+    )
+
+
+    if info is None:
+
+        return (
+            "❌ Conta não encontrada: "
+            f"{username}"
+        ), None
+
+
+    username = info.get(
+        "name",
+        username
+    )
+
+
+    editcount = info.get(
+        "editcount",
+        0
+    )
+
+
+    registration = info.get(
+        "registration"
+    )
+
+
+    if registration:
+
+        try:
+
+            created = datetime.fromisoformat(
+                registration.replace(
+                    "Z",
+                    "+00:00"
+                )
+            )
+
+
+            age_days = int(
+                (
+                    datetime.now(
+                        timezone.utc
+                    )
+                    -
+                    created
+                ).total_seconds()
+                /
+                86400
+            )
+
+
+            creation_text = (
+                f"{age_days} dias"
+            )
+
+
+        except Exception:
+
+            creation_text = (
+                "data indisponível"
+            )
+
+
+    else:
+
+        creation_text = (
+            "data indisponível"
+        )
+
+
+    groups = format_groups(
+        info.get(
+            "groups",
+            []
+        )
+    )
+
+
+    # -----------------------------------------
+    # BLOQUEIO
+    # -----------------------------------------
+
+    if info.get(
+        "blockid"
+    ):
+
+        block_status = (
+            "🔴 ativo"
+        )
+
+    else:
+
+        previous = has_previous_block(
+            username
+        )
+
+        if previous:
+
+            block_status = (
+                "🟡 bloqueio prévio"
+            )
+
+        else:
+
+            block_status = (
+                "🟢 nenhum"
+            )
+
+
+    encoded_username = quote(
+        username.replace(
+            " ",
+            "_"
+        ),
+        safe=""
+    )
+
+
+    user_url = (
+        "https://pt.wikipedia.org/wiki/"
+        f"Usuário:{encoded_username}"
+    )
+
+
+    safe_username = html.escape(
+        username
+    )
+
+    safe_groups = html.escape(
+        groups
+    )
+
+
+    message = (
+        f'👤 <a href="{user_url}">'
+        f"{safe_username}</a>\n\n"
+
+        f"✏️ Edições na Wikipédia em português: "
+        f"{editcount}\n"
+
+        f"📅 Idade da conta: "
+        f"{creation_text}\n"
+
+        f"🔑 Direitos de usuário: "
+        f"{safe_groups}\n"
+
+        f"🚫 Bloqueio: "
+        f"{block_status}"
+    )
+
+
+    return message, "HTML"
+
+
+# =========================================================
+# MENSAGEM /COMANDOS
+# =========================================================
+
+def commands_message():
+
+    return (
+        "🤖 Comandos disponíveis\n\n"
+
+        "👁 /vigiar Página\n"
+        "Adiciona uma página à vigilância.\n\n"
+
+        "🙈 /desvigiar Página\n"
+        "Remove uma página da vigilância.\n\n"
+
+        "📋 /vigiadas\n"
+        "Lista todas as páginas vigiadas.\n\n"
+
+        "👤 /conta Usuário\n"
+        "Mostra informações de uma conta.\n\n"
+
+        "📡 /status\n"
+        "Mostra o estado do bot.\n\n"
+
+        "📖 /comandos\n"
+        "Mostra esta lista."
+    )
+
+
+# =========================================================
+# PROCESSA COMANDOS
+# =========================================================
+
+def process_telegram_command(
+    message,
+    from_channel=False
+):
+
+    text = message.get(
+        "text",
+        ""
+    ).strip()
+
+
+    if not text.startswith("/"):
+        return
+
+
+    chat = message.get(
+        "chat",
+        {}
+    )
+
+
+    chat_id = chat.get(
+        "id"
+    )
+
+
+    if not chat_id:
+        return
+
+
+    first_part, *remaining = (
+        text.split(
+            maxsplit=1
+        )
+    )
+
+
+    command = (
+        first_part
+        .split("@")[0]
+        .lower()
+    )
+
+
+    argument = (
+        remaining[0].strip()
+        if remaining
+        else ""
+    )
+
+
+    # =====================================================
+    # /START
+    # =====================================================
+
+    if command == "/start":
+
+        send_telegram_message(
+            (
+                "🤖 Monitor de possíveis vandalismos "
+                "da Wikipédia em português.\n\n"
+                "Use /comandos para ver os comandos."
+            ),
+            chat_id=chat_id
+        )
+
+        return
+
+
+    # =====================================================
+    # /COMANDOS
+    # =====================================================
+
+    if command == "/comandos":
+
+        send_telegram_message(
+            commands_message(),
+            chat_id=chat_id
+        )
+
+        return
+
+
+    # =====================================================
+    # /STATUS
+    # =====================================================
+
+    if command == "/status":
+
+        with stream_lock:
+
+            connected = (
+                stream_connected
+            )
+
+            last_stream = (
+                last_stream_event_at
+            )
+
+            last_ptwiki = (
+                last_ptwiki_edit_at
+            )
+
+
+        if connected:
+
+            stream_status = (
+                "🟢 conectado"
+            )
+
+        else:
+
+            stream_status = (
+                "🔴 reconectando"
+            )
+
+
+        with watchlist_lock:
+
+            watch_count = len(
+                watched_pages
+            )
+
+
+        send_telegram_message(
+            (
+                "🤖 Status do bot\n\n"
+
+                f"📡 EventStreams: "
+                f"{stream_status}\n"
+
+                f"🌐 Último evento Wikimedia: "
+                f"{format_age(last_stream)}\n"
+
+                f"🇵🇹 Última edição ptwiki: "
+                f"{format_age(last_ptwiki)}\n\n"
+
+                f"👶 Idade máxima normal: "
+                f"{MAX_ACCOUNT_AGE_DAYS} dias\n"
+
+                f"✏️ Máximo de edições: "
+                f"{MAX_USER_EDITS}\n"
+
+                f"👁 Páginas vigiadas: "
+                f"{watch_count}\n\n"
+
+                f"🔎 Triagem Revert Risk: "
+                f"{REVERT_RISK_THRESHOLD:.0%}\n"
+
+                f"🚨 Score para postagem: "
+                f"{VANDALISM_THRESHOLD:.0%}\n\n"
+
+                f"📥 Fila de análise: "
+                f"{analysis_queue.qsize()}\n"
+
+                f"📤 Fila Telegram: "
+                f"{telegram_queue.qsize()}"
+            ),
+            chat_id=chat_id
+        )
+
+        return
+
+
+    # =====================================================
+    # /CONTA
+    # =====================================================
+
+    if command == "/conta":
+
+        if not argument:
+
+            send_telegram_message(
+                (
+                    "Uso:\n"
+                    "/conta Nome do usuário"
+                ),
+                chat_id=chat_id
+            )
+
+            return
+
+
+        account_message, parse_mode = (
+            build_account_message(
+                argument
+            )
+        )
+
+
+        send_telegram_message(
+            account_message,
+            chat_id=chat_id,
+            parse_mode=parse_mode
+        )
+
+        return
+
+
+    # =====================================================
+    # /VIGIADAS
+    # =====================================================
+
+    if command == "/vigiadas":
+
+        with watchlist_lock:
+
+            pages = sorted(
+                watched_pages,
+                key=str.lower
+            )
+
+
+        if not pages:
+
+            text_response = (
+                "👁 Nenhuma página está sendo "
+                "vigiada atualmente."
+            )
+
+        else:
+
+            page_list = "\n".join(
+                f"• {page}"
+                for page in pages
+            )
+
+            text_response = (
+                "👁 Páginas vigiadas:\n\n"
+                f"{page_list}"
+            )
+
+
+        send_telegram_message(
+            text_response,
+            chat_id=chat_id
+        )
+
+        return
+
+
+    # =====================================================
+    # COMANDOS QUE ALTERAM A WATCHLIST
+    # =====================================================
+
+    if command in (
+        "/vigiar",
+        "/desvigiar"
+    ):
+
+        # Estes comandos só podem ser publicados
+        # dentro do canal configurado.
+        if not from_channel:
+
+            send_telegram_message(
+                (
+                    "⚠️ Este comando deve ser "
+                    "publicado por um administrador "
+                    "no canal."
+                ),
+                chat_id=chat_id
+            )
+
+            return
+
+
+        if not is_target_channel(
+            chat
+        ):
+
+            return
+
+
+        if not argument:
+
+            send_telegram_message(
+                (
+                    "Uso:\n"
+                    f"{command} Nome da página"
+                ),
+                chat_id=chat_id
+            )
+
+            return
+
+
+        title = normalize_page_title(
+            argument
+        )
+
+
+        if not title:
+
+            send_telegram_message(
+                (
+                    "❌ Não foi possível identificar "
+                    "essa página."
+                ),
+                chat_id=chat_id
+            )
+
+            return
+
+
+        # -------------------------------------------------
+        # /VIGIAR
+        # -------------------------------------------------
+
+        if command == "/vigiar":
+
+            success, added = (
+                add_watched_page(
+                    title
+                )
+            )
+
+
+            if not success:
+
+                send_telegram_message(
+                    (
+                        "❌ Não foi possível salvar "
+                        "a página na lista de vigilância."
+                    ),
+                    chat_id=chat_id
+                )
+
+                return
+
+
+            if not added:
+
+                send_telegram_message(
+                    (
+                        f"👁 {title} já está sendo "
+                        "vigiada."
+                    ),
+                    chat_id=chat_id
+                )
+
+                return
+
+
+            send_telegram_message(
+                (
+                    f"👁 {title} adicionada à vigilância.\n\n"
+                    "Toda edição feita nesta página por "
+                    "usuário não-bot e não-administrador "
+                    "da Wikipédia gerará uma publicação "
+                    "neste canal."
+                ),
+                chat_id=chat_id
+            )
+
+            return
+
+
+        # -------------------------------------------------
+        # /DESVIGIAR
+        # -------------------------------------------------
+
+        success, removed = (
+            remove_watched_page(
+                title
+            )
+        )
+
+
+        if not success:
+
+            send_telegram_message(
+                (
+                    "❌ Não foi possível atualizar "
+                    "a lista de vigilância."
+                ),
+                chat_id=chat_id
+            )
+
+            return
+
+
+        if not removed:
+
+            send_telegram_message(
+                (
+                    f"🙈 {title} não estava "
+                    "na lista de páginas vigiadas."
+                ),
+                chat_id=chat_id
+            )
+
+            return
+
+
+        send_telegram_message(
+            (
+                f"🙈 {title} removida da vigilância.\n\n"
+                "As edições voltarão a seguir "
+                "os critérios normais do detector."
+            ),
+            chat_id=chat_id
+        )
+
+
+# =========================================================
+# LISTENER TELEGRAM
 # =========================================================
 
 def telegram_command_listener():
@@ -586,7 +1776,13 @@ def telegram_command_listener():
         try:
 
             params = {
-                "timeout": 30
+                "timeout": 30,
+                "allowed_updates": json.dumps(
+                    [
+                        "message",
+                        "channel_post"
+                    ]
+                )
             }
 
 
@@ -623,127 +1819,48 @@ def telegram_command_listener():
                 )
 
 
+                # -----------------------------------------
+                # MENSAGEM NORMAL / PRIVADA
+                # -----------------------------------------
+
                 message = update.get(
                     "message"
                 )
 
 
-                if not message:
+                if message:
 
-                    continue
-
-
-                text = message.get(
-                    "text",
-                    ""
-                )
-
-
-                chat_id = (
-                    message
-                    .get("chat", {})
-                    .get("id")
-                )
-
-
-                if not chat_id:
-
-                    continue
-
-
-                # =========================================
-                # /start
-                # =========================================
-
-                if text.startswith(
-                    "/start"
-                ):
-
-                    send_telegram_message(
-                        (
-                            "🤖 Monitor de possíveis "
-                            "vandalismos da Wikipédia "
-                            "em português.\n\n"
-
-                            "✅ Bot ativo.\n"
-                            "📡 Monitoramento em tempo real.\n"
-
-                            f"📢 Canal: "
-                            f"{TELEGRAM_CHANNEL}"
-                        ),
-                        chat_id=chat_id
+                    process_telegram_command(
+                        message,
+                        from_channel=False
                     )
 
 
-                # =========================================
-                # /status
-                # =========================================
+                # -----------------------------------------
+                # PUBLICAÇÃO NO CANAL
+                # -----------------------------------------
 
-                elif text.startswith(
-                    "/status"
-                ):
-
-                    with stream_lock:
-
-                        connected = (
-                            stream_connected
-                        )
-
-                        last_stream = (
-                            last_stream_event_at
-                        )
-
-                        last_ptwiki = (
-                            last_ptwiki_edit_at
-                        )
+                channel_post = update.get(
+                    "channel_post"
+                )
 
 
-                    if connected:
+                if channel_post:
 
-                        stream_status = (
-                            "🟢 conectado"
-                        )
-
-                    else:
-
-                        stream_status = (
-                            "🔴 reconectando"
-                        )
-
-
-                    send_telegram_message(
-                        (
-                            "🤖 Status do bot\n\n"
-
-                            f"📡 EventStreams: "
-                            f"{stream_status}\n"
-
-                            f"🌐 Último evento Wikimedia: "
-                            f"{format_age(last_stream)}\n"
-
-                            f"🇵🇹 Última edição ptwiki: "
-                            f"{format_age(last_ptwiki)}\n\n"
-
-                            f"👶 Idade máxima da conta: "
-                            f"{MAX_ACCOUNT_AGE_DAYS} dias\n"
-
-                            f"✏️ Máximo de edições: "
-                            f"{MAX_USER_EDITS}\n\n"
-
-                            f"🔎 Triagem Revert Risk: "
-                            f"{REVERT_RISK_THRESHOLD:.0%}\n"
-
-                            f"🚨 Score para postagem: "
-                            f"{VANDALISM_THRESHOLD:.0%}\n\n"
-
-                            f"📥 Fila de análise: "
-                            f"{analysis_queue.qsize()}\n"
-
-                            f"📤 Fila Telegram: "
-                            f"{telegram_queue.qsize()}"
-                        ),
-                        chat_id=chat_id
+                    chat = channel_post.get(
+                        "chat",
+                        {}
                     )
+
+
+                    if is_target_channel(
+                        chat
+                    ):
+
+                        process_telegram_command(
+                            channel_post,
+                            from_channel=True
+                        )
 
 
         except Exception as e:
@@ -757,7 +1874,7 @@ def telegram_command_listener():
 
 
 # =========================================================
-# WATCHDOG DO EVENTSTREAMS
+# WATCHDOG EVENTSTREAMS
 # =========================================================
 
 def eventstream_watchdog():
@@ -804,7 +1921,6 @@ def eventstream_watchdog():
                         f"{int(elapsed)}s."
                     )
 
-
                     print(
                         "🔄 Forçando reconexão..."
                     )
@@ -814,14 +1930,9 @@ def eventstream_watchdog():
                         current_stream_response
                     )
 
+                    current_stream_response = None
 
-                    current_stream_response = (
-                        None
-                    )
-
-                    stream_connected = (
-                        False
-                    )
+                    stream_connected = False
 
 
         if response_to_close is not None:
@@ -839,13 +1950,12 @@ def eventstream_watchdog():
 
 
 # =========================================================
-# LIMPEZA DO HTML DO DIFF
+# LIMPEZA DO DIFF
 # =========================================================
 
 def clean_html(text):
 
     if not text:
-
         return ""
 
 
@@ -872,7 +1982,7 @@ def clean_html(text):
 
 
 # =========================================================
-# BUSCA DIFF
+# DIFF
 # =========================================================
 
 def get_revision_diff(
@@ -880,19 +1990,16 @@ def get_revision_diff(
     new_revision
 ):
 
-    params = {
-        "action": "compare",
-        "format": "json",
-        "formatversion": 2,
-        "fromrev": old_revision,
-        "torev": new_revision,
-        "prop": "diff"
-    }
-
-
     response = requests.get(
         WIKIPEDIA_API,
-        params=params,
+        params={
+            "action": "compare",
+            "format": "json",
+            "formatversion": 2,
+            "fromrev": old_revision,
+            "torev": new_revision,
+            "prop": "diff"
+        },
         headers=HEADERS,
         timeout=30
     )
@@ -906,10 +2013,7 @@ def get_revision_diff(
     diff_html = (
         data
         .get("compare", {})
-        .get(
-            "body",
-            ""
-        )
+        .get("body", "")
     )
 
 
@@ -948,26 +2052,16 @@ def get_revision_diff(
 
 
     return {
-        "added": (
-            added[
-                :MAX_DIFF_CHARS
-            ]
-        ),
-        "removed": (
-            removed[
-                :MAX_DIFF_CHARS
-            ]
-        )
+        "added": added[:MAX_DIFF_CHARS],
+        "removed": removed[:MAX_DIFF_CHARS]
     }
 
 
 # =========================================================
-# WIKIMEDIA REVERT RISK
+# REVERT RISK
 # =========================================================
 
-def get_revert_risk(
-    revision_id
-):
+def get_revert_risk(revision_id):
 
     try:
 
@@ -1080,7 +2174,6 @@ def profanity_score(text):
 def repetition_score(text):
 
     if not text:
-
         return 0.0
 
 
@@ -1114,7 +2207,6 @@ def destructive_score(
     added_len = len(
         added.strip()
     )
-
 
     removed_len = len(
         removed.strip()
@@ -1157,7 +2249,6 @@ def nonsense_score(text):
 
 
     if not text:
-
         return 0.0
 
 
@@ -1178,7 +2269,6 @@ def nonsense_score(text):
 
 
         if ratio < 0.25:
-
             return 0.80
 
 
@@ -1186,7 +2276,7 @@ def nonsense_score(text):
 
 
 # =========================================================
-# ANÁLISE FINAL
+# ANÁLISE
 # =========================================================
 
 def analyze_vandalism(
@@ -1200,39 +2290,27 @@ def analyze_vandalism(
         ""
     )
 
-
     removed = diff.get(
         "removed",
         ""
     )
 
 
-    profanity = (
-        profanity_score(
-            added
-        )
+    profanity = profanity_score(
+        added
     )
 
-
-    repetition = (
-        repetition_score(
-            added
-        )
+    repetition = repetition_score(
+        added
     )
 
-
-    destructive = (
-        destructive_score(
-            added,
-            removed
-        )
+    destructive = destructive_score(
+        added,
+        removed
     )
 
-
-    nonsense = (
-        nonsense_score(
-            added
-        )
+    nonsense = nonsense_score(
+        added
     )
 
 
@@ -1249,16 +2327,9 @@ def analyze_vandalism(
     )
 
 
-    # =========================================
-    # SCORE
-    # =========================================
-
-    # Revert Risk é o score-base.
     score = revert_risk
 
 
-    # Um sinal heurístico forte:
-    # +10 pontos percentuais.
     if heuristic >= 0.75:
 
         score += 0.10
@@ -1271,8 +2342,6 @@ def analyze_vandalism(
     )
 
 
-    # Dois ou mais sinais fortes:
-    # +5 pontos adicionais.
     if strong_signals >= 2:
 
         score += 0.05
@@ -1352,7 +2421,7 @@ def analyze_vandalism(
 
 
 # =========================================================
-# FORMATA MENSAGEM TELEGRAM
+# MENSAGEM DE VANDALISMO
 # =========================================================
 
 def format_message(
@@ -1365,12 +2434,10 @@ def format_message(
         "Sem título"
     )
 
-
     user = change.get(
         "user",
         "Desconhecido"
     )
-
 
     comment = (
         change.get(
@@ -1391,27 +2458,17 @@ def format_message(
         "old"
     )
 
-
     new_revision = revision.get(
         "new"
     )
 
 
     final_score = round(
-        result[
-            "score"
-        ]
-        *
-        100
+        result["score"] * 100
     )
 
-
     revert_score = round(
-        result[
-            "revert_risk"
-        ]
-        *
-        100
+        result["revert_risk"] * 100
     )
 
 
@@ -1441,6 +2498,66 @@ def format_message(
 
 
 # =========================================================
+# MENSAGEM DE PÁGINA VIGIADA
+# =========================================================
+
+def format_watched_message(
+    change
+):
+
+    title = change.get(
+        "title",
+        "Sem título"
+    )
+
+    user = change.get(
+        "user",
+        "Desconhecido"
+    )
+
+    comment = (
+        change.get(
+            "comment"
+        )
+        or
+        "Sem resumo"
+    )
+
+
+    revision = change.get(
+        "revision",
+        {}
+    )
+
+
+    old_revision = revision.get(
+        "old"
+    )
+
+    new_revision = revision.get(
+        "new"
+    )
+
+
+    diff_url = (
+        "https://pt.wikipedia.org/w/index.php"
+        f"?diff={new_revision}"
+        f"&oldid={old_revision}"
+    )
+
+
+    return (
+        "👁 Edição em página vigiada\n\n"
+
+        f"📝 {title}\n"
+        f"👤 {user}\n"
+        f"💬 {comment}\n\n"
+
+        f"🔗 {diff_url}"
+    )
+
+
+# =========================================================
 # WORKER DE ANÁLISE
 # =========================================================
 
@@ -1448,9 +2565,7 @@ def analysis_worker():
 
     while True:
 
-        change = (
-            analysis_queue.get()
-        )
+        change = analysis_queue.get()
 
 
         try:
@@ -1461,39 +2576,88 @@ def analysis_worker():
             )
 
 
-            old_revision = (
-                revision.get(
-                    "old"
-                )
+            old_revision = revision.get(
+                "old"
             )
 
-
-            new_revision = (
-                revision.get(
-                    "new"
-                )
+            new_revision = revision.get(
+                "new"
             )
 
 
             if not old_revision:
-
                 continue
-
 
             if not new_revision:
-
                 continue
 
-
-            # =========================================
-            # FILTRO DE USUÁRIO
-            # =========================================
 
             username = change.get(
                 "user",
                 ""
             )
 
+            title = change.get(
+                "title",
+                ""
+            )
+
+
+            # =========================================
+            # PÁGINA VIGIADA
+            # =========================================
+
+            if is_watched_page(
+                title
+            ):
+
+                print(
+                    "👁 Edição em página vigiada:",
+                    title,
+                    "|",
+                    username
+                )
+
+
+                if is_wikipedia_admin(
+                    username
+                ):
+
+                    print(
+                        "⏭️ Edição vigiada ignorada: "
+                        "usuário é administrador |",
+                        username
+                    )
+
+                    continue
+
+
+                telegram_queue.put(
+                    {
+                        "message": (
+                            format_watched_message(
+                                change
+                            )
+                        ),
+                        "title": title
+                    }
+                )
+
+
+                print(
+                    "📤 Página vigiada enfileirada:",
+                    title
+                )
+
+
+                # Não passa pelo detector normal
+                # para evitar postagem duplicada.
+                continue
+
+
+            # =========================================
+            # FILTRO NORMAL DE USUÁRIO
+            # =========================================
 
             if not should_evaluate_user(
                 username
@@ -1506,15 +2670,12 @@ def analysis_worker():
             # REVERT RISK
             # =========================================
 
-            revert_risk = (
-                get_revert_risk(
-                    new_revision
-                )
+            revert_risk = get_revert_risk(
+                new_revision
             )
 
 
             if revert_risk is None:
-
                 continue
 
 
@@ -1522,15 +2683,9 @@ def analysis_worker():
                 "Revert Risk:",
                 f"{revert_risk:.1%}",
                 "|",
-                change.get(
-                    "title"
-                )
+                title
             )
 
-
-            # =========================================
-            # TRIAGEM
-            # =========================================
 
             if (
                 revert_risk
@@ -1542,16 +2697,14 @@ def analysis_worker():
                     "Descartada na triagem:",
                     f"{revert_risk:.1%}",
                     "|",
-                    change.get(
-                        "title"
-                    )
+                    title
                 )
 
                 continue
 
 
             # =========================================
-            # DIFF
+            # DIFF + HEURÍSTICAS
             # =========================================
 
             diff = get_revision_diff(
@@ -1560,12 +2713,10 @@ def analysis_worker():
             )
 
 
-            result = (
-                analyze_vandalism(
-                    change,
-                    diff,
-                    revert_risk
-                )
+            result = analyze_vandalism(
+                change,
+                diff,
+                revert_risk
             )
 
 
@@ -1573,15 +2724,9 @@ def analysis_worker():
                 "Score final:",
                 f"{result['score']:.1%}",
                 "|",
-                change.get(
-                    "title"
-                )
+                title
             )
 
-
-            # =========================================
-            # TELEGRAM
-            # =========================================
 
             if (
                 result["score"]
@@ -1597,22 +2742,14 @@ def analysis_worker():
                                 result
                             )
                         ),
-
-                        "title": (
-                            change.get(
-                                "title",
-                                "Sem título"
-                            )
-                        )
+                        "title": title
                     }
                 )
 
 
                 print(
                     "📤 Enfileirada para Telegram:",
-                    change.get(
-                        "title"
-                    )
+                    title
                 )
 
 
@@ -1622,9 +2759,7 @@ def analysis_worker():
                     "Não atingiu limite:",
                     f"{result['score']:.1%}",
                     "|",
-                    change.get(
-                        "title"
-                    )
+                    title
                 )
 
 
@@ -1642,7 +2777,7 @@ def analysis_worker():
 
 
 # =========================================================
-# WIKIMEDIA EVENTSTREAMS
+# EVENTSTREAMS
 # =========================================================
 
 def wikimedia_loop():
@@ -1704,8 +2839,6 @@ def wikimedia_loop():
 
             for event in client.events():
 
-                # Atualizamos para qualquer evento
-                # Wikimedia, não só ptwiki.
                 with stream_lock:
 
                     last_stream_event_at = (
@@ -1729,10 +2862,6 @@ def wikimedia_loop():
                     continue
 
 
-                # =========================================
-                # APENAS PTWIKI
-                # =========================================
-
                 if (
                     change.get(
                         "wiki"
@@ -1743,10 +2872,6 @@ def wikimedia_loop():
 
                     continue
 
-
-                # =========================================
-                # APENAS EDIÇÕES
-                # =========================================
 
                 if (
                     change.get(
@@ -1759,10 +2884,8 @@ def wikimedia_loop():
                     continue
 
 
-                # =========================================
-                # IGNORA BOTS
-                # =========================================
-
+                # Bots nunca entram nem mesmo
+                # nas páginas vigiadas.
                 if change.get(
                     "bot",
                     False
@@ -1812,13 +2935,10 @@ def wikimedia_loop():
 
                 if (
                     current_stream_response
-                    is
-                    response
+                    is response
                 ):
 
-                    current_stream_response = (
-                        None
-                    )
+                    current_stream_response = None
 
 
                 stream_connected = False
@@ -1849,6 +2969,9 @@ def wikimedia_loop():
 
 def main():
 
+    load_watchlist()
+
+
     print(
         "================================="
     )
@@ -1877,7 +3000,7 @@ def main():
     )
 
     print(
-        "Idade máxima da conta:",
+        "Idade máxima normal:",
         f"{MAX_ACCOUNT_AGE_DAYS} dias"
     )
 
@@ -1885,6 +3008,15 @@ def main():
         "Máximo de edições:",
         MAX_USER_EDITS
     )
+
+
+    with watchlist_lock:
+
+        print(
+            "Páginas vigiadas:",
+            len(watched_pages)
+        )
+
 
     print(
         "Watchdog:",
@@ -1924,5 +3056,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
