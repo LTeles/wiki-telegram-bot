@@ -22,9 +22,7 @@ TELEGRAM_CHANNEL = os.environ.get(
 )
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN não configurado."
-    )
+    raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado.")
 
 
 TELEGRAM_API = (
@@ -49,13 +47,17 @@ REVERT_RISK_API = (
 # LIMITES
 # =========================================================
 
-# A partir deste risco o bot busca e analisa o diff.
+# A partir deste valor, busca o diff.
 REVERT_RISK_THRESHOLD = 0.35
 
-# Score final mínimo para publicar no Telegram.
+# Score final para postagem.
 VANDALISM_THRESHOLD = 0.55
 
 MAX_DIFF_CHARS = 6000
+
+# Se nenhum evento GLOBAL da Wikimedia chegar
+# durante este período, força reconexão.
+STREAM_STALL_SECONDS = 120
 
 
 # =========================================================
@@ -67,22 +69,72 @@ telegram_queue = queue.Queue()
 
 
 # =========================================================
+# ESTADO DO STREAM
+# =========================================================
+
+stream_lock = threading.Lock()
+
+stream_connected = False
+
+last_stream_event_at = None
+last_ptwiki_edit_at = None
+
+current_stream_response = None
+
+
+# =========================================================
 # USER AGENT
 # =========================================================
 
 HEADERS = {
     "User-Agent": (
-        "PtWikiVandalismTelegramBot/1.0 "
+        "PtWikiVandalismTelegramBot/1.1 "
         "(https://t.me/ptwiki)"
     )
 }
 
 
 # =========================================================
-# TELEGRAM - ENVIO
+# UTILIDADES
 # =========================================================
 
-def send_telegram_message(text, chat_id=None):
+def format_age(timestamp):
+
+    if timestamp is None:
+        return "nunca"
+
+    seconds = int(
+        max(
+            0,
+            time.time() - timestamp
+        )
+    )
+
+    if seconds < 60:
+        return f"há {seconds}s"
+
+    minutes = seconds // 60
+
+    if minutes < 60:
+        return f"há {minutes} min"
+
+    hours = minutes // 60
+    remaining_minutes = minutes % 60
+
+    return (
+        f"há {hours}h "
+        f"{remaining_minutes}min"
+    )
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+def send_telegram_message(
+    text,
+    chat_id=None
+):
 
     if chat_id is None:
         chat_id = TELEGRAM_CHANNEL
@@ -105,16 +157,14 @@ def send_telegram_message(text, chat_id=None):
 
                 data = response.json()
 
-                retry_after = data.get(
-                    "parameters",
-                    {}
-                ).get(
-                    "retry_after",
-                    2
+                retry_after = (
+                    data
+                    .get("parameters", {})
+                    .get("retry_after", 2)
                 )
 
                 print(
-                    f"Rate limit Telegram. "
+                    "Rate limit Telegram. "
                     f"Aguardando {retry_after}s."
                 )
 
@@ -140,24 +190,39 @@ def telegram_sender():
 
     while True:
 
-        message = telegram_queue.get()
+        item = telegram_queue.get()
 
         try:
 
+            message = item["message"]
+            title = item["title"]
+
             send_telegram_message(
                 message
+            )
+
+            print(
+                "✅ Telegram confirmou envio:",
+                title
+            )
+
+        except Exception as e:
+
+            print(
+                "Erro no sender Telegram:",
+                e
             )
 
         finally:
 
             telegram_queue.task_done()
 
-        # Nunca envia mais de uma mensagem por segundo.
+        # Máximo aproximado de 1 postagem por segundo.
         time.sleep(1)
 
 
 # =========================================================
-# TELEGRAM - COMANDOS
+# COMANDOS TELEGRAM
 # =========================================================
 
 def telegram_command_listener():
@@ -211,53 +276,85 @@ def telegram_command_listener():
                     ""
                 )
 
-                chat = message.get(
-                    "chat",
-                    {}
-                )
-
-                chat_id = chat.get(
-                    "id"
+                chat_id = (
+                    message
+                    .get("chat", {})
+                    .get("id")
                 )
 
                 if not chat_id:
                     continue
 
 
+                # -----------------------------------------
                 # /start
+                # -----------------------------------------
 
-                if text.startswith(
-                    "/start"
-                ):
+                if text.startswith("/start"):
 
                     send_telegram_message(
                         (
-                            "🤖 Bot de monitoramento da "
-                            "Wikipédia em português ativo.\n\n"
-                            "Acompanho edições em tempo real "
-                            "e publico no @ptwiki aquelas "
-                            "consideradas possíveis vandalismos."
+                            "🤖 Monitor de possíveis vandalismos "
+                            "da Wikipédia em português.\n\n"
+                            "✅ Bot ativo.\n"
+                            "📡 Monitoramento em tempo real.\n"
+                            f"📢 Canal: {TELEGRAM_CHANNEL}"
                         ),
                         chat_id=chat_id
                     )
 
 
+                # -----------------------------------------
                 # /status
+                # -----------------------------------------
 
-                elif text.startswith(
-                    "/status"
-                ):
+                elif text.startswith("/status"):
+
+                    with stream_lock:
+
+                        connected = (
+                            stream_connected
+                        )
+
+                        last_stream = (
+                            last_stream_event_at
+                        )
+
+                        last_ptwiki = (
+                            last_ptwiki_edit_at
+                        )
+
+
+                    if connected:
+                        stream_status = "🟢 conectado"
+                    else:
+                        stream_status = "🔴 reconectando"
+
 
                     send_telegram_message(
                         (
-                            "✅ Bot online.\n\n"
-                            f"Canal: {TELEGRAM_CHANNEL}\n"
-                            f"Triagem Revert Risk: "
+                            "🤖 Status do bot\n\n"
+
+                            f"📡 EventStreams: "
+                            f"{stream_status}\n"
+
+                            f"🌐 Último evento Wikimedia: "
+                            f"{format_age(last_stream)}\n"
+
+                            f"🇵🇹 Última edição ptwiki: "
+                            f"{format_age(last_ptwiki)}\n\n"
+
+                            f"🔎 Triagem Revert Risk: "
                             f"{REVERT_RISK_THRESHOLD:.0%}\n"
-                            f"Score para postagem: "
+
+                            f"🚨 Score para postagem: "
                             f"{VANDALISM_THRESHOLD:.0%}\n"
-                            f"Fila de análise: "
-                            f"{analysis_queue.qsize()}"
+
+                            f"📥 Fila de análise: "
+                            f"{analysis_queue.qsize()}\n"
+
+                            f"📤 Fila Telegram: "
+                            f"{telegram_queue.qsize()}"
                         ),
                         chat_id=chat_id
                     )
@@ -274,7 +371,78 @@ def telegram_command_listener():
 
 
 # =========================================================
-# LIMPEZA DO HTML DO DIFF
+# WATCHDOG DO EVENTSTREAMS
+# =========================================================
+
+def eventstream_watchdog():
+
+    global stream_connected
+    global current_stream_response
+
+    print(
+        "✅ Watchdog do EventStreams iniciado."
+    )
+
+    while True:
+
+        time.sleep(15)
+
+        response_to_close = None
+
+        with stream_lock:
+
+            if (
+                stream_connected
+                and
+                last_stream_event_at is not None
+            ):
+
+                elapsed = (
+                    time.time()
+                    -
+                    last_stream_event_at
+                )
+
+                if (
+                    elapsed
+                    >
+                    STREAM_STALL_SECONDS
+                ):
+
+                    print(
+                        "⚠️ EventStreams sem eventos por "
+                        f"{int(elapsed)}s."
+                    )
+
+                    print(
+                        "🔄 Forçando reconexão..."
+                    )
+
+                    response_to_close = (
+                        current_stream_response
+                    )
+
+                    current_stream_response = None
+                    stream_connected = False
+
+
+        # Fecha fora do lock.
+        if response_to_close is not None:
+
+            try:
+
+                response_to_close.close()
+
+            except Exception as e:
+
+                print(
+                    "Erro ao fechar stream travado:",
+                    e
+                )
+
+
+# =========================================================
+# LIMPEZA DO HTML
 # =========================================================
 
 def clean_html(text):
@@ -302,7 +470,7 @@ def clean_html(text):
 
 
 # =========================================================
-# BUSCA O DIFF DA EDIÇÃO
+# DIFF
 # =========================================================
 
 def get_revision_diff(
@@ -330,14 +498,10 @@ def get_revision_diff(
 
     data = response.json()
 
-    compare = data.get(
-        "compare",
-        {}
-    )
-
-    diff_html = compare.get(
-        "body",
-        ""
+    diff_html = (
+        data
+        .get("compare", {})
+        .get("body", "")
     )
 
     if not diff_html:
@@ -354,7 +518,6 @@ def get_revision_diff(
         flags=re.I | re.S
     )
 
-
     removed_matches = re.findall(
         r'<td class="diff-deletedline"[^>]*>(.*?)</td>',
         diff_html,
@@ -366,7 +529,6 @@ def get_revision_diff(
         clean_html(x)
         for x in added_matches
     )
-
 
     removed = "\n".join(
         clean_html(x)
@@ -381,7 +543,7 @@ def get_revision_diff(
 
 
 # =========================================================
-# MODELO REVERT RISK DA WIKIMEDIA
+# REVERT RISK
 # =========================================================
 
 def get_revert_risk(revision_id):
@@ -405,7 +567,7 @@ def get_revert_risk(revision_id):
         if response.status_code == 429:
 
             print(
-                "Rate limit do Wikimedia Lift Wing."
+                "⚠️ Rate limit Wikimedia Lift Wing."
             )
 
             return None
@@ -427,7 +589,7 @@ def get_revert_risk(revision_id):
         if probability is None:
 
             print(
-                "Resposta inesperada do Lift Wing:",
+                "Resposta inesperada Lift Wing:",
                 data
             )
 
@@ -450,7 +612,7 @@ def get_revert_risk(revision_id):
 
 
 # =========================================================
-# REGRAS AUXILIARES
+# HEURÍSTICAS
 # =========================================================
 
 BAD_WORDS = [
@@ -478,7 +640,6 @@ def profanity_score(text):
         if word in text
     )
 
-
     if count >= 3:
         return 1.0
 
@@ -496,7 +657,6 @@ def repetition_score(text):
     if not text:
         return 0.0
 
-
     patterns = [
         r"(.)\1{8,}",
         r"[!?]{8,}",
@@ -504,7 +664,6 @@ def repetition_score(text):
         r"(ha){6,}",
         r"(kk){4,}"
     ]
-
 
     for pattern in patterns:
 
@@ -514,7 +673,6 @@ def repetition_score(text):
         ):
 
             return 0.95
-
 
     return 0.0
 
@@ -582,9 +740,7 @@ def nonsense_score(text):
             len(text)
         )
 
-
         if ratio < 0.25:
-
             return 0.80
 
 
@@ -592,7 +748,7 @@ def nonsense_score(text):
 
 
 # =========================================================
-# CLASSIFICAÇÃO FINAL
+# ANÁLISE FINAL
 # =========================================================
 
 def analyze_vandalism(
@@ -637,31 +793,18 @@ def analyze_vandalism(
         nonsense
     ]
 
-
     heuristic = max(
         signals
     )
 
 
-    # =====================================================
-    # NOVA LÓGICA DE SCORE
-    #
-    # O Revert Risk passa a ser o score-base.
-    #
-    # Exemplo:
-    # Revert Risk 60% = score inicial 60%.
-    #
-    # Heurísticas fortes acrescentam bônus.
-    # =====================================================
-
+    # Revert Risk é o score-base.
     score = revert_risk
 
 
-    # Um sinal forte de vandalismo:
+    # Um sinal forte:
     # +10 pontos percentuais.
-
     if heuristic >= 0.75:
-
         score += 0.10
 
 
@@ -672,11 +815,9 @@ def analyze_vandalism(
     )
 
 
-    # Dois ou mais sinais fortes:
+    # Dois ou mais sinais:
     # +5 pontos adicionais.
-
     if strong_signals >= 2:
-
         score += 0.05
 
 
@@ -752,7 +893,7 @@ def analyze_vandalism(
 
 
 # =========================================================
-# FORMATA A MENSAGEM DO TELEGRAM
+# FORMATA MENSAGEM
 # =========================================================
 
 def format_message(
@@ -782,7 +923,6 @@ def format_message(
         {}
     )
 
-
     old_revision = revision.get(
         "old"
     )
@@ -795,7 +935,6 @@ def format_message(
     final_score = round(
         result["score"] * 100
     )
-
 
     revert_score = round(
         result["revert_risk"] * 100
@@ -838,7 +977,6 @@ def analysis_worker():
                 {}
             )
 
-
             old_revision = revision.get(
                 "old"
             )
@@ -866,13 +1004,11 @@ def analysis_worker():
 
             print(
                 "Revert Risk:",
-                f"{revert_risk:.0%}",
+                f"{revert_risk:.1%}",
                 "|",
                 change.get("title")
             )
 
-
-            # Descarta antes de buscar o diff.
 
             if (
                 revert_risk
@@ -882,7 +1018,7 @@ def analysis_worker():
 
                 print(
                     "Descartada na triagem:",
-                    f"{revert_risk:.0%}",
+                    f"{revert_risk:.1%}",
                     "|",
                     change.get("title")
                 )
@@ -905,7 +1041,7 @@ def analysis_worker():
 
             print(
                 "Score final:",
-                f"{result['score']:.0%}",
+                f"{result['score']:.1%}",
                 "|",
                 change.get("title")
             )
@@ -917,19 +1053,22 @@ def analysis_worker():
                 VANDALISM_THRESHOLD
             ):
 
-                message = format_message(
-                    change,
-                    result
-                )
-
-
                 telegram_queue.put(
-                    message
+                    {
+                        "message": format_message(
+                            change,
+                            result
+                        ),
+                        "title": change.get(
+                            "title",
+                            "Sem título"
+                        )
+                    }
                 )
 
 
                 print(
-                    "🚨 Possível vandalismo enviado:",
+                    "📤 Enfileirada para Telegram:",
                     change.get("title")
                 )
 
@@ -937,8 +1076,8 @@ def analysis_worker():
             else:
 
                 print(
-                    "Não atingiu limite de postagem:",
-                    f"{result['score']:.0%}",
+                    "Não atingiu limite:",
+                    f"{result['score']:.1%}",
                     "|",
                     change.get("title")
                 )
@@ -963,12 +1102,20 @@ def analysis_worker():
 
 def wikimedia_loop():
 
+    global stream_connected
+    global last_stream_event_at
+    global last_ptwiki_edit_at
+    global current_stream_response
+
+
     while True:
+
+        response = None
 
         try:
 
             print(
-                "Conectando ao Wikimedia EventStreams..."
+                "📡 Conectando ao Wikimedia EventStreams..."
             )
 
 
@@ -976,11 +1123,21 @@ def wikimedia_loop():
                 WIKIMEDIA_STREAM,
                 headers=HEADERS,
                 stream=True,
-                timeout=90
+                timeout=(15, 90)
             )
 
 
             response.raise_for_status()
+
+
+            with stream_lock:
+
+                current_stream_response = response
+                stream_connected = True
+
+                # Evita watchdog agir imediatamente
+                # após uma conexão recém-aberta.
+                last_stream_event_at = time.time()
 
 
             client = SSEClient(
@@ -994,6 +1151,16 @@ def wikimedia_loop():
 
 
             for event in client.events():
+
+                # IMPORTANTE:
+                # atualizamos isso para TODO evento,
+                # mesmo que não seja da ptwiki.
+                with stream_lock:
+
+                    last_stream_event_at = (
+                        time.time()
+                    )
+
 
                 if not event.data:
                     continue
@@ -1009,8 +1176,6 @@ def wikimedia_loop():
                     continue
 
 
-                # Apenas Wikipédia em português.
-
                 if (
                     change.get("wiki")
                     !=
@@ -1018,8 +1183,6 @@ def wikimedia_loop():
                 ):
                     continue
 
-
-                # Apenas edições.
 
                 if (
                     change.get("type")
@@ -1029,13 +1192,18 @@ def wikimedia_loop():
                     continue
 
 
-                # Ignora bots.
-
                 if change.get(
                     "bot",
                     False
                 ):
                     continue
+
+
+                with stream_lock:
+
+                    last_ptwiki_edit_at = (
+                        time.time()
+                    )
 
 
                 analysis_queue.put(
@@ -1051,20 +1219,46 @@ def wikimedia_loop():
                 )
 
 
+            print(
+                "⚠️ EventStreams encerrou o fluxo."
+            )
+
+
         except Exception as e:
 
             print(
-                "EventStreams desconectado:",
+                "⚠️ EventStreams desconectado:",
                 e
             )
 
 
-            print(
-                "Reconectando em 5 segundos..."
-            )
+        finally:
+
+            with stream_lock:
+
+                if (
+                    current_stream_response
+                    is response
+                ):
+
+                    current_stream_response = None
+
+                stream_connected = False
 
 
-            time.sleep(5)
+            if response is not None:
+
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+
+        print(
+            "🔄 Reconectando em 5 segundos..."
+        )
+
+        time.sleep(5)
 
 
 # =========================================================
@@ -1101,32 +1295,37 @@ def main():
     )
 
     print(
+        "Watchdog:",
+        f"{STREAM_STALL_SECONDS}s"
+    )
+
+    print(
         "================================="
     )
 
 
-    telegram_thread = threading.Thread(
+    threading.Thread(
         target=telegram_sender,
         daemon=True
-    )
-
-    telegram_thread.start()
+    ).start()
 
 
-    analysis_thread = threading.Thread(
+    threading.Thread(
         target=analysis_worker,
         daemon=True
-    )
-
-    analysis_thread.start()
+    ).start()
 
 
-    command_thread = threading.Thread(
+    threading.Thread(
         target=telegram_command_listener,
         daemon=True
-    )
+    ).start()
 
-    command_thread.start()
+
+    threading.Thread(
+        target=eventstream_watchdog,
+        daemon=True
+    ).start()
 
 
     wikimedia_loop()
