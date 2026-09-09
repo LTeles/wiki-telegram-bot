@@ -49,8 +49,12 @@ REVERT_RISK_API = (
 # LIMITES
 # =========================================================
 
+# A partir deste risco o bot busca e analisa o diff.
 REVERT_RISK_THRESHOLD = 0.35
+
+# Score final mínimo para publicar no Telegram.
 VANDALISM_THRESHOLD = 0.55
+
 MAX_DIFF_CHARS = 6000
 
 
@@ -120,7 +124,7 @@ def send_telegram_message(text, chat_id=None):
 
             response.raise_for_status()
 
-            return
+            return True
 
         except Exception as e:
 
@@ -148,6 +152,7 @@ def telegram_sender():
 
             telegram_queue.task_done()
 
+        # Nunca envia mais de uma mensagem por segundo.
         time.sleep(1)
 
 
@@ -160,7 +165,7 @@ def telegram_command_listener():
     offset = None
 
     print(
-        "Listener de comandos Telegram iniciado."
+        "✅ Listener de comandos Telegram iniciado."
     )
 
     while True:
@@ -247,9 +252,9 @@ def telegram_command_listener():
                         (
                             "✅ Bot online.\n\n"
                             f"Canal: {TELEGRAM_CHANNEL}\n"
-                            f"Revert Risk mínimo: "
+                            f"Triagem Revert Risk: "
                             f"{REVERT_RISK_THRESHOLD:.0%}\n"
-                            f"Score mínimo final: "
+                            f"Score para postagem: "
                             f"{VANDALISM_THRESHOLD:.0%}\n"
                             f"Fila de análise: "
                             f"{analysis_queue.qsize()}"
@@ -297,7 +302,7 @@ def clean_html(text):
 
 
 # =========================================================
-# BUSCA O DIFF
+# BUSCA O DIFF DA EDIÇÃO
 # =========================================================
 
 def get_revision_diff(
@@ -572,7 +577,8 @@ def nonsense_score(text):
         )
 
         ratio = (
-            alphabetic /
+            alphabetic
+            /
             len(text)
         )
 
@@ -637,11 +643,26 @@ def analyze_vandalism(
     )
 
 
-    score = (
-        revert_risk * 0.75
-        +
-        heuristic * 0.25
-    )
+    # =====================================================
+    # NOVA LÓGICA DE SCORE
+    #
+    # O Revert Risk passa a ser o score-base.
+    #
+    # Exemplo:
+    # Revert Risk 60% = score inicial 60%.
+    #
+    # Heurísticas fortes acrescentam bônus.
+    # =====================================================
+
+    score = revert_risk
+
+
+    # Um sinal forte de vandalismo:
+    # +10 pontos percentuais.
+
+    if heuristic >= 0.75:
+
+        score += 0.10
 
 
     strong_signals = sum(
@@ -651,9 +672,12 @@ def analyze_vandalism(
     )
 
 
+    # Dois ou mais sinais fortes:
+    # +5 pontos adicionais.
+
     if strong_signals >= 2:
 
-        score += 0.08
+        score += 0.05
 
 
     score = min(
@@ -665,10 +689,22 @@ def analyze_vandalism(
     reasons = []
 
 
-    if revert_risk >= 0.90:
+    if revert_risk >= 0.85:
+
+        reasons.append(
+            "risco de reversão muito alto"
+        )
+
+    elif revert_risk >= 0.70:
 
         reasons.append(
             "alto risco de reversão"
+        )
+
+    elif revert_risk >= 0.55:
+
+        reasons.append(
+            "risco de reversão elevado"
         )
 
 
@@ -716,7 +752,7 @@ def analyze_vandalism(
 
 
 # =========================================================
-# FORMATA MENSAGEM
+# FORMATA A MENSAGEM DO TELEGRAM
 # =========================================================
 
 def format_message(
@@ -836,11 +872,21 @@ def analysis_worker():
             )
 
 
+            # Descarta antes de buscar o diff.
+
             if (
                 revert_risk
                 <
                 REVERT_RISK_THRESHOLD
             ):
+
+                print(
+                    "Descartada na triagem:",
+                    f"{revert_risk:.0%}",
+                    "|",
+                    change.get("title")
+                )
+
                 continue
 
 
@@ -884,6 +930,16 @@ def analysis_worker():
 
                 print(
                     "🚨 Possível vandalismo enviado:",
+                    change.get("title")
+                )
+
+
+            else:
+
+                print(
+                    "Não atingiu limite de postagem:",
+                    f"{result['score']:.0%}",
+                    "|",
                     change.get("title")
                 )
 
@@ -953,6 +1009,8 @@ def wikimedia_loop():
                     continue
 
 
+                # Apenas Wikipédia em português.
+
                 if (
                     change.get("wiki")
                     !=
@@ -961,6 +1019,8 @@ def wikimedia_loop():
                     continue
 
 
+                # Apenas edições.
+
                 if (
                     change.get("type")
                     !=
@@ -968,6 +1028,8 @@ def wikimedia_loop():
                 ):
                     continue
 
+
+                # Ignora bots.
 
                 if change.get(
                     "bot",
@@ -1029,7 +1091,12 @@ def main():
     )
 
     print(
-        "Threshold:",
+        "Triagem Revert Risk:",
+        f"{REVERT_RISK_THRESHOLD:.0%}"
+    )
+
+    print(
+        "Score para postagem:",
         f"{VANDALISM_THRESHOLD:.0%}"
     )
 
