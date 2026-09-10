@@ -81,6 +81,302 @@ watched_pages = set()
 watchlist_lock = threading.Lock()
 
 
+def ensure_watchlist_storage():
+
+    directory = os.path.dirname(
+        WATCHLIST_FILE
+    )
+
+    try:
+
+        if directory:
+            os.makedirs(
+                directory,
+                exist_ok=True
+            )
+
+        test_file = os.path.join(
+            directory or ".",
+            ".watchlist_write_test"
+        )
+
+        with open(
+            test_file,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            file.write("ok")
+
+        os.remove(
+            test_file
+        )
+
+        print(
+            "✅ Armazenamento da watchlist gravável."
+        )
+
+        print(
+            "📁 WATCHLIST_FILE:",
+            WATCHLIST_FILE
+        )
+
+        print(
+            "📁 Diretório:",
+            directory or "."
+        )
+
+        print(
+            "📄 Arquivo existe:",
+            os.path.exists(
+                WATCHLIST_FILE
+            )
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "❌ WATCHLIST SEM PERSISTÊNCIA/ESCRITA:"
+        )
+
+        print(
+            "❌ Caminho:",
+            WATCHLIST_FILE
+        )
+
+        print(
+            "❌ Erro:",
+            repr(e)
+        )
+
+        return False
+
+
+def save_watchlist_snapshot(snapshot):
+
+    directory = os.path.dirname(
+        WATCHLIST_FILE
+    )
+
+    if directory:
+        os.makedirs(
+            directory,
+            exist_ok=True
+        )
+
+    temp_file = (
+        WATCHLIST_FILE
+        + ".tmp"
+    )
+
+    with open(
+        temp_file,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            sorted(snapshot),
+            file,
+            ensure_ascii=False,
+            indent=2
+        )
+
+        file.flush()
+
+        os.fsync(
+            file.fileno()
+        )
+
+    os.replace(
+        temp_file,
+        WATCHLIST_FILE
+    )
+
+    print(
+        "💾 Watchlist salva:",
+        WATCHLIST_FILE,
+        "| páginas:",
+        len(snapshot)
+    )
+
+
+def load_watchlist():
+
+    global watched_pages
+
+    print(
+        "📁 Carregando watchlist de:",
+        WATCHLIST_FILE
+    )
+
+    try:
+
+        if not os.path.exists(
+            WATCHLIST_FILE
+        ):
+
+            print(
+                "👁 Arquivo de watchlist ainda não existe."
+            )
+
+            with watchlist_lock:
+                watched_pages = set()
+
+            return
+
+        with open(
+            WATCHLIST_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(
+                file
+            )
+
+        if not isinstance(
+            data,
+            list
+        ):
+
+            raise ValueError(
+                "Formato inválido da watchlist."
+            )
+
+        with watchlist_lock:
+
+            watched_pages = set(
+                str(item)
+                for item in data
+            )
+
+        print(
+            "✅ Watchlist carregada."
+        )
+
+        print(
+            "👁 Páginas vigiadas:",
+            len(watched_pages)
+        )
+
+        for page in sorted(
+            watched_pages,
+            key=str.lower
+        ):
+
+            print(
+                "   •",
+                page
+            )
+
+    except json.JSONDecodeError as e:
+
+        print(
+            "❌ watchlist.json corrompido:",
+            e
+        )
+
+        with watchlist_lock:
+            watched_pages = set()
+
+    except Exception as e:
+
+        print(
+            "❌ Erro ao carregar watchlist:",
+            repr(e)
+        )
+
+
+def add_watched_page(title):
+
+    with watchlist_lock:
+
+        if title in watched_pages:
+            return True, False
+
+        snapshot = set(
+            watched_pages
+        )
+
+        snapshot.add(
+            title
+        )
+
+    try:
+
+        save_watchlist_snapshot(
+            snapshot
+        )
+
+    except Exception as e:
+
+        print(
+            "❌ Erro ao salvar watchlist:",
+            repr(e)
+        )
+
+        return False, False
+
+    with watchlist_lock:
+
+        watched_pages.add(
+            title
+        )
+
+    return True, True
+
+
+def remove_watched_page(title):
+
+    with watchlist_lock:
+
+        if title not in watched_pages:
+            return True, False
+
+        snapshot = set(
+            watched_pages
+        )
+
+        snapshot.remove(
+            title
+        )
+
+    try:
+
+        save_watchlist_snapshot(
+            snapshot
+        )
+
+    except Exception as e:
+
+        print(
+            "❌ Erro ao salvar watchlist:",
+            repr(e)
+        )
+
+        return False, False
+
+    with watchlist_lock:
+
+        watched_pages.discard(
+            title
+        )
+
+    return True, True
+
+
+def is_watched_page(title):
+
+    with watchlist_lock:
+
+        return (
+            title
+            in watched_pages
+        )
+
+
 # =========================================================
 # CACHE
 # =========================================================
