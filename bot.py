@@ -7,8 +7,10 @@ import re
 import html
 import ipaddress
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from statistics import median
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 from sseclient import SSEClient
@@ -18,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.10"
+BOT_VERSION = "1.11"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -66,6 +68,11 @@ ABUSE_FILTER_BATCH_LIMIT = 500
 POSTED_EDIT_CHECK_SECONDS = 90
 POSTED_EDIT_TRACK_SECONDS = 48 * 60 * 60
 
+DETECTION_STATS_RETENTION_DAYS = 90
+DAILY_REPORT_HOUR = 20
+DAILY_REPORT_MINUTE = 5
+REPORT_TIMEZONE = "America/Sao_Paulo"
+
 
 # =========================================================
 # ARQUIVOS PERSISTENTES
@@ -106,6 +113,11 @@ POSTED_EDITS_FILE = os.environ.get(
     "/data/posted_edits.json"
 )
 
+DETECTION_STATS_FILE = os.environ.get(
+    "DETECTION_STATS_FILE",
+    "/data/detection_stats.json"
+)
+
 
 # =========================================================
 # ESTADO EM MEMÓRIA
@@ -132,6 +144,14 @@ abuse_state_lock = threading.Lock()
 # revisão -> metadados da mensagem do Telegram
 posted_edits = {}
 posted_edits_lock = threading.Lock()
+
+# Estatísticas dos alertas do detector normal.
+# Mantidas separadamente das mensagens acompanhadas por 48h.
+detection_stats = {
+    "records": [],
+    "last_report_date": None,
+}
+detection_stats_lock = threading.Lock()
 
 user_cache = {}
 
@@ -195,6 +215,7 @@ def ensure_storage():
         ABUSE_FILTERS_FILE,
         ABUSE_FILTER_STATE_FILE,
         POSTED_EDITS_FILE,
+        DETECTION_STATS_FILE,
     ]
 
     directories = {
@@ -226,6 +247,7 @@ def ensure_storage():
         print("📁 Filtros de abuso:", ABUSE_FILTERS_FILE)
         print("📁 Estado dos filtros:", ABUSE_FILTER_STATE_FILE)
         print("📁 Edições publicadas:", POSTED_EDITS_FILE)
+        print("📁 Estatísticas do detector:", DETECTION_STATS_FILE)
         print("📁 Versão do bot:", BOT_VERSION_FILE)
 
         return True
@@ -1555,6 +1577,577 @@ def abuse_filter_monitor():
 
 
 # =========================================================
+# ESTATÍSTICAS DO DETECTOR NORMAL
+# =========================================================
+
+def save_detection_stats():
+    with detection_stats_lock:
+        data = {
+            "records": list(
+                detection_stats.get("records", [])
+            ),
+            "last_report_date": detection_stats.get(
+                "last_report_date"
+            ),
+        }
+
+    atomic_write_json(
+        DETECTION_STATS_FILE,
+        data
+    )
+
+
+def cleanup_detection_stats(save=True):
+    cutoff = (
+        time.time()
+        -
+        DETECTION_STATS_RETENTION_DAYS
+        * 24
+        * 60
+        * 60
+    )
+
+    removed = False
+
+    with detection_stats_lock:
+        records = detection_stats.get(
+            "records",
+            []
+        )
+
+        kept = [
+            item
+            for item in records
+            if float(
+                item.get("posted_at", 0)
+            ) >= cutoff
+        ]
+
+        if len(kept) != len(records):
+            detection_stats["records"] = kept
+            removed = True
+
+    if removed and save:
+        try:
+            save_detection_stats()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao limpar estatísticas:",
+                repr(e)
+            )
+
+
+def load_detection_stats():
+    global detection_stats
+
+    data = load_json(
+        DETECTION_STATS_FILE,
+        {
+            "records": [],
+            "last_report_date": None,
+        }
+    )
+
+    if not isinstance(data, dict):
+        data = {
+            "records": [],
+            "last_report_date": None,
+        }
+
+    raw_records = data.get(
+        "records",
+        []
+    )
+
+    loaded_records = []
+
+    if isinstance(raw_records, list):
+        for item in raw_records:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                revision_id = int(
+                    item.get("revision_id")
+                )
+                posted_at = float(
+                    item.get("posted_at")
+                )
+                score = float(
+                    item.get("score")
+                )
+                revert_risk = float(
+                    item.get("revert_risk")
+                )
+            except Exception:
+                continue
+
+            reverted_at = item.get(
+                "reverted_at"
+            )
+
+            if reverted_at is not None:
+                try:
+                    reverted_at = float(
+                        reverted_at
+                    )
+                except Exception:
+                    reverted_at = None
+
+            loaded_records.append(
+                {
+                    "revision_id": revision_id,
+                    "title": item.get("title"),
+                    "posted_at": posted_at,
+                    "score": score,
+                    "revert_risk": revert_risk,
+                    "reverted_at": reverted_at,
+                }
+            )
+
+    with detection_stats_lock:
+        detection_stats = {
+            "records": loaded_records,
+            "last_report_date": data.get(
+                "last_report_date"
+            ),
+        }
+
+    cleanup_detection_stats(save=False)
+
+    print(
+        "✅ Registros estatísticos carregados:",
+        len(
+            detection_stats.get(
+                "records",
+                []
+            )
+        )
+    )
+
+    try:
+        save_detection_stats()
+    except Exception:
+        pass
+
+
+def register_detection_stat(
+    revision_id,
+    title,
+    posted_at,
+    score,
+    revert_risk
+):
+    try:
+        record = {
+            "revision_id": int(revision_id),
+            "title": title,
+            "posted_at": float(posted_at),
+            "score": float(score),
+            "revert_risk": float(revert_risk),
+            "reverted_at": None,
+        }
+    except Exception:
+        return
+
+    with detection_stats_lock:
+        records = detection_stats.setdefault(
+            "records",
+            []
+        )
+
+        existing = next(
+            (
+                item
+                for item in records
+                if int(
+                    item.get(
+                        "revision_id",
+                        0
+                    )
+                )
+                ==
+                record["revision_id"]
+            ),
+            None
+        )
+
+        if existing is None:
+            records.append(record)
+        else:
+            existing.update(record)
+
+    try:
+        save_detection_stats()
+    except Exception as e:
+        print(
+            "⚠️ Erro ao salvar estatística:",
+            repr(e)
+        )
+
+
+def mark_detection_stat_reverted(
+    revision_id,
+    reverted_at
+):
+    changed = False
+
+    with detection_stats_lock:
+        for item in detection_stats.get(
+            "records",
+            []
+        ):
+            if (
+                int(
+                    item.get(
+                        "revision_id",
+                        0
+                    )
+                )
+                ==
+                int(revision_id)
+            ):
+                if item.get(
+                    "reverted_at"
+                ) is None:
+                    item["reverted_at"] = float(
+                        reverted_at
+                    )
+                    changed = True
+                break
+
+    if changed:
+        try:
+            save_detection_stats()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao salvar reversão estatística:",
+                repr(e)
+            )
+
+
+def format_percent(value):
+    return (
+        f"{value:.1f}"
+        .replace(".", ",")
+        +
+        "%"
+    )
+
+
+def format_minutes(seconds):
+    if seconds is None:
+        return "—"
+
+    minutes = max(
+        0,
+        int(round(seconds / 60))
+    )
+
+    if minutes < 60:
+        return f"{minutes} min"
+
+    hours = minutes // 60
+    remaining = minutes % 60
+
+    if remaining:
+        return f"{hours}h {remaining}min"
+
+    return f"{hours}h"
+
+
+def score_band_summary(records, minimum, maximum):
+    items = [
+        item
+        for item in records
+        if float(
+            item.get("score", 0)
+        ) >= minimum
+        and
+        float(
+            item.get("score", 0)
+        ) < maximum
+    ]
+
+    total = len(items)
+    reverted = sum(
+        1
+        for item in items
+        if item.get("reverted_at") is not None
+    )
+
+    percent = (
+        reverted / total * 100
+        if total
+        else 0.0
+    )
+
+    return total, reverted, percent
+
+
+def build_daily_detection_report(
+    start_timestamp,
+    end_timestamp
+):
+    with detection_stats_lock:
+        records = [
+            dict(item)
+            for item in detection_stats.get(
+                "records",
+                []
+            )
+            if float(
+                item.get("posted_at", 0)
+            ) >= start_timestamp
+            and
+            float(
+                item.get("posted_at", 0)
+            ) < end_timestamp
+        ]
+
+    total = len(records)
+
+    reverted_records = [
+        item
+        for item in records
+        if item.get("reverted_at") is not None
+    ]
+
+    reverted = len(reverted_records)
+    pending = total - reverted
+
+    reverted_pct = (
+        reverted / total * 100
+        if total
+        else 0.0
+    )
+
+    pending_pct = (
+        pending / total * 100
+        if total
+        else 0.0
+    )
+
+    avg_risk = (
+        sum(
+            float(
+                item.get(
+                    "revert_risk",
+                    0
+                )
+            )
+            for item in records
+        )
+        /
+        total
+        *
+        100
+        if total
+        else 0.0
+    )
+
+    avg_score = (
+        sum(
+            float(
+                item.get(
+                    "score",
+                    0
+                )
+            )
+            for item in records
+        )
+        /
+        total
+        *
+        100
+        if total
+        else 0.0
+    )
+
+    reversal_times = [
+        max(
+            0,
+            float(
+                item["reverted_at"]
+            )
+            -
+            float(
+                item["posted_at"]
+            )
+        )
+        for item in reverted_records
+    ]
+
+    median_reversal = (
+        median(reversal_times)
+        if reversal_times
+        else None
+    )
+
+    bands = [
+        ("45–59%", 0.45, 0.60),
+        ("60–79%", 0.60, 0.80),
+        ("80–100%", 0.80, 1.000001),
+    ]
+
+    band_lines = []
+
+    for label, minimum, maximum in bands:
+        band_total, band_reverted, band_pct = (
+            score_band_summary(
+                records,
+                minimum,
+                maximum
+            )
+        )
+
+        band_lines.append(
+            (
+                f"• {label}: "
+                f"{band_total} alertas • "
+                f"{band_reverted} revertidas "
+                f"({format_percent(band_pct)})"
+            )
+        )
+
+    tz = ZoneInfo(REPORT_TIMEZONE)
+
+    start_dt = datetime.fromtimestamp(
+        start_timestamp,
+        tz
+    )
+
+    end_dt = datetime.fromtimestamp(
+        end_timestamp,
+        tz
+    )
+
+    period_text = (
+        start_dt.strftime(
+            "%d/%m %H:%M"
+        )
+        +
+        " → "
+        +
+        end_dt.strftime(
+            "%d/%m %H:%M"
+        )
+        +
+        " (Brasília)"
+    )
+
+    return (
+        "📊 Relatório diário — detector de vandalismo\n\n"
+        f"🕐 Período: {period_text}\n\n"
+        f"🚨 Alertas de possível vandalismo: {total}\n"
+        f"↩️ Edições revertidas: "
+        f"{reverted} ({format_percent(reverted_pct)})\n"
+        f"⏳ Ainda não revertidas: "
+        f"{pending} ({format_percent(pending_pct)})\n\n"
+        f"🤖 Revert Risk médio: "
+        f"{format_percent(avg_risk)}\n"
+        f"🎯 Score médio final: "
+        f"{format_percent(avg_score)}\n"
+        f"⏱ Mediana até detecção da reversão: "
+        f"{format_minutes(median_reversal)}\n\n"
+        "📈 Por faixa de score:\n"
+        +
+        "\n".join(band_lines)
+        +
+        "\n\n"
+        "ℹ️ Considera apenas alertas do detector normal. "
+        "“Ainda não revertida” pode mudar durante as "
+        "48 horas de acompanhamento."
+    )
+
+
+def daily_detection_report_scheduler():
+    print(
+        "✅ Relatório diário agendado para "
+        "20:05 (horário de Brasília)."
+    )
+
+    tz = ZoneInfo(
+        REPORT_TIMEZONE
+    )
+
+    while True:
+        try:
+            cleanup_detection_stats()
+
+            now = datetime.now(tz)
+
+            report_end = now.replace(
+                hour=DAILY_REPORT_HOUR,
+                minute=DAILY_REPORT_MINUTE,
+                second=0,
+                microsecond=0
+            )
+
+            report_date = report_end.date().isoformat()
+
+            with detection_stats_lock:
+                last_report_date = (
+                    detection_stats.get(
+                        "last_report_date"
+                    )
+                )
+
+            if (
+                now >= report_end
+                and
+                last_report_date
+                !=
+                report_date
+            ):
+                end_timestamp = (
+                    report_end.timestamp()
+                )
+
+                start_timestamp = (
+                    report_end
+                    -
+                    timedelta(hours=24)
+                ).timestamp()
+
+                message = (
+                    build_daily_detection_report(
+                        start_timestamp,
+                        end_timestamp
+                    )
+                )
+
+                sent = send_telegram_message(
+                    message
+                )
+
+                if sent:
+                    with detection_stats_lock:
+                        detection_stats[
+                            "last_report_date"
+                        ] = report_date
+
+                    save_detection_stats()
+
+                    print(
+                        "📊 Relatório diário publicado:",
+                        report_date
+                    )
+                else:
+                    print(
+                        "⚠️ Falha ao publicar relatório diário."
+                    )
+
+        except Exception as e:
+            print(
+                "⚠️ Erro no relatório diário:",
+                repr(e)
+            )
+
+        time.sleep(30)
+
+
+# =========================================================
 # EDIÇÕES PUBLICADAS / STATUS POSTERIOR
 # =========================================================
 
@@ -1670,6 +2263,8 @@ def register_posted_edit(item, telegram_message):
     except Exception:
         return
 
+    posted_at = time.time()
+
     record = {
         "revision_id": revision_id,
         "rcid": item.get("rcid"),
@@ -1677,7 +2272,7 @@ def register_posted_edit(item, telegram_message):
         "message_id": message_id,
         "base_message": item.get("message", ""),
         "parse_mode": item.get("parse_mode"),
-        "posted_at": time.time(),
+        "posted_at": posted_at,
         "status": None,
     }
 
@@ -1699,6 +2294,21 @@ def register_posted_edit(item, telegram_message):
         print(
             "⚠️ Erro ao persistir revisão publicada:",
             repr(e)
+        )
+
+    stats_payload = item.get(
+        "stats_payload"
+    )
+
+    if isinstance(stats_payload, dict):
+        register_detection_stat(
+            revision_id=revision_id,
+            title=item.get("page_title"),
+            posted_at=posted_at,
+            score=stats_payload.get("score"),
+            revert_risk=stats_payload.get(
+                "revert_risk"
+            ),
         )
 
 
@@ -1968,6 +2578,12 @@ def posted_edit_status_monitor():
                             live["status"] = new_status
 
                     changed_any = True
+
+                    if new_status == "reverted":
+                        mark_detection_stat_reverted(
+                            revision_id,
+                            time.time()
+                        )
 
                     print(
                         "✏️ Mensagem atualizada:",
@@ -3048,7 +3664,12 @@ def build_diff_url(change):
     )
 
 
-def tracked_queue_item(change, message, title):
+def tracked_queue_item(
+    change,
+    message,
+    title,
+    stats_payload=None
+):
     revision = change.get("revision", {})
 
     return {
@@ -3058,6 +3679,7 @@ def tracked_queue_item(change, message, title):
         "revision_id": revision.get("new"),
         "rcid": change.get("id"),
         "page_title": change.get("title"),
+        "stats_payload": stats_payload,
     }
 
 
@@ -3249,7 +3871,13 @@ def analysis_worker():
                     tracked_queue_item(
                         change,
                         message,
-                        title
+                        title,
+                        stats_payload={
+                            "score": result["score"],
+                            "revert_risk": result[
+                                "revert_risk"
+                            ],
+                        }
                     )
                 )
 
@@ -3382,6 +4010,14 @@ def process_telegram_command(message, from_channel=False):
                 posted_edits
             )
 
+        with detection_stats_lock:
+            stats_count = len(
+                detection_stats.get(
+                    "records",
+                    []
+                )
+            )
+
         if patrol_visibility_supported is True:
             patrol_text = "disponível"
         elif patrol_visibility_supported is False:
@@ -3421,6 +4057,9 @@ def process_telegram_command(message, from_channel=False):
                 f"{filter_count}\n"
                 f"📝 Edições acompanhadas: "
                 f"{tracked_count}\n"
+                f"📊 Registros estatísticos (90d): "
+                f"{stats_count}\n"
+                f"🕗 Relatório diário: 20:05 (Brasília)\n"
                 f"✅ Patrulhamento: "
                 f"{patrol_text}\n"
                 f"🔒 Monitor de bloqueios: ativo\n\n"
@@ -4368,10 +5007,12 @@ def main():
     load_abuse_filters()
     load_abuse_filter_state()
     load_posted_edits()
+    load_detection_stats()
 
     cleanup_expired_observations()
     cleanup_expired_ignored_users()
     cleanup_posted_edits()
+    cleanup_detection_stats()
 
     print(
         "🔎 Revert Risk mínimo:",
@@ -4403,6 +5044,13 @@ def main():
         "✅ Monitor de patrulhamento: "
         "tentará usar a API pública"
     )
+    print(
+        "📊 Relatório diário: 20:05 "
+        "(horário de Brasília)"
+    )
+    print(
+        "🗃 Histórico estatístico: 90 dias"
+    )
 
     threads = [
         ("telegram-sender", telegram_sender),
@@ -4412,6 +5060,7 @@ def main():
         ("telegram-listener", telegram_command_listener),
         ("abuse-filter-monitor", abuse_filter_monitor),
         ("posted-edit-status", posted_edit_status_monitor),
+        ("daily-detection-report", daily_detection_report_scheduler),
     ]
 
     for name, target in threads:
