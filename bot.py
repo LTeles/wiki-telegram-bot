@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.11"
+BOT_VERSION = "1.12"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -32,6 +32,14 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 WIKIMEDIA_STREAM = "https://stream.wikimedia.org/v2/stream/recentchange"
 WIKIPEDIA_API = "https://pt.wikipedia.org/w/api.php"
+
+WIKIMEDIA_BOT_USERNAME = os.environ.get(
+    "WIKIMEDIA_BOT_USERNAME"
+)
+WIKIMEDIA_BOT_PASSWORD = os.environ.get(
+    "WIKIMEDIA_BOT_PASSWORD"
+)
+
 REVERT_RISK_API = (
     "https://api.wikimedia.org/service/lw/inference/v1/"
     "models/revertrisk-multilingual:predict"
@@ -65,8 +73,15 @@ IGNORE_DURATION_SECONDS = 6 * 60 * 60
 ABUSE_FILTER_POLL_SECONDS = 20
 ABUSE_FILTER_BATCH_LIMIT = 500
 
-POSTED_EDIT_CHECK_SECONDS = 90
+POSTED_EDIT_CHECK_SECONDS = 60
 POSTED_EDIT_TRACK_SECONDS = 48 * 60 * 60
+
+# Patrulhamento: teto explícito de uma chamada à API por minuto.
+PATROL_REQUEST_INTERVAL_SECONDS = 60
+PATROL_RECENTCHANGES_LIMIT = 500
+
+# Reversões são verificadas em lote, reduzindo chamadas individuais.
+REVISION_TAG_BATCH_SIZE = 50
 
 DETECTION_STATS_RETENTION_DAYS = 90
 DAILY_REPORT_HOUR = 20
@@ -167,6 +182,19 @@ current_stream_response = None
 
 patrol_visibility_supported = None
 patrol_visibility_warning_printed = False
+
+# Sessão autenticada para leituras que exigem direitos Wikimedia.
+wikimedia_session = requests.Session()
+wikimedia_session.headers.update(HEADERS)
+wikimedia_auth_lock = threading.Lock()
+wikimedia_authenticated = False
+wikimedia_authenticated_user = None
+wikimedia_auth_error = None
+wikimedia_rights = set()
+
+# Controle explícito do teto de patrulhamento.
+patrol_request_lock = threading.Lock()
+last_patrol_request_at = 0.0
 
 
 # =========================================================
@@ -2375,42 +2403,293 @@ def get_revision_tags(revision_id):
     return set()
 
 
-def check_revision_patrolled(title, revision_id):
+def wikimedia_login():
     """
-    Retorna:
-      True  -> patrulhada
-      False -> encontrada e ainda não patrulhada
-      None  -> não foi possível determinar
-
-    A propriedade 'patrolled' da API RecentChanges pode exigir
-    o direito patrol/patrolmarks. Se a ptwiki não a expuser à
-    sessão anônima usada pelo bot, a função degrada sem interromper
-    o restante do monitor.
+    Autentica uma única sessão persistente usando Bot Password.
+    O login via Bot Password usa duas chamadas: token + POST login.
+    Em seguida, uma terceira chamada consulta os direitos da conta.
     """
 
+    global wikimedia_authenticated
+    global wikimedia_authenticated_user
+    global wikimedia_auth_error
+    global wikimedia_rights
+    global patrol_visibility_supported
+
+    if not WIKIMEDIA_BOT_USERNAME or not WIKIMEDIA_BOT_PASSWORD:
+        wikimedia_authenticated = False
+        wikimedia_authenticated_user = None
+        wikimedia_rights = set()
+        wikimedia_auth_error = (
+            "credenciais Wikimedia não configuradas"
+        )
+        patrol_visibility_supported = False
+        print(
+            "⚠️ WIKIMEDIA_BOT_USERNAME/WIKIMEDIA_BOT_PASSWORD "
+            "não configurados."
+        )
+        return False
+
+    with wikimedia_auth_lock:
+        try:
+            token_response = wikimedia_session.get(
+                WIKIPEDIA_API,
+                params={
+                    "action": "query",
+                    "meta": "tokens",
+                    "type": "login",
+                    "format": "json",
+                    "formatversion": 2,
+                },
+                timeout=25
+            )
+            token_response.raise_for_status()
+            token_data = token_response.json()
+            login_token = (
+                token_data
+                .get("query", {})
+                .get("tokens", {})
+                .get("logintoken")
+            )
+
+            if not login_token:
+                raise RuntimeError(
+                    "token de login não retornado"
+                )
+
+            login_response = wikimedia_session.post(
+                WIKIPEDIA_API,
+                data={
+                    "action": "login",
+                    "lgname": WIKIMEDIA_BOT_USERNAME,
+                    "lgpassword": WIKIMEDIA_BOT_PASSWORD,
+                    "lgtoken": login_token,
+                    "format": "json",
+                    "formatversion": 2,
+                },
+                timeout=25
+            )
+            login_response.raise_for_status()
+            login_data = login_response.json()
+
+            login_result = (
+                login_data
+                .get("login", {})
+                .get("result")
+            )
+
+            if login_result != "Success":
+                reason = (
+                    login_data
+                    .get("login", {})
+                    .get("reason")
+                    or
+                    login_result
+                    or
+                    "falha desconhecida"
+                )
+                raise RuntimeError(
+                    f"login Wikimedia falhou: {reason}"
+                )
+
+            user_response = wikimedia_session.get(
+                WIKIPEDIA_API,
+                params={
+                    "action": "query",
+                    "meta": "userinfo",
+                    "uiprop": "rights",
+                    "format": "json",
+                    "formatversion": 2,
+                },
+                timeout=25
+            )
+            user_response.raise_for_status()
+            user_data = user_response.json()
+            userinfo = (
+                user_data
+                .get("query", {})
+                .get("userinfo", {})
+            )
+
+            wikimedia_authenticated_user = userinfo.get("name")
+            wikimedia_rights = set(
+                userinfo.get("rights", [])
+            )
+            wikimedia_authenticated = not bool(
+                userinfo.get("anon")
+            )
+
+            has_patrol_visibility = bool(
+                {"patrol", "patrolmarks"}
+                &
+                wikimedia_rights
+            )
+
+            patrol_visibility_supported = (
+                wikimedia_authenticated
+                and
+                has_patrol_visibility
+            )
+
+            if not wikimedia_authenticated:
+                raise RuntimeError(
+                    "sessão permaneceu anônima após login"
+                )
+
+            if not has_patrol_visibility:
+                wikimedia_auth_error = (
+                    "conta autenticada sem direito patrol/patrolmarks"
+                )
+                print(
+                    "⚠️ Login Wikimedia OK, mas a conta não possui "
+                    "patrol/patrolmarks."
+                )
+                return True
+
+            wikimedia_auth_error = None
+            print(
+                "✅ Wikimedia autenticada como:",
+                wikimedia_authenticated_user
+            )
+            print(
+                "✅ Direito de leitura de patrulhamento disponível."
+            )
+            return True
+
+        except Exception as e:
+            wikimedia_authenticated = False
+            wikimedia_authenticated_user = None
+            wikimedia_rights = set()
+            patrol_visibility_supported = False
+            wikimedia_auth_error = str(e)
+            print(
+                "❌ Falha no login Wikimedia:",
+                repr(e)
+            )
+            return False
+
+
+def get_revision_tags_batch(revision_ids):
+    """
+    Consulta tags de várias revisões em uma única chamada.
+    O lote é limitado a REVISION_TAG_BATCH_SIZE para manter a
+    requisição pequena e previsível.
+    """
+
+    ids = []
+
+    for revision_id in revision_ids:
+        try:
+            value = int(revision_id)
+        except Exception:
+            continue
+
+        if value not in ids:
+            ids.append(value)
+
+        if len(ids) >= REVISION_TAG_BATCH_SIZE:
+            break
+
+    if not ids:
+        return {}
+
+    try:
+        response = wikimedia_session.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "prop": "revisions",
+                "revids": "|".join(
+                    str(value)
+                    for value in ids
+                ),
+                "rvprop": "ids|tags",
+            },
+            timeout=25
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        result = {
+            value: set()
+            for value in ids
+        }
+
+        for page in (
+            data
+            .get("query", {})
+            .get("pages", [])
+        ):
+            for revision in page.get("revisions", []):
+                try:
+                    revid = int(
+                        revision.get("revid")
+                    )
+                except Exception:
+                    continue
+
+                result[revid] = set(
+                    revision.get("tags", [])
+                )
+
+        return result
+
+    except Exception as e:
+        print(
+            "⚠️ Erro na consulta em lote de tags:",
+            repr(e)
+        )
+        return {}
+
+
+def get_patrol_status_batch(records):
+    """
+    Faz NO MÁXIMO UMA solicitação de patrulhamento por minuto.
+
+    A chamada busca até 500 mudanças recentes de uma vez e compara
+    localmente os revids/rcids com as mensagens acompanhadas.
+    Isso evita uma requisição por edição.
+    """
+
+    global last_patrol_request_at
     global patrol_visibility_supported
     global patrol_visibility_warning_printed
 
-    if patrol_visibility_supported is False:
-        return None
+    if not wikimedia_authenticated:
+        return {}
+
+    if patrol_visibility_supported is not True:
+        return {}
+
+    now = time.monotonic()
+
+    with patrol_request_lock:
+        elapsed = now - last_patrol_request_at
+
+        if elapsed < PATROL_REQUEST_INTERVAL_SECONDS:
+            return {}
+
+        # Reserva o ciclo antes da chamada para impedir que duas
+        # threads disparem requisições simultâneas por acidente.
+        last_patrol_request_at = now
 
     try:
-        response = requests.get(
+        response = wikimedia_session.get(
             WIKIPEDIA_API,
             params={
                 "action": "query",
                 "format": "json",
                 "formatversion": 2,
                 "list": "recentchanges",
-                "rctitle": title,
                 "rctype": "edit|new",
                 "rcprop": "ids|patrolled|timestamp",
-                "rclimit": 500,
+                "rclimit": PATROL_RECENTCHANGES_LIMIT,
+                "rcdir": "older",
             },
-            headers=HEADERS,
             timeout=25
         )
-
         response.raise_for_status()
         data = response.json()
 
@@ -2418,23 +2697,20 @@ def check_revision_patrolled(title, revision_id):
 
         if error:
             code = error.get("code", "")
+            info = error.get("info", "")
 
             if code == "rcpermissiondenied":
                 patrol_visibility_supported = False
 
-                if not patrol_visibility_warning_printed:
-                    patrol_visibility_warning_printed = True
-                    print(
-                        "⚠️ A API não permite consultar a marca "
-                        "de patrulhamento sem autenticação Wikimedia. "
-                        "Reversões continuarão sendo acompanhadas."
-                    )
+            if not patrol_visibility_warning_printed:
+                patrol_visibility_warning_printed = True
+                print(
+                    "⚠️ Falha ao ler patrulhamento:",
+                    code,
+                    info
+                )
 
-                return None
-
-            return None
-
-        patrol_visibility_supported = True
+            return {}
 
         changes = (
             data
@@ -2442,35 +2718,39 @@ def check_revision_patrolled(title, revision_id):
             .get("recentchanges", [])
         )
 
-        for change in changes:
-            if (
-                int(
-                    change.get(
-                        "revid",
-                        0
-                    )
-                )
-                ==
-                int(revision_id)
-            ):
-                # Quando solicitada, a API inclui a chave
-                # "patrolled" nas mudanças patrulhadas.
-                return (
-                    "patrolled"
-                    in change
-                    and
-                    change.get("patrolled") is not False
-                )
+        tracked_ids = {
+            int(record["revision_id"])
+            for record in records
+            if record.get("revision_id") is not None
+        }
 
-        return None
+        result = {}
+
+        for change in changes:
+            try:
+                revid = int(
+                    change.get("revid", 0)
+                )
+            except Exception:
+                continue
+
+            if revid not in tracked_ids:
+                continue
+
+            result[revid] = (
+                "patrolled" in change
+                and
+                change.get("patrolled") is not False
+            )
+
+        return result
 
     except Exception as e:
         print(
-            "⚠️ Erro ao consultar patrulhamento:",
-            revision_id,
+            "⚠️ Erro na consulta em lote de patrulhamento:",
             repr(e)
         )
-        return None
+        return {}
 
 
 def message_with_status(record, status):
@@ -2500,6 +2780,11 @@ def posted_edit_status_monitor():
     print(
         "✅ Monitor de reversões/patrulhamento iniciado."
     )
+    print(
+        "🔄 Patrulhamento em lote: máximo de 1 chamada/minuto."
+    )
+
+    revision_cursor = 0
 
     while True:
         time.sleep(POSTED_EDIT_CHECK_SECONDS)
@@ -2513,42 +2798,68 @@ def posted_edit_status_monitor():
                 in posted_edits.values()
             ]
 
+        active = [
+            record
+            for record in snapshot
+            if record.get("status") != "reverted"
+        ]
+
+        if not active:
+            continue
+
+        # -------- Reversões em lote --------
+        # Até 50 revisões por chamada. Se houver mais, os lotes são
+        # percorridos em rodízio a cada ciclo para manter a carga baixa.
+        total_active = len(active)
+
+        if revision_cursor >= total_active:
+            revision_cursor = 0
+
+        ordered = (
+            active[revision_cursor:]
+            +
+            active[:revision_cursor]
+        )
+
+        revision_batch = ordered[:REVISION_TAG_BATCH_SIZE]
+        revision_cursor = (
+            revision_cursor
+            +
+            len(revision_batch)
+        ) % max(total_active, 1)
+
+        tags_by_revision = get_revision_tags_batch(
+            [
+                record["revision_id"]
+                for record in revision_batch
+            ]
+        )
+
+        # -------- Patrulhamento em lote --------
+        # Teto rígido: no máximo uma chamada à API a cada 60 s.
+        patrol_by_revision = get_patrol_status_batch(
+            active
+        )
+
         changed_any = False
 
-        for record in snapshot:
-            revision_id = record["revision_id"]
+        for record in active:
+            revision_id = int(
+                record["revision_id"]
+            )
             current_status = record.get("status")
+            new_status = None
 
-            # Uma vez revertida, o estado final desejado pelo usuário
-            # é "revertida", mesmo que também seja patrulhada.
-            if current_status == "reverted":
-                continue
-
-            tags = get_revision_tags(
+            tags = tags_by_revision.get(
                 revision_id
             )
 
-            if "mw-reverted" in tags:
+            if tags and "mw-reverted" in tags:
                 new_status = "reverted"
 
-            else:
-                # Se já está marcada como patrulhada, continuamos
-                # verificando somente se posteriormente foi revertida.
-                if current_status == "patrolled":
-                    continue
-
-                new_status = None
-
-                title = record.get("title")
-
-                if title:
-                    patrolled = check_revision_patrolled(
-                        title,
-                        revision_id
-                    )
-
-                    if patrolled is True:
-                        new_status = "patrolled"
+            elif current_status != "patrolled":
+                if patrol_by_revision.get(revision_id) is True:
+                    new_status = "patrolled"
 
             if (
                 new_status
@@ -4018,14 +4329,21 @@ def process_telegram_command(message, from_channel=False):
                 )
             )
 
-        if patrol_visibility_supported is True:
-            patrol_text = "disponível"
-        elif patrol_visibility_supported is False:
-            patrol_text = (
-                "indisponível sem autenticação"
+        if wikimedia_authenticated:
+            auth_text = (
+                "autenticada como "
+                +
+                str(wikimedia_authenticated_user)
             )
         else:
-            patrol_text = "a verificar"
+            auth_text = "não autenticada"
+
+        if patrol_visibility_supported is True:
+            patrol_text = "disponível"
+        elif wikimedia_authenticated:
+            patrol_text = "indisponível para esta conta"
+        else:
+            patrol_text = "indisponível sem autenticação"
 
         stream_status = (
             "🟢 conectado"
@@ -4060,8 +4378,10 @@ def process_telegram_command(message, from_channel=False):
                 f"📊 Registros estatísticos (90d): "
                 f"{stats_count}\n"
                 f"🕗 Relatório diário: 20:05 (Brasília)\n"
-                f"✅ Patrulhamento: "
-                f"{patrol_text}\n"
+                f"🔐 Wikimedia: {auth_text}\n"
+                f"✅ Patrulhamento: {patrol_text}\n"
+                f"🔄 Patrulhamento: lote a cada 60s, "
+                f"máx. 1 chamada/min\n"
                 f"🔒 Monitor de bloqueios: ativo\n\n"
                 f"🔎 Triagem: "
                 f"{REVERT_RISK_THRESHOLD:.0%}\n"
@@ -5040,9 +5360,15 @@ def main():
     print(
         "↩️ Monitor de reversões: ativo"
     )
+    wikimedia_login()
+
     print(
         "✅ Monitor de patrulhamento: "
-        "tentará usar a API pública"
+        "sessão autenticada quando configurada"
+    )
+    print(
+        "🔄 Patrulhamento em lote: máximo de "
+        "1 chamada por minuto"
     )
     print(
         "📊 Relatório diário: 20:05 "
