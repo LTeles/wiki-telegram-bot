@@ -18,6 +18,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
+BOT_VERSION = "1.8"
+
 TELEGRAM_TOKEN = os.environ.get(
     "TELEGRAM_BOT_TOKEN"
 )
@@ -71,7 +73,6 @@ STREAM_STALL_SECONDS = 120
 # OBSERVAÇÃO DE CONTAS
 # =========================================================
 
-# 6 HORAS
 OBSERVATION_DURATION_SECONDS = 6 * 60 * 60
 
 OBSERVED_USERS_FILE = os.environ.get(
@@ -84,7 +85,7 @@ observed_users_lock = threading.Lock()
 
 
 # =========================================================
-# WATCHLIST DE PÁGINAS
+# WATCHLIST
 # =========================================================
 
 WATCHLIST_FILE = os.environ.get(
@@ -94,6 +95,16 @@ WATCHLIST_FILE = os.environ.get(
 
 watched_pages = set()
 watchlist_lock = threading.Lock()
+
+
+# =========================================================
+# VERSIONAMENTO
+# =========================================================
+
+BOT_VERSION_FILE = os.environ.get(
+    "BOT_VERSION_FILE",
+    "/data/bot_version.json"
+)
 
 
 # =========================================================
@@ -132,7 +143,7 @@ current_stream_response = None
 
 HEADERS = {
     "User-Agent": (
-        "PtWikiVandalismTelegramBot/1.7 "
+        f"PtWikiVandalismTelegramBot/{BOT_VERSION} "
         "(https://t.me/ptwiki)"
     )
 }
@@ -305,6 +316,7 @@ def is_target_channel(chat):
         return False
 
     chat_id = chat.get("id")
+
     username = chat.get(
         "username",
         ""
@@ -331,14 +343,15 @@ def is_target_channel(chat):
 
 
 # =========================================================
-# TESTE DE ARMAZENAMENTO
+# ARMAZENAMENTO
 # =========================================================
 
 def ensure_storage():
 
     files = [
         WATCHLIST_FILE,
-        OBSERVED_USERS_FILE
+        OBSERVED_USERS_FILE,
+        BOT_VERSION_FILE
     ]
 
     directories = set(
@@ -368,6 +381,7 @@ def ensure_storage():
             ) as file:
 
                 file.write("ok")
+
                 file.flush()
 
                 os.fsync(
@@ -392,6 +406,11 @@ def ensure_storage():
             OBSERVED_USERS_FILE
         )
 
+        print(
+            "📁 Versão do bot:",
+            BOT_VERSION_FILE
+        )
+
         return True
 
     except Exception as e:
@@ -402,6 +421,172 @@ def ensure_storage():
         )
 
         return False
+
+
+# =========================================================
+# VERSIONAMENTO
+# =========================================================
+
+def load_saved_bot_version():
+
+    try:
+
+        if not os.path.exists(
+            BOT_VERSION_FILE
+        ):
+            return None
+
+        with open(
+            BOT_VERSION_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(
+                file
+            )
+
+        if not isinstance(
+            data,
+            dict
+        ):
+            return None
+
+        version = data.get(
+            "version"
+        )
+
+        if not version:
+            return None
+
+        return str(
+            version
+        )
+
+    except Exception as e:
+
+        print(
+            "⚠️ Erro ao ler versão salva:",
+            repr(e)
+        )
+
+        return None
+
+
+def save_bot_version(version):
+
+    directory = os.path.dirname(
+        BOT_VERSION_FILE
+    )
+
+    if directory:
+
+        os.makedirs(
+            directory,
+            exist_ok=True
+        )
+
+    temp_file = (
+        BOT_VERSION_FILE
+        +
+        ".tmp"
+    )
+
+    data = {
+        "version": version,
+        "updated_at": datetime.now(
+            timezone.utc
+        ).isoformat()
+    }
+
+    with open(
+        temp_file,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            data,
+            file,
+            ensure_ascii=False,
+            indent=2
+        )
+
+        file.flush()
+
+        os.fsync(
+            file.fileno()
+        )
+
+    os.replace(
+        temp_file,
+        BOT_VERSION_FILE
+    )
+
+    print(
+        "💾 Versão registrada:",
+        version
+    )
+
+
+def announce_new_version_if_needed():
+
+    saved_version = load_saved_bot_version()
+
+    print(
+        "📦 Versão registrada anteriormente:",
+        saved_version or "nenhuma"
+    )
+
+    print(
+        "🤖 Versão atual:",
+        BOT_VERSION
+    )
+
+    if saved_version == BOT_VERSION:
+
+        print(
+            "ℹ️ Versão já anunciada. "
+            "Nenhuma mensagem enviada."
+        )
+
+        return
+
+    message = (
+        "✅ Bot atualizado com sucesso\n\n"
+        f"🤖 Versão {BOT_VERSION}"
+    )
+
+    success = send_telegram_message(
+        message
+    )
+
+    if not success:
+
+        print(
+            "⚠️ Não foi possível anunciar "
+            "a nova versão."
+        )
+
+        return
+
+    try:
+
+        save_bot_version(
+            BOT_VERSION
+        )
+
+        print(
+            "✅ Nova versão anunciada e registrada."
+        )
+
+    except Exception as e:
+
+        print(
+            "⚠️ Mensagem enviada, mas houve erro "
+            "ao registrar a versão:",
+            repr(e)
+        )
 
 
 # =========================================================
@@ -1119,7 +1304,7 @@ def normalize_username(username):
 
 
 # =========================================================
-# BLOQUEIOS - CONSULTA DE HISTÓRICO
+# HISTÓRICO DE BLOQUEIOS
 # =========================================================
 
 def has_previous_block(username):
@@ -1161,7 +1346,7 @@ def has_previous_block(username):
 
 
 # =========================================================
-# NOVOS BLOQUEIOS - DETALHES
+# NOVOS BLOQUEIOS
 # =========================================================
 
 def get_block_log_details(log_id):
@@ -1241,7 +1426,9 @@ def translate_duration_text(value):
 
         return "não informada"
 
-    value = str(value).strip()
+    value = str(
+        value
+    ).strip()
 
     if not value:
 
@@ -1313,7 +1500,6 @@ def duration_from_expiry(
 
         return "indefinido"
 
-    # Se já for uma duração relativa como "2 weeks"
     if not re.match(
         r"^\d{4}-\d{2}-\d{2}",
         expiry_text
@@ -1359,11 +1545,7 @@ def duration_from_expiry(
 
             return "expirado"
 
-        days = (
-            total_seconds
-            //
-            86400
-        )
+        days = total_seconds // 86400
 
         hours = (
             total_seconds
@@ -1389,9 +1571,7 @@ def duration_from_expiry(
                     f"{remaining_days} dia(s)"
                 )
 
-            return (
-                f"{years} ano(s)"
-            )
+            return f"{years} ano(s)"
 
         if days:
 
@@ -1402,9 +1582,7 @@ def duration_from_expiry(
                     f"{hours} hora(s)"
                 )
 
-            return (
-                f"{days} dia(s)"
-            )
+            return f"{days} dia(s)"
 
         if hours:
 
@@ -1415,9 +1593,7 @@ def duration_from_expiry(
                     f"{minutes} minuto(s)"
                 )
 
-            return (
-                f"{hours} hora(s)"
-            )
+            return f"{hours} hora(s)"
 
         return (
             f"{max(1, minutes)} minuto(s)"
@@ -1447,8 +1623,6 @@ def get_block_duration(
 
         params = {}
 
-    # Dependendo da versão do MediaWiki,
-    # pode existir duration e/ou expiry.
     duration = params.get(
         "duration"
     )
@@ -1472,8 +1646,6 @@ def get_block_duration(
             )
         )
 
-    # Tenta os parâmetros enviados diretamente
-    # pelo EventStreams.
     if fallback_change:
 
         stream_params = fallback_change.get(
@@ -1674,8 +1846,6 @@ def block_worker():
                 )
             )
 
-            # Apenas aplicação/reaplicação.
-            # Desbloqueios não são publicados.
             if action not in (
                 "block",
                 "reblock"
@@ -1791,7 +1961,6 @@ def is_wikipedia_admin(username):
 
     if info is None:
 
-        # Fail open para páginas vigiadas.
         return False
 
     return (
@@ -2004,8 +2173,6 @@ def telegram_sender():
 
             telegram_queue.task_done()
 
-        # Mantém envio abaixo de aproximadamente
-        # uma mensagem por segundo.
         time.sleep(1)
 
 
@@ -2232,10 +2399,6 @@ def process_telegram_command(
     )
 
 
-    # =====================================================
-    # /START
-    # =====================================================
-
     if command == "/start":
 
         send_telegram_message(
@@ -2251,10 +2414,6 @@ def process_telegram_command(
         return
 
 
-    # =====================================================
-    # /COMANDOS
-    # =====================================================
-
     if command == "/comandos":
 
         send_telegram_message(
@@ -2264,10 +2423,6 @@ def process_telegram_command(
 
         return
 
-
-    # =====================================================
-    # /STATUS
-    # =====================================================
 
     if command == "/status":
 
@@ -2301,6 +2456,8 @@ def process_telegram_command(
         send_telegram_message(
             (
                 "🤖 Status do bot\n\n"
+
+                f"📦 Versão: {BOT_VERSION}\n\n"
 
                 f"📡 EventStreams: "
                 f"{stream_status}\n"
@@ -2346,10 +2503,6 @@ def process_telegram_command(
         return
 
 
-    # =====================================================
-    # /CONTA
-    # =====================================================
-
     if command == "/conta":
 
         if not argument:
@@ -2375,10 +2528,6 @@ def process_telegram_command(
 
         return
 
-
-    # =====================================================
-    # /OBSERVADAS
-    # =====================================================
 
     if command == "/observadas":
 
@@ -2446,10 +2595,6 @@ def process_telegram_command(
 
         return
 
-
-    # =====================================================
-    # /OBSERVAR
-    # =====================================================
 
     if command == "/observar":
 
@@ -2542,10 +2687,6 @@ def process_telegram_command(
         return
 
 
-    # =====================================================
-    # /DESOBSERVAR
-    # =====================================================
-
     if command == "/desobservar":
 
         if (
@@ -2617,10 +2758,6 @@ def process_telegram_command(
         return
 
 
-    # =====================================================
-    # /VIGIADAS
-    # =====================================================
-
     if command == "/vigiadas":
 
         with watchlist_lock:
@@ -2654,10 +2791,6 @@ def process_telegram_command(
 
         return
 
-
-    # =====================================================
-    # /VIGIAR E /DESVIGIAR
-    # =====================================================
 
     if command in (
         "/vigiar",
@@ -3735,10 +3868,6 @@ def wikimedia_loop():
                     continue
 
 
-                # =========================================
-                # APENAS PTWIKI
-                # =========================================
-
                 if (
                     change.get("wiki")
                     !=
@@ -3749,7 +3878,7 @@ def wikimedia_loop():
 
 
                 # =========================================
-                # REGISTROS DE BLOQUEIO
+                # BLOQUEIOS
                 # =========================================
 
                 if (
@@ -3788,13 +3917,11 @@ def wikimedia_loop():
                                 action
                             )
 
-                    # Outros registros não são
-                    # enviados à análise de vandalismo.
                     continue
 
 
                 # =========================================
-                # APENAS EDIÇÕES
+                # EDIÇÕES
                 # =========================================
 
                 if (
@@ -3874,7 +4001,7 @@ def main():
     )
 
     print(
-        "Versão 1.7"
+        f"Versão {BOT_VERSION}"
     )
 
     print(
@@ -3965,6 +4092,23 @@ def main():
         daemon=True,
         name="telegram-listener"
     ).start()
+
+
+    # Pequeno intervalo para permitir que as threads
+    # terminem a inicialização antes do anúncio.
+    time.sleep(2)
+
+
+    # =====================================================
+    # VERSIONAMENTO / ANÚNCIO
+    # =====================================================
+
+    announce_new_version_if_needed()
+
+
+    # =====================================================
+    # EVENTSTREAMS
+    # =====================================================
 
     wikimedia_loop()
 
