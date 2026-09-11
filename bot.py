@@ -72,7 +72,7 @@ STREAM_STALL_SECONDS = 120
 # OBSERVAÇÃO DE CONTAS
 # =========================================================
 
-OBSERVATION_DURATION_SECONDS = 2 * 60 * 60
+OBSERVATION_DURATION_SECONDS = 6 * 60 * 60
 
 OBSERVED_USERS_FILE = os.environ.get(
     "OBSERVED_USERS_FILE",
