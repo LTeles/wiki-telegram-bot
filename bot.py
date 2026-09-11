@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.13"
+BOT_VERSION = "1.14"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -419,7 +419,7 @@ def check_telegram_webhook():
         print("⚠️ Erro ao verificar webhook:", repr(e))
 
 
-def send_telegram_message(text, chat_id=None, parse_mode=None):
+def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None):
     """
     Retorna o objeto Message do Telegram quando o envio é confirmado.
     Retorna None em erro permanente.
@@ -438,6 +438,9 @@ def send_telegram_message(text, chat_id=None, parse_mode=None):
 
             if parse_mode:
                 payload["parse_mode"] = parse_mode
+
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
 
             response = requests.post(
                 f"{TELEGRAM_API}/sendMessage",
@@ -780,7 +783,7 @@ def load_observed_users():
 
         loaded[username_key(username)] = {
             "username": username,
-            "reason": reason,
+            "reason": reason or "",
             "expires_at": expires_at,
         }
 
@@ -798,7 +801,7 @@ def load_observed_users():
         pass
 
 
-def observe_user(username, reason):
+def observe_user(username, reason=None):
     expires_at = (
         time.time()
         +
@@ -2302,6 +2305,7 @@ def register_posted_edit(item, telegram_message):
         "revision_id": revision_id,
         "rcid": item.get("rcid"),
         "title": item.get("page_title"),
+        "username": item.get("username"),
         "message_id": message_id,
         "base_message": item.get("message", ""),
         "parse_mode": item.get("parse_mode"),
@@ -3034,7 +3038,8 @@ def telegram_sender():
                 item["message"],
                 parse_mode=item.get(
                     "parse_mode"
-                )
+                ),
+                reply_markup=item.get("reply_markup")
             )
 
             if result:
@@ -4096,17 +4101,26 @@ def tracked_queue_item(
         "revision_id": revision.get("new"),
         "rcid": change.get("id"),
         "page_title": change.get("title"),
+        "username": change.get("user"),
         "stats_payload": stats_payload,
+        "reply_markup": {
+            "inline_keyboard": [[{
+                "text": "🔎 Observar conta (6h)",
+                "callback_data": f"observe:{revision.get('new')}",
+            }]]
+        },
     }
 
 
 def format_observed_message(change, observation):
+    reason = (observation.get("reason") or "").strip()
+    reason_line = f"\n📌 Motivo: {reason}\n" if reason else ""
     return (
         "👁 Edição de conta observada\n\n"
         f"👤 {change.get('user', 'Desconhecido')}\n"
         f"📝 {change.get('title', 'Sem título')}\n"
-        f"💬 {change.get('comment') or 'Sem resumo'}\n\n"
-        f"📌 Motivo: {observation['reason']}\n\n"
+        f"💬 {change.get('comment') or 'Sem resumo'}\n"
+        f"{reason_line}\n"
         f"🔗 {build_diff_url(change)}"
     )
 
@@ -4321,7 +4335,7 @@ def commands_message():
         "Remove uma página da vigilância.\n\n"
         "📋 /vigiadas\n"
         "Lista páginas vigiadas.\n\n"
-        "🔎 /observar Usuário motivo\n"
+        "🔎 /observar Usuário\n"
         "Observa uma conta durante 6 horas.\n\n"
         "⛔ /desobservar Usuário\n"
         "Encerra a observação de uma conta.\n\n"
@@ -4585,8 +4599,8 @@ def process_telegram_command(message, from_channel=False):
                 (
                     f"• {item['username']}\n"
                     f"  ⏳ "
-                    f"{format_remaining(remaining_time)}\n"
-                    f"  📌 {item['reason']}"
+                    f"{format_remaining(remaining_time)}"
+                    + (f"\n  📌 {item.get('reason')}" if item.get('reason') else "")
                 )
             )
 
@@ -4615,21 +4629,20 @@ def process_telegram_command(message, from_channel=False):
             )
             return
 
-        parts = argument.split(maxsplit=1)
+        username_input = argument.strip()
 
-        if len(parts) < 2:
+        if not username_input:
             send_telegram_message(
                 (
                     "Uso:\n"
-                    "/observar Usuário motivo\n\n"
+                    "/observar Usuário\n\n"
                     "Para nomes com espaços, use _."
                 ),
                 chat_id=chat_id
             )
             return
 
-        username_input = parts[0]
-        reason = parts[1].strip()
+        reason = ""
 
         canonical_username = normalize_username(
             username_input
@@ -4653,8 +4666,7 @@ def process_telegram_command(message, from_channel=False):
                 (
                     "🔎 Conta colocada em observação\n\n"
                     f"👤 {canonical_username}\n"
-                    f"⏳ Duração: 6 horas\n"
-                    f"📌 Motivo: {reason}\n\n"
+                    f"⏳ Duração: 6 horas\n\n"
                     "Toda edição desta conta será "
                     "publicada no canal durante "
                     "esse período."
@@ -5174,6 +5186,57 @@ def process_telegram_command(message, from_channel=False):
         return
 
 
+def answer_callback_query(callback_query_id, text=None):
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/answerCallbackQuery",
+            json=payload,
+            timeout=20
+        )
+    except Exception as e:
+        print("⚠️ Erro ao responder callback:", repr(e))
+
+
+def process_observe_callback(callback):
+    callback_id = callback.get("id")
+    data = callback.get("data", "")
+    if not data.startswith("observe:"):
+        answer_callback_query(callback_id)
+        return
+
+    revision_id = data.split(":", 1)[1]
+    with posted_edits_lock:
+        record = posted_edits.get(str(revision_id))
+
+    if not record or not record.get("username"):
+        answer_callback_query(
+            callback_id,
+            "Não encontrei a conta deste alerta."
+        )
+        return
+
+    username = record["username"]
+    if observe_user(username):
+        answer_callback_query(
+            callback_id,
+            f"{username} em observação por 6 horas."
+        )
+        send_telegram_message(
+            "🔎 Conta colocada em observação\n\n"
+            f"👤 {username}\n"
+            "⏳ Duração: 6 horas",
+            chat_id=TELEGRAM_CHANNEL
+        )
+    else:
+        answer_callback_query(
+            callback_id,
+            "Não foi possível salvar a observação."
+        )
+
+
 # =========================================================
 # LISTENER TELEGRAM
 # =========================================================
@@ -5190,7 +5253,8 @@ def telegram_command_listener():
                 "allowed_updates": json.dumps(
                     [
                         "message",
-                        "channel_post"
+                        "channel_post",
+                        "callback_query"
                     ]
                 ),
             }
@@ -5225,6 +5289,12 @@ def telegram_command_listener():
                     +
                     1
                 )
+
+                callback = update.get("callback_query")
+
+                if callback:
+                    process_observe_callback(callback)
+                    continue
 
                 message = update.get("message")
 
