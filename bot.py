@@ -18,7 +18,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.9"
+BOT_VERSION = "1.10"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -58,6 +58,7 @@ USER_CACHE_SECONDS = 3600
 STREAM_STALL_SECONDS = 120
 
 OBSERVATION_DURATION_SECONDS = 6 * 60 * 60
+IGNORE_DURATION_SECONDS = 6 * 60 * 60
 
 ABUSE_FILTER_POLL_SECONDS = 20
 ABUSE_FILTER_BATCH_LIMIT = 500
@@ -78,6 +79,11 @@ WATCHLIST_FILE = os.environ.get(
 OBSERVED_USERS_FILE = os.environ.get(
     "OBSERVED_USERS_FILE",
     "/data/observed_users.json"
+)
+
+IGNORED_USERS_FILE = os.environ.get(
+    "IGNORED_USERS_FILE",
+    "/data/ignored_users.json"
 )
 
 BOT_VERSION_FILE = os.environ.get(
@@ -110,6 +116,9 @@ watchlist_lock = threading.Lock()
 
 observed_users = {}
 observed_users_lock = threading.Lock()
+
+ignored_users = {}
+ignored_users_lock = threading.Lock()
 
 # dict:
 # "123" -> {"filter_id": "123", "added_at": 1234567890.0, ...}
@@ -181,6 +190,7 @@ def ensure_storage():
     files = [
         WATCHLIST_FILE,
         OBSERVED_USERS_FILE,
+        IGNORED_USERS_FILE,
         BOT_VERSION_FILE,
         ABUSE_FILTERS_FILE,
         ABUSE_FILTER_STATE_FILE,
@@ -212,6 +222,7 @@ def ensure_storage():
         print("✅ Armazenamento gravável.")
         print("📁 Watchlist:", WATCHLIST_FILE)
         print("📁 Contas observadas:", OBSERVED_USERS_FILE)
+        print("📁 Contas ignoradas:", IGNORED_USERS_FILE)
         print("📁 Filtros de abuso:", ABUSE_FILTERS_FILE)
         print("📁 Estado dos filtros:", ABUSE_FILTER_STATE_FILE)
         print("📁 Edições publicadas:", POSTED_EDITS_FILE)
@@ -800,6 +811,182 @@ def get_observation(username):
 
     with observed_users_lock:
         item = observed_users.get(
+            username_key(username)
+        )
+
+        return dict(item) if item else None
+
+
+# =========================================================
+# CONTAS IGNORADAS TEMPORARIAMENTE
+# =========================================================
+
+def save_ignored_users():
+    with ignored_users_lock:
+        data = list(ignored_users.values())
+
+    atomic_write_json(
+        IGNORED_USERS_FILE,
+        data
+    )
+
+    print(
+        "💾 Contas ignoradas salvas:",
+        len(data)
+    )
+
+
+def cleanup_expired_ignored_users():
+    now = time.time()
+    removed = False
+
+    with ignored_users_lock:
+        expired_keys = [
+            key
+            for key, item in ignored_users.items()
+            if item.get("expires_at", 0) <= now
+        ]
+
+        for key in expired_keys:
+            print(
+                "⌛ Ignorância temporária expirada:",
+                ignored_users[key].get(
+                    "username",
+                    key
+                )
+            )
+            del ignored_users[key]
+            removed = True
+
+    if removed:
+        try:
+            save_ignored_users()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao salvar expirações "
+                "de contas ignoradas:",
+                repr(e)
+            )
+
+
+def load_ignored_users():
+    global ignored_users
+
+    data = load_json(
+        IGNORED_USERS_FILE,
+        []
+    )
+
+    if not isinstance(data, list):
+        print(
+            "❌ Formato inválido de ignored_users.json"
+        )
+        return
+
+    now = time.time()
+    loaded = {}
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        username = item.get("username")
+        expires_at = item.get("expires_at", 0)
+
+        if (
+            not username
+            or
+            expires_at <= now
+        ):
+            continue
+
+        loaded[username_key(username)] = {
+            "username": username,
+            "expires_at": expires_at,
+        }
+
+    with ignored_users_lock:
+        ignored_users = loaded
+
+    print(
+        "✅ Contas ignoradas carregadas:",
+        len(loaded)
+    )
+
+    try:
+        save_ignored_users()
+    except Exception:
+        pass
+
+
+def ignore_user(username):
+    expires_at = (
+        time.time()
+        +
+        IGNORE_DURATION_SECONDS
+    )
+
+    key = username_key(username)
+
+    with ignored_users_lock:
+        previous = ignored_users.get(key)
+
+        ignored_users[key] = {
+            "username": username,
+            "expires_at": expires_at,
+        }
+
+    try:
+        save_ignored_users()
+        return True
+
+    except Exception as e:
+        print(
+            "❌ Erro ao salvar conta ignorada:",
+            repr(e)
+        )
+
+        with ignored_users_lock:
+            if previous is None:
+                ignored_users.pop(key, None)
+            else:
+                ignored_users[key] = previous
+
+        return False
+
+
+def stop_ignoring_user(username):
+    key = username_key(username)
+
+    with ignored_users_lock:
+        if key not in ignored_users:
+            return True, False
+
+        backup = ignored_users[key]
+        del ignored_users[key]
+
+    try:
+        save_ignored_users()
+        return True, True
+
+    except Exception as e:
+        print(
+            "❌ Erro ao salvar remoção "
+            "de conta ignorada:",
+            repr(e)
+        )
+
+        with ignored_users_lock:
+            ignored_users[key] = backup
+
+        return False, False
+
+
+def get_ignored_user(username):
+    cleanup_expired_ignored_users()
+
+    with ignored_users_lock:
+        item = ignored_users.get(
             username_key(username)
         )
 
@@ -2988,13 +3175,26 @@ def analysis_worker():
                 )
                 continue
 
-            # 3. Filtro normal de conta
+            # 3. Conta temporariamente ignorada
+            # A observação e a página vigiada têm prioridade.
+            ignored = get_ignored_user(username)
+
+            if ignored:
+                print(
+                    "🙈 Edição ignorada temporariamente:",
+                    username,
+                    "|",
+                    title
+                )
+                continue
+
+            # 4. Filtro normal de conta
             if not should_evaluate_user(
                 username
             ):
                 continue
 
-            # 4. Revert Risk
+            # 5. Revert Risk
             revert_risk = get_revert_risk(
                 new_revision
             )
@@ -3016,7 +3216,7 @@ def analysis_worker():
             ):
                 continue
 
-            # 5. Diff + heurísticas
+            # 6. Diff + heurísticas
             diff = get_revision_diff(
                 old_revision,
                 new_revision
@@ -3082,6 +3282,12 @@ def commands_message():
         "Encerra a observação de uma conta.\n\n"
         "📋 /observadas\n"
         "Lista contas atualmente observadas.\n\n"
+        "🙈 /ignorar Usuário\n"
+        "Ignora uma conta durante 6 horas no detector normal.\n\n"
+        "👀 /designorar Usuário\n"
+        "Encerra a exclusão temporária de uma conta.\n\n"
+        "📋 /ignoradas\n"
+        "Lista contas temporariamente ignoradas.\n\n"
         "🛡 /vigiarfiltro ID\n"
         "Vigia um filtro de abusos.\n\n"
         "🛑 /desvigiarfiltro ID\n"
@@ -3145,6 +3351,7 @@ def process_telegram_command(message, from_channel=False):
 
     if command == "/status":
         cleanup_expired_observations()
+        cleanup_expired_ignored_users()
         cleanup_posted_edits()
 
         with stream_lock:
@@ -3158,6 +3365,11 @@ def process_telegram_command(message, from_channel=False):
         with observed_users_lock:
             observed_count = len(
                 observed_users
+            )
+
+        with ignored_users_lock:
+            ignored_count = len(
+                ignored_users
             )
 
         with abuse_filters_lock:
@@ -3203,6 +3415,8 @@ def process_telegram_command(message, from_channel=False):
                 f"{watch_count}\n"
                 f"🔎 Contas observadas: "
                 f"{observed_count}\n"
+                f"🙈 Contas ignoradas: "
+                f"{ignored_count}\n"
                 f"🛡 Filtros de abuso vigiados: "
                 f"{filter_count}\n"
                 f"📝 Edições acompanhadas: "
@@ -3416,6 +3630,173 @@ def process_telegram_command(message, from_channel=False):
             response_text = (
                 "⛔ Observação encerrada\n\n"
                 f"👤 {canonical_username}"
+            )
+
+        send_telegram_message(
+            response_text,
+            chat_id=chat_id
+        )
+        return
+
+    if command == "/ignoradas":
+        cleanup_expired_ignored_users()
+        now = time.time()
+
+        with ignored_users_lock:
+            items = [
+                dict(item)
+                for item
+                in ignored_users.values()
+            ]
+
+        if not items:
+            send_telegram_message(
+                (
+                    "🙈 Nenhuma conta está "
+                    "temporariamente ignorada."
+                ),
+                chat_id=chat_id
+            )
+            return
+
+        items.sort(
+            key=lambda x:
+            x.get("expires_at", 0)
+        )
+
+        lines = []
+
+        for item in items:
+            remaining_time = (
+                item["expires_at"]
+                -
+                now
+            )
+
+            lines.append(
+                (
+                    f"• {item['username']} — "
+                    f"{format_remaining(remaining_time)} restantes"
+                )
+            )
+
+        send_telegram_message(
+            (
+                "🙈 Contas temporariamente ignoradas:\n\n"
+                +
+                "\n".join(lines)
+            ),
+            chat_id=chat_id
+        )
+        return
+
+    if command == "/ignorar":
+        if (
+            not from_channel
+            or
+            not is_target_channel(chat)
+        ):
+            send_telegram_message(
+                (
+                    "⚠️ /ignorar deve ser publicado "
+                    "diretamente no canal."
+                ),
+                chat_id=chat_id
+            )
+            return
+
+        if not argument:
+            send_telegram_message(
+                "Uso: /ignorar Nome",
+                chat_id=chat_id
+            )
+            return
+
+        canonical_username = normalize_username(
+            argument
+        )
+
+        if not canonical_username:
+            send_telegram_message(
+                (
+                    "❌ Conta não encontrada: "
+                    f"{argument}"
+                ),
+                chat_id=chat_id
+            )
+            return
+
+        if ignore_user(canonical_username):
+            send_telegram_message(
+                (
+                    "🙈 Conta temporariamente ignorada\n\n"
+                    f"👤 {canonical_username}\n"
+                    "⏳ Duração: 6 horas\n\n"
+                    "As edições desta conta não serão "
+                    "avaliadas pelo detector normal de "
+                    "vandalismo durante esse período.\n\n"
+                    "ℹ️ Contas observadas e páginas "
+                    "vigiadas continuam tendo prioridade."
+                ),
+                chat_id=chat_id
+            )
+        else:
+            send_telegram_message(
+                (
+                    "❌ Não foi possível salvar "
+                    "a conta ignorada."
+                ),
+                chat_id=chat_id
+            )
+        return
+
+    if command == "/designorar":
+        if (
+            not from_channel
+            or
+            not is_target_channel(chat)
+        ):
+            send_telegram_message(
+                (
+                    "⚠️ /designorar deve ser publicado "
+                    "diretamente no canal."
+                ),
+                chat_id=chat_id
+            )
+            return
+
+        if not argument:
+            send_telegram_message(
+                "Uso: /designorar Nome",
+                chat_id=chat_id
+            )
+            return
+
+        canonical_username = (
+            normalize_username(argument)
+            or
+            argument.replace("_", " ").strip()
+        )
+
+        success, removed = stop_ignoring_user(
+            canonical_username
+        )
+
+        if not success:
+            response_text = (
+                "❌ Erro ao salvar alteração."
+            )
+        elif not removed:
+            response_text = (
+                f"ℹ️ {canonical_username} "
+                "não estava na lista de ignoradas."
+            )
+        else:
+            response_text = (
+                "👀 Conta removida da lista de ignoradas\n\n"
+                f"👤 {canonical_username}\n\n"
+                "As próximas edições voltarão a seguir "
+                "o fluxo normal de análise."
             )
 
         send_telegram_message(
@@ -3802,6 +4183,7 @@ def eventstream_watchdog():
     while True:
         time.sleep(15)
         cleanup_expired_observations()
+        cleanup_expired_ignored_users()
 
         response_to_close = None
 
@@ -3982,11 +4364,13 @@ def main():
 
     load_watchlist()
     load_observed_users()
+    load_ignored_users()
     load_abuse_filters()
     load_abuse_filter_state()
     load_posted_edits()
 
     cleanup_expired_observations()
+    cleanup_expired_ignored_users()
     cleanup_posted_edits()
 
     print(
@@ -4007,6 +4391,7 @@ def main():
         MAX_USER_EDITS
     )
     print("⏳ Observação de conta: 6 horas")
+    print("🙈 Ignorar conta: 6 horas")
     print("🔒 Monitor de bloqueios: ativo")
     print(
         "🛡 Monitor de filtros de abuso: ativo"
