@@ -32,7 +32,6 @@ if not TELEGRAM_TOKEN:
         "TELEGRAM_BOT_TOKEN não configurado."
     )
 
-
 TELEGRAM_API = (
     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 )
@@ -72,6 +71,7 @@ STREAM_STALL_SECONDS = 120
 # OBSERVAÇÃO DE CONTAS
 # =========================================================
 
+# 6 HORAS
 OBSERVATION_DURATION_SECONDS = 6 * 60 * 60
 
 OBSERVED_USERS_FILE = os.environ.get(
@@ -84,7 +84,7 @@ observed_users_lock = threading.Lock()
 
 
 # =========================================================
-# WATCHLIST
+# WATCHLIST DE PÁGINAS
 # =========================================================
 
 WATCHLIST_FILE = os.environ.get(
@@ -108,6 +108,7 @@ user_cache = {}
 # =========================================================
 
 analysis_queue = queue.Queue()
+block_queue = queue.Queue()
 telegram_queue = queue.Queue()
 
 
@@ -131,7 +132,7 @@ current_stream_response = None
 
 HEADERS = {
     "User-Agent": (
-        "PtWikiVandalismTelegramBot/1.6 "
+        "PtWikiVandalismTelegramBot/1.7 "
         "(https://t.me/ptwiki)"
     )
 }
@@ -155,19 +156,10 @@ def remove_telegram_webhook():
 
         response.raise_for_status()
 
-        data = response.json()
-
-        if data.get("ok"):
+        if response.json().get("ok"):
 
             print(
                 "✅ Webhook Telegram removido/desativado."
-            )
-
-        else:
-
-            print(
-                "⚠️ Resposta inesperada ao remover webhook:",
-                data
             )
 
     except Exception as e:
@@ -189,10 +181,8 @@ def check_telegram_webhook():
 
         response.raise_for_status()
 
-        data = response.json()
-
         webhook = (
-            data
+            response.json()
             .get("result", {})
             .get("url")
         )
@@ -200,8 +190,7 @@ def check_telegram_webhook():
         if webhook:
 
             print(
-                "⚠️ Webhook ainda configurado:",
-                webhook
+                "⚠️ Webhook ainda configurado."
             )
 
         else:
@@ -307,7 +296,7 @@ def username_key(username):
 
 
 # =========================================================
-# IDENTIFICA CANAL TELEGRAM
+# IDENTIFICA O CANAL
 # =========================================================
 
 def is_target_channel(chat):
@@ -315,10 +304,7 @@ def is_target_channel(chat):
     if not chat:
         return False
 
-    chat_id = chat.get(
-        "id"
-    )
-
+    chat_id = chat.get("id")
     username = chat.get(
         "username",
         ""
@@ -382,7 +368,6 @@ def ensure_storage():
             ) as file:
 
                 file.write("ok")
-
                 file.flush()
 
                 os.fsync(
@@ -394,7 +379,7 @@ def ensure_storage():
             )
 
         print(
-            "✅ Armazenamento persistente gravável."
+            "✅ Armazenamento gravável."
         )
 
         print(
@@ -412,10 +397,7 @@ def ensure_storage():
     except Exception as e:
 
         print(
-            "❌ Erro no armazenamento:"
-        )
-
-        print(
+            "❌ Erro no armazenamento:",
             repr(e)
         )
 
@@ -683,7 +665,6 @@ def save_observed_users():
 def cleanup_expired_observations():
 
     now = time.time()
-
     removed = False
 
     with observed_users_lock:
@@ -743,7 +724,7 @@ def load_observed_users():
         ):
 
             print(
-                "👁 Nenhuma lista de contas "
+                "🔎 Nenhuma lista de contas "
                 "observadas encontrada."
             )
 
@@ -769,7 +750,6 @@ def load_observed_users():
             )
 
         now = time.time()
-
         loaded = {}
 
         for item in data:
@@ -843,6 +823,10 @@ def observe_user(
 
     with observed_users_lock:
 
+        previous = observed_users.get(
+            key
+        )
+
         observed_users[
             key
         ] = {
@@ -866,10 +850,18 @@ def observe_user(
 
         with observed_users_lock:
 
-            observed_users.pop(
-                key,
-                None
-            )
+            if previous is None:
+
+                observed_users.pop(
+                    key,
+                    None
+                )
+
+            else:
+
+                observed_users[
+                    key
+                ] = previous
 
         return False
 
@@ -940,7 +932,7 @@ def get_observation(username):
 
 
 # =========================================================
-# NORMALIZA TÍTULO
+# NORMALIZAÇÃO DE PÁGINA
 # =========================================================
 
 def normalize_page_title(title):
@@ -948,7 +940,6 @@ def normalize_page_title(title):
     title = title.strip()
 
     if not title:
-
         return None
 
     try:
@@ -998,7 +989,7 @@ def normalize_page_title(title):
 
 
 # =========================================================
-# USUÁRIO WIKIPÉDIA
+# USUÁRIOS
 # =========================================================
 
 def get_user_info(
@@ -1128,7 +1119,7 @@ def normalize_username(username):
 
 
 # =========================================================
-# BLOQUEIOS
+# BLOQUEIOS - CONSULTA DE HISTÓRICO
 # =========================================================
 
 def has_previous_block(username):
@@ -1170,6 +1161,563 @@ def has_previous_block(username):
 
 
 # =========================================================
+# NOVOS BLOQUEIOS - DETALHES
+# =========================================================
+
+def get_block_log_details(log_id):
+
+    try:
+
+        response = requests.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "list": "logevents",
+                "leids": log_id,
+                "leprop": (
+                    "ids|title|type|user|"
+                    "timestamp|comment|details"
+                )
+            },
+            headers=HEADERS,
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        events = (
+            response.json()
+            .get("query", {})
+            .get("logevents", [])
+        )
+
+        if not events:
+
+            return None
+
+        return events[0]
+
+    except Exception as e:
+
+        print(
+            "⚠️ Erro ao obter detalhes do bloqueio:",
+            log_id,
+            repr(e)
+        )
+
+        return None
+
+
+def extract_block_target(title):
+
+    if not title:
+
+        return "Desconhecido"
+
+    prefixes = [
+        "Usuário:",
+        "Usuario:",
+        "User:"
+    ]
+
+    for prefix in prefixes:
+
+        if title.startswith(
+            prefix
+        ):
+
+            return title[
+                len(prefix):
+            ]
+
+    return title
+
+
+def translate_duration_text(value):
+
+    if value is None:
+
+        return "não informada"
+
+    value = str(value).strip()
+
+    if not value:
+
+        return "não informada"
+
+    lower = value.lower()
+
+    if lower in (
+        "infinite",
+        "infinity",
+        "indefinite",
+        "indefinitely",
+        "never"
+    ):
+
+        return "indefinido"
+
+    replacements = [
+        ("seconds", "segundos"),
+        ("second", "segundo"),
+        ("minutes", "minutos"),
+        ("minute", "minuto"),
+        ("hours", "horas"),
+        ("hour", "hora"),
+        ("days", "dias"),
+        ("day", "dia"),
+        ("weeks", "semanas"),
+        ("week", "semana"),
+        ("months", "meses"),
+        ("month", "mês"),
+        ("years", "anos"),
+        ("year", "ano")
+    ]
+
+    translated = value
+
+    for english, portuguese in replacements:
+
+        translated = re.sub(
+            rf"\b{english}\b",
+            portuguese,
+            translated,
+            flags=re.I
+        )
+
+    return translated
+
+
+def duration_from_expiry(
+    expiry,
+    timestamp=None
+):
+
+    if not expiry:
+
+        return "não informada"
+
+    expiry_text = str(
+        expiry
+    ).strip()
+
+    if expiry_text.lower() in (
+        "infinite",
+        "infinity",
+        "indefinite",
+        "indefinitely",
+        "never"
+    ):
+
+        return "indefinido"
+
+    # Se já for uma duração relativa como "2 weeks"
+    if not re.match(
+        r"^\d{4}-\d{2}-\d{2}",
+        expiry_text
+    ):
+
+        return translate_duration_text(
+            expiry_text
+        )
+
+    try:
+
+        expiry_dt = datetime.fromisoformat(
+            expiry_text.replace(
+                "Z",
+                "+00:00"
+            )
+        )
+
+        if timestamp:
+
+            start_dt = datetime.fromisoformat(
+                str(timestamp).replace(
+                    "Z",
+                    "+00:00"
+                )
+            )
+
+        else:
+
+            start_dt = datetime.now(
+                timezone.utc
+            )
+
+        total_seconds = int(
+            (
+                expiry_dt
+                -
+                start_dt
+            ).total_seconds()
+        )
+
+        if total_seconds <= 0:
+
+            return "expirado"
+
+        days = (
+            total_seconds
+            //
+            86400
+        )
+
+        hours = (
+            total_seconds
+            %
+            86400
+        ) // 3600
+
+        minutes = (
+            total_seconds
+            %
+            3600
+        ) // 60
+
+        if days >= 365:
+
+            years = days // 365
+            remaining_days = days % 365
+
+            if remaining_days:
+
+                return (
+                    f"{years} ano(s) e "
+                    f"{remaining_days} dia(s)"
+                )
+
+            return (
+                f"{years} ano(s)"
+            )
+
+        if days:
+
+            if hours:
+
+                return (
+                    f"{days} dia(s) e "
+                    f"{hours} hora(s)"
+                )
+
+            return (
+                f"{days} dia(s)"
+            )
+
+        if hours:
+
+            if minutes:
+
+                return (
+                    f"{hours} hora(s) e "
+                    f"{minutes} minuto(s)"
+                )
+
+            return (
+                f"{hours} hora(s)"
+            )
+
+        return (
+            f"{max(1, minutes)} minuto(s)"
+        )
+
+    except Exception:
+
+        return translate_duration_text(
+            expiry_text
+        )
+
+
+def get_block_duration(
+    event,
+    fallback_change=None
+):
+
+    params = event.get(
+        "params",
+        {}
+    )
+
+    if not isinstance(
+        params,
+        dict
+    ):
+
+        params = {}
+
+    # Dependendo da versão do MediaWiki,
+    # pode existir duration e/ou expiry.
+    duration = params.get(
+        "duration"
+    )
+
+    if duration:
+
+        return translate_duration_text(
+            duration
+        )
+
+    expiry = params.get(
+        "expiry"
+    )
+
+    if expiry:
+
+        return duration_from_expiry(
+            expiry,
+            event.get(
+                "timestamp"
+            )
+        )
+
+    # Tenta os parâmetros enviados diretamente
+    # pelo EventStreams.
+    if fallback_change:
+
+        stream_params = fallback_change.get(
+            "log_params",
+            {}
+        )
+
+        if isinstance(
+            stream_params,
+            dict
+        ):
+
+            duration = stream_params.get(
+                "duration"
+            )
+
+            if duration:
+
+                return translate_duration_text(
+                    duration
+                )
+
+            expiry = stream_params.get(
+                "expiry"
+            )
+
+            if expiry:
+
+                return duration_from_expiry(
+                    expiry,
+                    fallback_change.get(
+                        "timestamp"
+                    )
+                )
+
+    return "não informada"
+
+
+def block_log_url(target):
+
+    encoded_target = quote(
+        f"Usuário:{target}",
+        safe=""
+    )
+
+    return (
+        "https://pt.wikipedia.org/w/index.php"
+        "?title=Especial:Registo"
+        "&type=block"
+        f"&page={encoded_target}"
+    )
+
+
+def format_block_message(
+    event,
+    change
+):
+
+    title = (
+        event.get("title")
+        or
+        change.get("title")
+        or
+        ""
+    )
+
+    target = extract_block_target(
+        title
+    )
+
+    reason = (
+        event.get("comment")
+        or
+        change.get("comment")
+        or
+        "Motivo não informado"
+    )
+
+    blocker = (
+        event.get("user")
+        or
+        change.get("user")
+        or
+        "Desconhecido"
+    )
+
+    duration = get_block_duration(
+        event,
+        change
+    )
+
+    action = (
+        event.get("action")
+        or
+        change.get("log_action")
+        or
+        "block"
+    )
+
+    if action == "reblock":
+
+        heading = (
+            "🔒 Bloqueio alterado/reaplicado"
+        )
+
+    else:
+
+        heading = (
+            "🔒 Novo bloqueio aplicado"
+        )
+
+    target_url = block_log_url(
+        target
+    )
+
+    safe_target = html.escape(
+        target
+    )
+
+    safe_reason = html.escape(
+        reason
+    )
+
+    safe_blocker = html.escape(
+        blocker
+    )
+
+    safe_duration = html.escape(
+        duration
+    )
+
+    return (
+        f"{heading}\n\n"
+
+        f'👤 <a href="{target_url}">'
+        f"{safe_target}</a>\n"
+
+        f"📌 Motivo: "
+        f"{safe_reason}\n"
+
+        f"⏳ Duração: "
+        f"{safe_duration}\n"
+
+        f"🛡 Aplicado por: "
+        f"{safe_blocker}"
+    )
+
+
+# =========================================================
+# WORKER DE BLOQUEIOS
+# =========================================================
+
+def block_worker():
+
+    print(
+        "✅ Monitor de bloqueios iniciado."
+    )
+
+    while True:
+
+        change = block_queue.get()
+
+        try:
+
+            log_id = change.get(
+                "log_id"
+            )
+
+            if not log_id:
+
+                print(
+                    "⚠️ Evento de bloqueio sem log_id."
+                )
+
+                continue
+
+            details = get_block_log_details(
+                log_id
+            )
+
+            if details is None:
+
+                continue
+
+            if (
+                details.get("type")
+                !=
+                "block"
+            ):
+
+                continue
+
+            action = (
+                details.get("action")
+                or
+                change.get(
+                    "log_action"
+                )
+            )
+
+            # Apenas aplicação/reaplicação.
+            # Desbloqueios não são publicados.
+            if action not in (
+                "block",
+                "reblock"
+            ):
+
+                continue
+
+            message = format_block_message(
+                details,
+                change
+            )
+
+            telegram_queue.put(
+                {
+                    "message": message,
+                    "title": (
+                        "Registro de bloqueio"
+                    ),
+                    "parse_mode": "HTML"
+                }
+            )
+
+            print(
+                "🔒 Bloqueio detectado:",
+                details.get(
+                    "title"
+                )
+            )
+
+        except Exception as e:
+
+            print(
+                "❌ Erro no monitor de bloqueios:",
+                repr(e)
+            )
+
+        finally:
+
+            block_queue.task_done()
+
+
+# =========================================================
 # GRUPOS
 # =========================================================
 
@@ -1179,17 +1727,25 @@ GROUP_NAMES = {
     "user": "usuário registrado",
     "autoconfirmed": "autoconfirmado",
     "confirmed": "confirmado",
-    "extendedconfirmed": "autoconfirmado estendido",
+    "extendedconfirmed": (
+        "autoconfirmado estendido"
+    ),
     "autoreviewer": "autorrevisor",
     "rollbacker": "reversor",
     "eliminator": "eliminador",
     "sysop": "administrador",
     "bureaucrat": "burocrata",
-    "interface-admin": "administrador de interface",
-    "accountcreator": "criador de contas",
+    "interface-admin": (
+        "administrador de interface"
+    ),
+    "accountcreator": (
+        "criador de contas"
+    ),
     "checkuser": "verificador",
     "suppress": "oversight",
-    "ipblock-exempt": "isento de bloqueio de IP"
+    "ipblock-exempt": (
+        "isento de bloqueio de IP"
+    )
 }
 
 
@@ -1197,7 +1753,9 @@ def format_groups(groups):
 
     if not groups:
 
-        return "nenhum grupo especial"
+        return (
+            "nenhum grupo especial"
+        )
 
     formatted = []
 
@@ -1233,6 +1791,7 @@ def is_wikipedia_admin(username):
 
     if info is None:
 
+        # Fail open para páginas vigiadas.
         return False
 
     return (
@@ -1301,7 +1860,11 @@ def should_evaluate_user(username):
                 created
             ).total_seconds() / 86400
 
-            if age_days > MAX_ACCOUNT_AGE_DAYS:
+            if (
+                age_days
+                >
+                MAX_ACCOUNT_AGE_DAYS
+            ):
 
                 return False
 
@@ -1313,7 +1876,7 @@ def should_evaluate_user(username):
 
 
 # =========================================================
-# TELEGRAM
+# TELEGRAM - ENVIO
 # =========================================================
 
 def send_telegram_message(
@@ -1441,6 +2004,8 @@ def telegram_sender():
 
             telegram_queue.task_done()
 
+        # Mantém envio abaixo de aproximadamente
+        # uma mensagem por segundo.
         time.sleep(1)
 
 
@@ -1505,11 +2070,15 @@ def build_account_message(username):
 
         except Exception:
 
-            creation_text = "indisponível"
+            creation_text = (
+                "indisponível"
+            )
 
     else:
 
-        creation_text = "indisponível"
+        creation_text = (
+            "indisponível"
+        )
 
     groups = format_groups(
         info.get(
@@ -1522,17 +2091,23 @@ def build_account_message(username):
         "blockid"
     ):
 
-        block_status = "🔴 ativo"
+        block_status = (
+            "🔴 ativo"
+        )
 
     elif has_previous_block(
         username
     ):
 
-        block_status = "🟡 bloqueio prévio"
+        block_status = (
+            "🟡 bloqueio prévio"
+        )
 
     else:
 
-        block_status = "🟢 nenhum"
+        block_status = (
+            "🟢 nenhum"
+        )
 
     encoded_username = quote(
         username.replace(
@@ -1589,7 +2164,7 @@ def commands_message():
         "Lista páginas vigiadas.\n\n"
 
         "🔎 /observar Usuário motivo\n"
-        "Observa uma conta durante 2 horas.\n\n"
+        "Observa uma conta durante 6 horas.\n\n"
 
         "⛔ /desobservar Usuário\n"
         "Encerra a observação de uma conta.\n\n"
@@ -1609,7 +2184,7 @@ def commands_message():
 
 
 # =========================================================
-# PROCESSAMENTO DOS COMANDOS
+# PROCESSA COMANDOS
 # =========================================================
 
 def process_telegram_command(
@@ -1636,7 +2211,6 @@ def process_telegram_command(
     )
 
     if not chat_id:
-
         return
 
     first_part, *remaining = (
@@ -1668,6 +2242,7 @@ def process_telegram_command(
             (
                 "🤖 Monitor da Wikipédia "
                 "em português.\n\n"
+
                 "Use /comandos."
             ),
             chat_id=chat_id
@@ -1746,7 +2321,9 @@ def process_telegram_command(
                 f"{watch_count}\n"
 
                 f"🔎 Contas observadas: "
-                f"{observed_count}\n\n"
+                f"{observed_count}\n"
+
+                f"🔒 Monitor de bloqueios: ativo\n\n"
 
                 f"🔎 Triagem: "
                 f"{REVERT_RISK_THRESHOLD:.0%}\n"
@@ -1756,6 +2333,9 @@ def process_telegram_command(
 
                 f"📥 Fila análise: "
                 f"{analysis_queue.qsize()}\n"
+
+                f"🔒 Fila bloqueios: "
+                f"{block_queue.qsize()}\n"
 
                 f"📤 Fila Telegram: "
                 f"{telegram_queue.qsize()}"
@@ -1817,7 +2397,10 @@ def process_telegram_command(
         if not items:
 
             send_telegram_message(
-                "🔎 Nenhuma conta está sendo observada.",
+                (
+                    "🔎 Nenhuma conta está "
+                    "sendo observada."
+                ),
                 chat_id=chat_id
             )
 
@@ -1844,7 +2427,8 @@ def process_telegram_command(
             lines.append(
                 (
                     f"• {item['username']}\n"
-                    f"  ⏳ {format_remaining(remaining_time)}\n"
+                    f"  ⏳ "
+                    f"{format_remaining(remaining_time)}\n"
                     f"  📌 {item['reason']}"
                 )
             )
@@ -1895,6 +2479,7 @@ def process_telegram_command(
                 (
                     "Uso:\n"
                     "/observar Usuário motivo\n\n"
+
                     "Exemplo:\n"
                     "/observar Teles vandalismo recorrente"
                 ),
@@ -1934,7 +2519,7 @@ def process_telegram_command(
                     "🔎 Conta colocada em observação\n\n"
 
                     f"👤 {canonical_username}\n"
-                    f"⏳ Duração: 2 horas\n"
+                    f"⏳ Duração: 6 horas\n"
                     f"📌 Motivo: {reason}\n\n"
 
                     "Toda edição desta conta será "
@@ -2071,7 +2656,7 @@ def process_telegram_command(
 
 
     # =====================================================
-    # /VIGIAR /DESVIGIAR
+    # /VIGIAR E /DESVIGIAR
     # =====================================================
 
     if command in (
@@ -2215,7 +2800,9 @@ def telegram_command_listener():
 
             if offset is not None:
 
-                params["offset"] = offset
+                params[
+                    "offset"
+                ] = offset
 
             response = requests.get(
                 f"{TELEGRAM_API}/getUpdates",
@@ -2230,6 +2817,7 @@ def telegram_command_listener():
                 )
 
                 print(
+                    "Resposta Telegram:",
                     response.text
                 )
 
@@ -2304,6 +2892,10 @@ def eventstream_watchdog():
     global stream_connected
     global current_stream_response
 
+    print(
+        "✅ Watchdog EventStreams iniciado."
+    )
+
     while True:
 
         time.sleep(15)
@@ -2326,7 +2918,17 @@ def eventstream_watchdog():
                     last_stream_event_at
                 )
 
-                if elapsed > STREAM_STALL_SECONDS:
+                if (
+                    elapsed
+                    >
+                    STREAM_STALL_SECONDS
+                ):
+
+                    print(
+                        "⚠️ EventStreams parado por",
+                        int(elapsed),
+                        "segundos."
+                    )
 
                     response_to_close = (
                         current_stream_response
@@ -2463,6 +3065,10 @@ def get_revert_risk(revision_id):
 
         if response.status_code == 429:
 
+            print(
+                "⚠️ Rate limit Lift Wing."
+            )
+
             return None
 
         response.raise_for_status()
@@ -2536,7 +3142,6 @@ def profanity_score(text):
 def repetition_score(text):
 
     if not text:
-
         return 0.0
 
     patterns = [
@@ -2644,20 +3249,28 @@ def analyze_vandalism(
         ""
     )
 
+    profanity = profanity_score(
+        added
+    )
+
+    repetition = repetition_score(
+        added
+    )
+
+    destructive = destructive_score(
+        added,
+        removed
+    )
+
+    nonsense = nonsense_score(
+        added
+    )
+
     signals = [
-        profanity_score(
-            added
-        ),
-        repetition_score(
-            added
-        ),
-        destructive_score(
-            added,
-            removed
-        ),
-        nonsense_score(
-            added
-        )
+        profanity,
+        repetition,
+        destructive,
+        nonsense
     ]
 
     score = revert_risk
@@ -2701,25 +3314,25 @@ def analyze_vandalism(
             "risco de reversão elevado"
         )
 
-    if signals[0] >= 0.75:
+    if profanity >= 0.75:
 
         reasons.append(
             "linguagem ofensiva"
         )
 
-    if signals[1] >= 0.75:
+    if repetition >= 0.75:
 
         reasons.append(
             "repetição anormal"
         )
 
-    if signals[2] >= 0.75:
+    if destructive >= 0.75:
 
         reasons.append(
             "remoção potencialmente destrutiva"
         )
 
-    if signals[3] >= 0.75:
+    if nonsense >= 0.75:
 
         reasons.append(
             "texto possivelmente sem sentido"
@@ -2848,6 +3461,10 @@ def format_message(
 
 def analysis_worker():
 
+    print(
+        "✅ Worker de análise iniciado."
+    )
+
     while True:
 
         change = analysis_queue.get()
@@ -2943,6 +3560,11 @@ def analysis_worker():
                     }
                 )
 
+                print(
+                    "👁 Edição em página vigiada:",
+                    title
+                )
+
                 continue
 
 
@@ -2986,7 +3608,7 @@ def analysis_worker():
 
 
             # =============================================
-            # 5. DIFF E HEURÍSTICAS
+            # 5. DIFF
             # =============================================
 
             diff = get_revision_diff(
@@ -3038,7 +3660,7 @@ def analysis_worker():
 
 
 # =========================================================
-# EVENTSTREAMS
+# WIKIMEDIA EVENTSTREAMS
 # =========================================================
 
 def wikimedia_loop():
@@ -3112,6 +3734,11 @@ def wikimedia_loop():
 
                     continue
 
+
+                # =========================================
+                # APENAS PTWIKI
+                # =========================================
+
                 if (
                     change.get("wiki")
                     !=
@@ -3119,6 +3746,56 @@ def wikimedia_loop():
                 ):
 
                     continue
+
+
+                # =========================================
+                # REGISTROS DE BLOQUEIO
+                # =========================================
+
+                if (
+                    change.get("type")
+                    ==
+                    "log"
+                ):
+
+                    if (
+                        change.get(
+                            "log_type"
+                        )
+                        ==
+                        "block"
+                    ):
+
+                        action = change.get(
+                            "log_action"
+                        )
+
+                        if action in (
+                            "block",
+                            "reblock"
+                        ):
+
+                            block_queue.put(
+                                change
+                            )
+
+                            print(
+                                "🔒 Evento de bloqueio:",
+                                change.get(
+                                    "title"
+                                ),
+                                "| ação:",
+                                action
+                            )
+
+                    # Outros registros não são
+                    # enviados à análise de vandalismo.
+                    continue
+
+
+                # =========================================
+                # APENAS EDIÇÕES
+                # =========================================
 
                 if (
                     change.get("type")
@@ -3197,7 +3874,7 @@ def main():
     )
 
     print(
-        "Versão 1.6"
+        "Versão 1.7"
     )
 
     print(
@@ -3246,27 +3923,47 @@ def main():
 
     print(
         "⏳ Observação de conta:",
-        "2 horas"
+        "6 horas"
     )
+
+    print(
+        "🔒 Monitor de bloqueios:",
+        "ativo"
+    )
+
+
+    # =====================================================
+    # THREADS
+    # =====================================================
 
     threading.Thread(
         target=telegram_sender,
-        daemon=True
+        daemon=True,
+        name="telegram-sender"
     ).start()
 
     threading.Thread(
         target=analysis_worker,
-        daemon=True
+        daemon=True,
+        name="analysis-worker"
+    ).start()
+
+    threading.Thread(
+        target=block_worker,
+        daemon=True,
+        name="block-worker"
     ).start()
 
     threading.Thread(
         target=eventstream_watchdog,
-        daemon=True
+        daemon=True,
+        name="eventstream-watchdog"
     ).start()
 
     threading.Thread(
         target=telegram_command_listener,
-        daemon=True
+        daemon=True,
+        name="telegram-listener"
     ).start()
 
     wikimedia_loop()
