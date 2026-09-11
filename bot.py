@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.12"
+BOT_VERSION = "1.13"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -191,6 +191,11 @@ wikimedia_authenticated = False
 wikimedia_authenticated_user = None
 wikimedia_auth_error = None
 wikimedia_rights = set()
+
+# Diagnóstico do acesso de patrulhamento.
+patrol_api_test_ok = None
+patrol_api_test_code = None
+patrol_api_test_info = None
 
 # Controle explícito do teto de patrulhamento.
 patrol_request_lock = threading.Lock()
@@ -2403,11 +2408,97 @@ def get_revision_tags(revision_id):
     return set()
 
 
+def test_patrol_visibility_access():
+    """
+    Testa diretamente se a sessão autenticada consegue pedir
+    rcprop=patrolled no RecentChanges.
+
+    Esta chamada diagnóstica também conta para o teto de patrulhamento:
+    após executá-la, o próximo lote normal só poderá ocorrer 60s depois.
+    """
+
+    global patrol_api_test_ok
+    global patrol_api_test_code
+    global patrol_api_test_info
+    global patrol_visibility_supported
+    global last_patrol_request_at
+
+    try:
+        # Reserva o ciclo antes da chamada. Assim o teste de inicialização
+        # não permite uma segunda chamada de patrulhamento no mesmo minuto.
+        with patrol_request_lock:
+            last_patrol_request_at = time.monotonic()
+
+        response = wikimedia_session.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "list": "recentchanges",
+                "rctype": "edit|new",
+                "rcprop": "ids|patrolled|timestamp",
+                "rclimit": 1,
+                "rcdir": "older",
+            },
+            timeout=25
+        )
+        response.raise_for_status()
+        data = response.json()
+        error = data.get("error")
+
+        if error:
+            patrol_api_test_ok = False
+            patrol_api_test_code = str(
+                error.get("code") or "erro_desconhecido"
+            )
+            patrol_api_test_info = str(
+                error.get("info") or "sem detalhes"
+            )
+            patrol_visibility_supported = False
+
+            print(
+                "❌ Teste rcprop=patrolled falhou:",
+                patrol_api_test_code,
+                "-",
+                patrol_api_test_info
+            )
+            return False
+
+        patrol_api_test_ok = True
+        patrol_api_test_code = "ok"
+        patrol_api_test_info = "rcprop=patrolled aceito pela API"
+        patrol_visibility_supported = True
+
+        print(
+            "✅ Teste rcprop=patrolled: API permitiu a leitura."
+        )
+        return True
+
+    except Exception as e:
+        patrol_api_test_ok = False
+        patrol_api_test_code = "exception"
+        patrol_api_test_info = str(e)
+        patrol_visibility_supported = False
+        print(
+            "❌ Exceção no teste rcprop=patrolled:",
+            repr(e)
+        )
+        return False
+
+
 def wikimedia_login():
     """
-    Autentica uma única sessão persistente usando Bot Password.
-    O login via Bot Password usa duas chamadas: token + POST login.
-    Em seguida, uma terceira chamada consulta os direitos da conta.
+    Autentica uma sessão persistente usando Bot Password.
+
+    Depois do login:
+    1. consulta os direitos efetivos da sessão;
+    2. registra patrol, patrolmarks e autopatrol individualmente;
+    3. testa de fato rcprop=patrolled no RecentChanges.
+
+    O teste real da API é a fonte final para definir se a leitura de
+    patrulhamento está disponível. Isso evita falsos negativos causados
+    apenas pela interpretação da lista de direitos.
     """
 
     global wikimedia_authenticated
@@ -2415,6 +2506,13 @@ def wikimedia_login():
     global wikimedia_auth_error
     global wikimedia_rights
     global patrol_visibility_supported
+    global patrol_api_test_ok
+    global patrol_api_test_code
+    global patrol_api_test_info
+
+    patrol_api_test_ok = None
+    patrol_api_test_code = None
+    patrol_api_test_info = None
 
     if not WIKIMEDIA_BOT_USERNAME or not WIKIMEDIA_BOT_PASSWORD:
         wikimedia_authenticated = False
@@ -2519,41 +2617,47 @@ def wikimedia_login():
                 userinfo.get("anon")
             )
 
-            has_patrol_visibility = bool(
-                {"patrol", "patrolmarks"}
-                &
-                wikimedia_rights
-            )
-
-            patrol_visibility_supported = (
-                wikimedia_authenticated
-                and
-                has_patrol_visibility
-            )
-
             if not wikimedia_authenticated:
                 raise RuntimeError(
                     "sessão permaneceu anônima após login"
                 )
 
-            if not has_patrol_visibility:
-                wikimedia_auth_error = (
-                    "conta autenticada sem direito patrol/patrolmarks"
-                )
-                print(
-                    "⚠️ Login Wikimedia OK, mas a conta não possui "
-                    "patrol/patrolmarks."
-                )
-                return True
-
-            wikimedia_auth_error = None
             print(
                 "✅ Wikimedia autenticada como:",
                 wikimedia_authenticated_user
             )
             print(
-                "✅ Direito de leitura de patrulhamento disponível."
+                "🔎 Direitos efetivos da sessão:"
             )
+            print(
+                "   patrol =",
+                "sim" if "patrol" in wikimedia_rights else "não"
+            )
+            print(
+                "   patrolmarks =",
+                "sim" if "patrolmarks" in wikimedia_rights else "não"
+            )
+            print(
+                "   autopatrol =",
+                "sim" if "autopatrol" in wikimedia_rights else "não"
+            )
+
+            # O teste prático é deliberadamente executado mesmo se a lista
+            # de rights não contiver patrol/patrolmarks. A resposta real do
+            # RecentChanges é a fonte definitiva para o bot.
+            test_ok = test_patrol_visibility_access()
+
+            if test_ok:
+                wikimedia_auth_error = None
+                print(
+                    "✅ Direito de leitura de patrulhamento disponível."
+                )
+            else:
+                wikimedia_auth_error = (
+                    "rcprop=patrolled recusado: "
+                    f"{patrol_api_test_code}: {patrol_api_test_info}"
+                )
+
             return True
 
         except Exception as e:
@@ -2562,12 +2666,14 @@ def wikimedia_login():
             wikimedia_rights = set()
             patrol_visibility_supported = False
             wikimedia_auth_error = str(e)
+            patrol_api_test_ok = False
+            patrol_api_test_code = "login_error"
+            patrol_api_test_info = str(e)
             print(
                 "❌ Falha no login Wikimedia:",
                 repr(e)
             )
             return False
-
 
 def get_revision_tags_batch(revision_ids):
     """
@@ -4341,9 +4447,28 @@ def process_telegram_command(message, from_channel=False):
         if patrol_visibility_supported is True:
             patrol_text = "disponível"
         elif wikimedia_authenticated:
-            patrol_text = "indisponível para esta conta"
+            patrol_text = "indisponível para esta sessão"
         else:
             patrol_text = "indisponível sem autenticação"
+
+        patrol_right_text = (
+            "sim" if "patrol" in wikimedia_rights else "não"
+        )
+        patrolmarks_right_text = (
+            "sim" if "patrolmarks" in wikimedia_rights else "não"
+        )
+        autopatrol_right_text = (
+            "sim" if "autopatrol" in wikimedia_rights else "não"
+        )
+
+        if patrol_api_test_ok is True:
+            patrol_test_text = "OK"
+        elif patrol_api_test_ok is False:
+            patrol_test_text = (
+                str(patrol_api_test_code or "falhou")
+            )
+        else:
+            patrol_test_text = "não executado"
 
         stream_status = (
             "🟢 conectado"
@@ -4380,6 +4505,10 @@ def process_telegram_command(message, from_channel=False):
                 f"🕗 Relatório diário: 20:05 (Brasília)\n"
                 f"🔐 Wikimedia: {auth_text}\n"
                 f"✅ Patrulhamento: {patrol_text}\n"
+                f"🔑 Direito patrol: {patrol_right_text}\n"
+                f"🔑 Direito patrolmarks: {patrolmarks_right_text}\n"
+                f"🔑 Direito autopatrol: {autopatrol_right_text}\n"
+                f"🧪 Teste rcprop=patrolled: {patrol_test_text}\n"
                 f"🔄 Patrulhamento: lote a cada 60s, "
                 f"máx. 1 chamada/min\n"
                 f"🔒 Monitor de bloqueios: ativo\n\n"
