@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.20"
+BOT_VERSION = "1.22"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -72,6 +72,12 @@ IGNORE_DURATION_SECONDS = 6 * 60 * 60
 
 ABUSE_FILTER_POLL_SECONDS = 20
 ABUSE_FILTER_BATCH_LIMIT = 500
+
+# Proteção contra flooding em surtos de bloqueios.
+# Até 5 bloqueios/rebloqueios por minuto recebem alertas individuais.
+# Do 6º em diante, os eventos individuais são suprimidos e uma única
+# mensagem direciona ao registro de bloqueios.
+MAX_BLOCK_ALERTS_PER_MINUTE = 5
 
 POSTED_EDIT_CHECK_SECONDS = 10
 REVISION_STATUS_INTERVAL_SECONDS = 30
@@ -154,9 +160,11 @@ watchlist_lock = threading.Lock()
 
 observed_users = {}
 observed_users_lock = threading.Lock()
+observed_users_persist_lock = threading.Lock()
 
 ignored_users = {}
 ignored_users_lock = threading.Lock()
+ignored_users_persist_lock = threading.Lock()
 
 # dict:
 # "123" -> {"filter_id": "123", "added_at": 1234567890.0, ...}
@@ -170,6 +178,7 @@ abuse_state_lock = threading.Lock()
 # revisão -> metadados da mensagem do Telegram
 posted_edits = {}
 posted_edits_lock = threading.Lock()
+posted_edits_persist_lock = threading.Lock()
 
 # Estatísticas dos alertas do detector normal.
 # Mantidas separadamente das mensagens acompanhadas por 48h.
@@ -178,6 +187,7 @@ detection_stats = {
     "last_report_date": None,
 }
 detection_stats_lock = threading.Lock()
+detection_stats_persist_lock = threading.Lock()
 
 # Estado do último resumo periódico de pendências.
 pending_summary_state = {
@@ -185,12 +195,22 @@ pending_summary_state = {
     "last_signature": "",
 }
 pending_summary_lock = threading.Lock()
+pending_summary_persist_lock = threading.Lock()
 
 user_cache = {}
 
 analysis_queue = queue.Queue()
 block_queue = queue.Queue()
 page_deletion_queue = queue.Queue()
+
+# Controle de flooding dos alertas de bloqueio.
+block_rate_lock = threading.Lock()
+block_rate_state = {
+    "minute_bucket": None,
+    "count": 0,
+    "summary_sent": False,
+}
+
 telegram_queue = queue.Queue()
 
 stream_lock = threading.Lock()
@@ -230,7 +250,9 @@ def atomic_write_json(path, data):
     if directory:
         os.makedirs(directory, exist_ok=True)
 
-    temp_file = path + ".tmp"
+    temp_file = (
+        f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
 
     with open(temp_file, "w", encoding="utf-8") as file:
         json.dump(
@@ -254,7 +276,7 @@ def load_json(path, default):
             return json.load(file)
 
     except Exception as e:
-        print("⚠️ Erro ao ler", path, ":", repr(e))
+        print("⚠️ Erro ao ler", path, ":", safe_exception(e))
         return default
 
 
@@ -307,7 +329,7 @@ def ensure_storage():
         return True
 
     except Exception as e:
-        print("❌ Erro no armazenamento:", repr(e))
+        print("❌ Erro no armazenamento:", safe_exception(e))
         return False
 
 
@@ -397,6 +419,29 @@ def is_target_channel(chat):
     return str(chat_id) == str(TELEGRAM_CHANNEL)
 
 
+def safe_exception(error):
+    """Retorna erro apropriado para log sem expor credenciais."""
+    text = repr(error)
+
+    secrets = [
+        TELEGRAM_TOKEN,
+        WIKIMEDIA_BOT_PASSWORD,
+    ]
+
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "***REDACTED***")
+
+    # O token do Telegram faz parte da própria URL da Bot API.
+    if TELEGRAM_TOKEN:
+        text = text.replace(
+            f"/bot{TELEGRAM_TOKEN}/",
+            "/bot***REDACTED***/",
+        )
+
+    return text
+
+
 # =========================================================
 # TELEGRAM
 # =========================================================
@@ -414,7 +459,7 @@ def remove_telegram_webhook():
             print("✅ Webhook Telegram removido/desativado.")
 
     except Exception as e:
-        print("⚠️ Erro ao remover webhook Telegram:", repr(e))
+        print("⚠️ Erro ao remover webhook Telegram:", safe_exception(e))
 
 
 def check_telegram_webhook():
@@ -437,7 +482,7 @@ def check_telegram_webhook():
             print("✅ Webhook atual: nenhum")
 
     except Exception as e:
-        print("⚠️ Erro ao verificar webhook:", repr(e))
+        print("⚠️ Erro ao verificar webhook:", safe_exception(e))
 
 
 def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None):
@@ -505,7 +550,7 @@ def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None
             return data.get("result")
 
         except requests.RequestException as e:
-            print("⚠️ Erro de rede Telegram:", repr(e))
+            print("⚠️ Erro de rede Telegram:", safe_exception(e))
             time.sleep(5)
 
 
@@ -572,7 +617,7 @@ def edit_telegram_message(message_id, text, parse_mode=None, reply_markup=None):
             return bool(response.json().get("ok"))
 
         except requests.RequestException as e:
-            print("⚠️ Erro ao editar mensagem Telegram:", repr(e))
+            print("⚠️ Erro ao editar mensagem Telegram:", safe_exception(e))
             time.sleep(5)
 
 
@@ -639,7 +684,7 @@ def announce_new_version_if_needed():
         print(
             "⚠️ Mensagem enviada, mas houve erro "
             "ao registrar a versão:",
-            repr(e)
+            safe_exception(e)
         )
 
 
@@ -689,7 +734,7 @@ def add_watched_page(title):
     try:
         save_watchlist_snapshot(snapshot)
     except Exception as e:
-        print("❌ Erro ao salvar watchlist:", repr(e))
+        print("❌ Erro ao salvar watchlist:", safe_exception(e))
         return False, False
 
     with watchlist_lock:
@@ -709,7 +754,7 @@ def remove_watched_page(title):
     try:
         save_watchlist_snapshot(snapshot)
     except Exception as e:
-        print("❌ Erro ao salvar watchlist:", repr(e))
+        print("❌ Erro ao salvar watchlist:", safe_exception(e))
         return False, False
 
     with watchlist_lock:
@@ -728,13 +773,14 @@ def is_watched_page(title):
 # =========================================================
 
 def save_observed_users():
-    with observed_users_lock:
-        data = list(observed_users.values())
+    with observed_users_persist_lock:
+        with observed_users_lock:
+            data = list(observed_users.values())
 
-    atomic_write_json(
-        OBSERVED_USERS_FILE,
-        data
-    )
+        atomic_write_json(
+            OBSERVED_USERS_FILE,
+            data
+        )
 
     print(
         "💾 Contas observadas salvas:",
@@ -770,7 +816,7 @@ def cleanup_expired_observations():
         except Exception as e:
             print(
                 "⚠️ Erro ao salvar expirações:",
-                repr(e)
+                safe_exception(e)
             )
 
 
@@ -851,7 +897,7 @@ def observe_user(username, reason=None):
     except Exception as e:
         print(
             "❌ Erro ao salvar conta observada:",
-            repr(e)
+            safe_exception(e)
         )
 
         with observed_users_lock:
@@ -880,7 +926,7 @@ def stop_observing_user(username):
     except Exception as e:
         print(
             "❌ Erro ao salvar remoção:",
-            repr(e)
+            safe_exception(e)
         )
 
         with observed_users_lock:
@@ -905,13 +951,14 @@ def get_observation(username):
 # =========================================================
 
 def save_ignored_users():
-    with ignored_users_lock:
-        data = list(ignored_users.values())
+    with ignored_users_persist_lock:
+        with ignored_users_lock:
+            data = list(ignored_users.values())
 
-    atomic_write_json(
-        IGNORED_USERS_FILE,
-        data
-    )
+        atomic_write_json(
+            IGNORED_USERS_FILE,
+            data
+        )
 
     print(
         "💾 Contas ignoradas salvas:",
@@ -948,7 +995,7 @@ def cleanup_expired_ignored_users():
             print(
                 "⚠️ Erro ao salvar expirações "
                 "de contas ignoradas:",
-                repr(e)
+                safe_exception(e)
             )
 
 
@@ -1026,7 +1073,7 @@ def ignore_user(username):
     except Exception as e:
         print(
             "❌ Erro ao salvar conta ignorada:",
-            repr(e)
+            safe_exception(e)
         )
 
         with ignored_users_lock:
@@ -1056,7 +1103,7 @@ def stop_ignoring_user(username):
         print(
             "❌ Erro ao salvar remoção "
             "de conta ignorada:",
-            repr(e)
+            safe_exception(e)
         )
 
         with ignored_users_lock:
@@ -1165,7 +1212,7 @@ def get_abuse_filter_info(filter_id):
             "⚠️ Erro ao consultar filtro de abuso",
             filter_id,
             ":",
-            repr(e)
+            safe_exception(e)
         )
         return None
 
@@ -1273,7 +1320,7 @@ def add_abuse_filter(filter_id):
     except Exception as e:
         print(
             "❌ Erro ao salvar filtro de abuso:",
-            repr(e)
+            safe_exception(e)
         )
 
         with abuse_filters_lock:
@@ -1307,7 +1354,7 @@ def remove_abuse_filter(filter_id):
     except Exception as e:
         print(
             "❌ Erro ao salvar remoção de filtro:",
-            repr(e)
+            safe_exception(e)
         )
 
         with abuse_filters_lock:
@@ -1491,7 +1538,7 @@ def fetch_abuse_log_entries(filter_ids):
         except Exception as e:
             print(
                 "⚠️ Erro ao consultar AbuseLog:",
-                repr(e)
+                safe_exception(e)
             )
 
     return all_entries
@@ -1625,13 +1672,13 @@ def abuse_filter_monitor():
                 except Exception as e:
                     print(
                         "⚠️ Erro ao salvar estado do AbuseLog:",
-                        repr(e)
+                        safe_exception(e)
                     )
 
         except Exception as e:
             print(
                 "❌ Erro no monitor de filtros de abuso:",
-                repr(e)
+                safe_exception(e)
             )
 
         time.sleep(ABUSE_FILTER_POLL_SECONDS)
@@ -1642,20 +1689,21 @@ def abuse_filter_monitor():
 # =========================================================
 
 def save_detection_stats():
-    with detection_stats_lock:
-        data = {
-            "records": list(
-                detection_stats.get("records", [])
-            ),
-            "last_report_date": detection_stats.get(
-                "last_report_date"
-            ),
-        }
+    with detection_stats_persist_lock:
+        with detection_stats_lock:
+            data = {
+                "records": list(
+                    detection_stats.get("records", [])
+                ),
+                "last_report_date": detection_stats.get(
+                    "last_report_date"
+                ),
+            }
 
-    atomic_write_json(
-        DETECTION_STATS_FILE,
-        data
-    )
+        atomic_write_json(
+            DETECTION_STATS_FILE,
+            data
+        )
 
 
 def cleanup_detection_stats(save=True):
@@ -1694,7 +1742,7 @@ def cleanup_detection_stats(save=True):
         except Exception as e:
             print(
                 "⚠️ Erro ao limpar estatísticas:",
-                repr(e)
+                safe_exception(e)
             )
 
 
@@ -1843,7 +1891,7 @@ def register_detection_stat(
     except Exception as e:
         print(
             "⚠️ Erro ao salvar estatística:",
-            repr(e)
+            safe_exception(e)
         )
 
 
@@ -1883,7 +1931,7 @@ def mark_detection_stat_reverted(
         except Exception as e:
             print(
                 "⚠️ Erro ao salvar reversão estatística:",
-                repr(e)
+                safe_exception(e)
             )
 
 
@@ -2202,7 +2250,7 @@ def daily_detection_report_scheduler():
         except Exception as e:
             print(
                 "⚠️ Erro no relatório diário:",
-                repr(e)
+                safe_exception(e)
             )
 
         time.sleep(30)
@@ -2213,15 +2261,16 @@ def daily_detection_report_scheduler():
 # =========================================================
 
 def save_posted_edits():
-    with posted_edits_lock:
-        data = list(
-            posted_edits.values()
-        )
+    with posted_edits_persist_lock:
+        with posted_edits_lock:
+            data = list(
+                posted_edits.values()
+            )
 
-    atomic_write_json(
-        POSTED_EDITS_FILE,
-        data
-    )
+        atomic_write_json(
+            POSTED_EDITS_FILE,
+            data
+        )
 
 
 def cleanup_posted_edits(save=True):
@@ -2247,7 +2296,7 @@ def cleanup_posted_edits(save=True):
         except Exception as e:
             print(
                 "⚠️ Erro ao limpar posted_edits:",
-                repr(e)
+                safe_exception(e)
             )
 
 
@@ -2363,7 +2412,7 @@ def register_posted_edit(item, telegram_message):
     except Exception as e:
         print(
             "⚠️ Erro ao persistir revisão publicada:",
-            repr(e)
+            safe_exception(e)
         )
 
     stats_payload = item.get(
@@ -2439,7 +2488,7 @@ def get_revision_tags(revision_id):
             "⚠️ Erro ao consultar tags da revisão",
             revision_id,
             ":",
-            repr(e)
+            safe_exception(e)
         )
 
     return set()
@@ -2519,7 +2568,7 @@ def test_patrol_visibility_access():
         patrol_visibility_supported = False
         print(
             "❌ Exceção no teste rcprop=patrolled:",
-            repr(e)
+            safe_exception(e)
         )
         return False
 
@@ -2708,7 +2757,7 @@ def wikimedia_login():
             patrol_api_test_info = str(e)
             print(
                 "❌ Falha no login Wikimedia:",
-                repr(e)
+                safe_exception(e)
             )
             return False
 
@@ -2782,7 +2831,7 @@ def get_revision_tags_batch(revision_ids):
     except Exception as e:
         print(
             "⚠️ Erro na consulta em lote de tags:",
-            repr(e)
+            safe_exception(e)
         )
         return {}
 
@@ -2833,6 +2882,15 @@ def get_patrol_status_batch(records):
             },
             timeout=25
         )
+
+        if response.status_code in (401, 403):
+            print(
+                "⚠️ Sessão Wikimedia perdeu autenticação; tentando novo login."
+            )
+            if wikimedia_login():
+                patrol_visibility_warning_printed = False
+            return {}
+
         response.raise_for_status()
         data = response.json()
 
@@ -2843,6 +2901,12 @@ def get_patrol_status_batch(records):
             info = error.get("info", "")
 
             if code == "rcpermissiondenied":
+                print(
+                    "⚠️ rcprop=patrolled recusado; tentando renovar a sessão Wikimedia."
+                )
+                if wikimedia_login():
+                    patrol_visibility_warning_printed = False
+                    return {}
                 patrol_visibility_supported = False
 
             if not patrol_visibility_warning_printed:
@@ -2891,7 +2955,7 @@ def get_patrol_status_batch(records):
     except Exception as e:
         print(
             "⚠️ Erro na consulta em lote de patrulhamento:",
-            repr(e)
+            safe_exception(e)
         )
         return {}
 
@@ -2949,7 +3013,7 @@ def get_reverter_username(title, revision_id):
                 if explicit_tag or explicit_comment:
                     return rev.get("user") or None
     except Exception as e:
-        print("⚠️ Não foi possível identificar quem reverteu:", repr(e))
+        print("⚠️ Não foi possível identificar quem reverteu:", safe_exception(e))
     return None
 
 
@@ -3173,7 +3237,7 @@ def posted_edit_status_monitor():
             except Exception as e:
                 print(
                     "⚠️ Erro ao salvar status de mensagens:",
-                    repr(e)
+                    safe_exception(e)
                 )
 
 
@@ -3268,11 +3332,11 @@ def page_deletion_worker():
                 except Exception as e:
                     print(
                         "⚠️ Erro ao salvar status de página eliminada:",
-                        repr(e)
+                        safe_exception(e)
                     )
 
         except Exception as e:
-            print("⚠️ Erro ao processar eliminação de página:", repr(e))
+            print("⚠️ Erro ao processar eliminação de página:", safe_exception(e))
         finally:
             page_deletion_queue.task_done()
 
@@ -3299,9 +3363,10 @@ def load_pending_summary_state():
 
 
 def save_pending_summary_state():
-    with pending_summary_lock:
-        data = dict(pending_summary_state)
-    atomic_write_json(PENDING_SUMMARY_STATE_FILE, data)
+    with pending_summary_persist_lock:
+        with pending_summary_lock:
+            data = dict(pending_summary_state)
+        atomic_write_json(PENDING_SUMMARY_STATE_FILE, data)
 
 
 def telegram_post_url(message_id):
@@ -3414,7 +3479,7 @@ def pending_alerts_summary_scheduler():
                 save_pending_summary_state()
                 print("✅ Resumo de pendências publicado:", len(items), "alertas.")
         except Exception as e:
-            print("⚠️ Erro no resumo de pendências:", repr(e))
+            print("⚠️ Erro no resumo de pendências:", safe_exception(e))
 
 
 # =========================================================
@@ -3447,7 +3512,7 @@ def telegram_sender():
                     )
 
         except Exception as e:
-            print("❌ Erro sender:", repr(e))
+            print("❌ Erro sender:", safe_exception(e))
 
         finally:
             telegram_queue.task_done()
@@ -3499,7 +3564,7 @@ def normalize_page_title(title):
     except Exception as e:
         print(
             "⚠️ Erro ao normalizar página:",
-            repr(e)
+            safe_exception(e)
         )
         return None
 
@@ -3569,7 +3634,7 @@ def get_user_info(username, use_cache=True):
         print(
             "⚠️ Erro ao consultar usuário:",
             username,
-            repr(e)
+            safe_exception(e)
         )
         return None
 
@@ -3831,7 +3896,7 @@ def get_block_log_details(log_id):
         print(
             "⚠️ Erro ao obter detalhes do bloqueio:",
             log_id,
-            repr(e)
+            safe_exception(e)
         )
         return None
 
@@ -4045,6 +4110,87 @@ def get_block_duration(event, fallback_change=None):
     return "não informada"
 
 
+def general_block_log_url():
+    return (
+        "https://pt.wikipedia.org/w/index.php"
+        "?title=Special:Log&type=block"
+    )
+
+
+def format_block_burst_message():
+    url = general_block_log_url()
+
+    return (
+        "⚠️ <b>Mais de 5 bloqueios no mesmo minuto</b>\n\n"
+        "Mais de 5 bloqueios ou reaplicações de bloqueio foram "
+        "efetuados neste minuto. Para evitar flooding, os alertas "
+        "individuais adicionais foram suprimidos.\n\n"
+        f'🔗 <a href="{url}">Ver registro de bloqueios</a>'
+    )
+
+
+def handle_block_event(change):
+    """
+    Aplica o limite de flooding antes de consultar detalhes do log.
+
+    Os cinco primeiros eventos de cada minuto seguem para block_queue.
+    No sexto evento, é enviada uma única mensagem-resumo e o próprio
+    evento, assim como os seguintes no mesmo minuto, não gera consulta
+    adicional a list=logevents.
+    """
+    now = time.time()
+    minute_bucket = int(now // 60)
+    send_summary = False
+    allow_individual = False
+
+    with block_rate_lock:
+        if block_rate_state["minute_bucket"] != minute_bucket:
+            block_rate_state["minute_bucket"] = minute_bucket
+            block_rate_state["count"] = 0
+            block_rate_state["summary_sent"] = False
+
+        block_rate_state["count"] += 1
+        count = block_rate_state["count"]
+
+        if count <= MAX_BLOCK_ALERTS_PER_MINUTE:
+            allow_individual = True
+        elif not block_rate_state["summary_sent"]:
+            block_rate_state["summary_sent"] = True
+            send_summary = True
+
+    if allow_individual:
+        block_queue.put(change)
+        print(
+            "🔒 Evento de bloqueio aceito:",
+            change.get("title"),
+            "| minuto:",
+            minute_bucket,
+            "| posição:",
+            count,
+        )
+        return
+
+    if send_summary:
+        telegram_queue.put(
+            {
+                "message": format_block_burst_message(),
+                "title": "Muitos bloqueios",
+                "parse_mode": "HTML",
+            }
+        )
+        print(
+            "⚠️ Mais de 5 bloqueios no mesmo minuto; "
+            "alertas individuais adicionais suprimidos."
+        )
+    else:
+        print(
+            "⏭️ Bloqueio suprimido por limite anti-flood:",
+            change.get("title"),
+            "| posição:",
+            count,
+        )
+
+
 def block_log_url(target):
     encoded_target = quote(
         f"Usuário:{target}",
@@ -4172,7 +4318,7 @@ def block_worker():
         except Exception as e:
             print(
                 "❌ Erro no monitor de bloqueios:",
-                repr(e)
+                safe_exception(e)
             )
 
         finally:
@@ -4290,7 +4436,7 @@ def get_revert_risk(revision_id):
         return float(probability)
 
     except Exception as e:
-        print("⚠️ Erro Lift Wing:", repr(e))
+        print("⚠️ Erro Lift Wing:", safe_exception(e))
         return None
 
 
@@ -4706,7 +4852,7 @@ def analysis_worker():
         except Exception as e:
             print(
                 "❌ Erro análise:",
-                repr(e)
+                safe_exception(e)
             )
 
         finally:
@@ -5598,7 +5744,51 @@ def answer_callback_query(callback_query_id, text=None):
             timeout=20
         )
     except Exception as e:
-        print("⚠️ Erro ao responder callback:", repr(e))
+        print("⚠️ Erro ao responder callback:", safe_exception(e))
+
+
+def telegram_user_is_channel_admin(user_id):
+    """Valida no Telegram se quem clicou é administrador do canal.
+
+    O botão aparece em um canal público, portanto não podemos confiar apenas
+    no fato de o callback ter vindo de uma mensagem do canal: qualquer
+    assinante consegue tocar em um botão inline.
+    """
+    try:
+        response = requests.get(
+            f"{TELEGRAM_API}/getChatMember",
+            params={
+                "chat_id": TELEGRAM_CHANNEL,
+                "user_id": int(user_id),
+            },
+            timeout=20,
+        )
+
+        if response.status_code in (400, 401, 403):
+            print(
+                "⚠️ Não foi possível validar administrador do canal:",
+                response.status_code,
+                response.text,
+            )
+            return False
+
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            return False
+
+        member = data.get("result", {})
+        status = member.get("status")
+        return status in ("creator", "administrator")
+
+    except Exception as e:
+        print(
+            "⚠️ Erro ao validar administrador do Telegram:",
+            safe_exception(e),
+        )
+        # Falha fechada: se não pudermos comprovar a permissão, não
+        # alteramos a lista de contas observadas.
+        return False
 
 
 def process_observe_callback(callback):
@@ -5606,6 +5796,26 @@ def process_observe_callback(callback):
     data = callback.get("data", "")
     if not data.startswith("observe:"):
         answer_callback_query(callback_id)
+        return
+
+    callback_message = callback.get("message") or {}
+    callback_chat = callback_message.get("chat") or {}
+
+    if not is_target_channel(callback_chat):
+        answer_callback_query(
+            callback_id,
+            "Este botão só funciona no canal configurado."
+        )
+        return
+
+    clicker = callback.get("from") or {}
+    clicker_id = clicker.get("id")
+
+    if not clicker_id or not telegram_user_is_channel_admin(clicker_id):
+        answer_callback_query(
+            callback_id,
+            "Apenas administradores do canal podem observar contas."
+        )
         return
 
     revision_id = data.split(":", 1)[1]
@@ -5724,7 +5934,7 @@ def telegram_command_listener():
         except Exception as e:
             print(
                 "⚠️ Erro listener Telegram:",
-                repr(e)
+                safe_exception(e)
             )
             time.sleep(5)
 
@@ -5844,14 +6054,7 @@ def wikimedia_loop():
                             "block",
                             "reblock"
                         ):
-                            block_queue.put(change)
-
-                            print(
-                                "🔒 Evento de bloqueio:",
-                                change.get("title"),
-                                "| ação:",
-                                action
-                            )
+                            handle_block_event(change)
 
                     elif (
                         log_type == "delete"
@@ -5884,7 +6087,7 @@ def wikimedia_loop():
         except Exception as e:
             print(
                 "⚠️ EventStreams desconectado:",
-                repr(e)
+                safe_exception(e)
             )
 
         finally:
@@ -6012,7 +6215,13 @@ def main():
 
     time.sleep(2)
 
-    announce_new_version_if_needed()
+    # A indisponibilidade do Telegram não deve impedir a conexão ao
+    # EventStreams. O anúncio de versão roda isolado do fluxo principal.
+    threading.Thread(
+        target=announce_new_version_if_needed,
+        daemon=True,
+        name="version-announcement",
+    ).start()
 
     wikimedia_loop()
 
