@@ -21,7 +21,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.6"
-BOT_BUILD = "2.6"
+BOT_BUILD = "2.6-r3"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -69,6 +69,7 @@ USER_CACHE_SECONDS = 3600
 STREAM_STALL_SECONDS = 120
 
 OBSERVATION_DURATION_SECONDS = 6 * 60 * 60
+TEMP_WATCH_DURATION_SECONDS = 6 * 60 * 60
 IGNORE_DURATION_SECONDS = 6 * 60 * 60
 
 ABUSE_FILTER_POLL_SECONDS = 20
@@ -119,6 +120,11 @@ OBSERVED_USERS_FILE = os.environ.get(
     "/data/observed_users.json"
 )
 
+TEMP_WATCHLIST_FILE = os.environ.get(
+    "TEMP_WATCHLIST_FILE",
+    "/data/temporary_watchlist.json"
+)
+
 IGNORED_USERS_FILE = os.environ.get(
     "IGNORED_USERS_FILE",
     "/data/ignored_users.json"
@@ -161,6 +167,10 @@ PENDING_SUMMARY_STATE_FILE = os.environ.get(
 
 watched_pages = set()
 watchlist_lock = threading.Lock()
+
+temporary_watched_pages = {}
+temporary_watchlist_lock = threading.Lock()
+temporary_watchlist_persist_lock = threading.Lock()
 
 observed_users = {}
 observed_users_lock = threading.Lock()
@@ -298,6 +308,7 @@ def ensure_storage():
     files = [
         WATCHLIST_FILE,
         OBSERVED_USERS_FILE,
+        TEMP_WATCHLIST_FILE,
         IGNORED_USERS_FILE,
         BOT_VERSION_FILE,
         ABUSE_FILTERS_FILE,
@@ -332,6 +343,7 @@ def ensure_storage():
         print("✅ Armazenamento gravável.")
         print("📁 Watchlist:", WATCHLIST_FILE)
         print("📁 Contas observadas:", OBSERVED_USERS_FILE)
+        print("📁 Vigilância temporária:", TEMP_WATCHLIST_FILE)
         print("📁 Contas ignoradas:", IGNORED_USERS_FILE)
         print("📁 Filtros de abuso:", ABUSE_FILTERS_FILE)
         print("📁 Estado dos filtros:", ABUSE_FILTER_STATE_FILE)
@@ -688,13 +700,31 @@ def announce_new_version_if_needed():
         return
 
     if BOT_VERSION == "2.6":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🆕 Novidades da versão 2.6:\n"
-            "• ao colocar uma conta em observação pelo botão, o alerta informa o nome do administrador do Telegram que realizou a ação;\n"
-            "• comandos /observar publicados no canal também exibem o responsável quando o Telegram fornece a identidade ou assinatura do autor."
-        )
+        if BOT_BUILD == "2.6-r3":
+            message = (
+                "✅ Bot atualizado com sucesso\n\n"
+                f"🤖 Versão {BOT_VERSION}\n\n"
+                "🔧 Ajuste de interface:\n"
+                "• os botões ‘Observar conta (6h)’ e ‘Vigiar pág. (6h)’ agora aparecem em linhas separadas para melhor visualização no Telegram."
+            )
+        elif BOT_BUILD == "2.6-r2":
+            message = (
+                "✅ Bot atualizado com sucesso\n\n"
+                f"🤖 Versão {BOT_VERSION}\n\n"
+                "🔧 Ajustes:\n"
+                "• adicionado botão ‘Vigiar pág. (6h)’ aos alertas de edição;\n"
+                "• edições de contas observadas oferecem botão ‘Desobservar’;\n"
+                "• edições de páginas vigiadas oferecem botão ‘Desvigiar’;\n"
+                "• confirmações informam o administrador do Telegram responsável pela vigilância, desobservação ou desvigilância."
+            )
+        else:
+            message = (
+                "✅ Bot atualizado com sucesso\n\n"
+                f"🤖 Versão {BOT_VERSION}\n\n"
+                "🆕 Novidades da versão 2.6:\n"
+                "• ao colocar uma conta em observação pelo botão, o alerta informa o nome do administrador do Telegram que realizou a ação;\n"
+                "• comandos /observar publicados no canal também exibem o responsável quando o Telegram fornece a identidade ou assinatura do autor."
+            )
     elif BOT_VERSION == "2.5":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
@@ -851,8 +881,125 @@ def remove_watched_page(title):
 
 def is_watched_page(title):
     with watchlist_lock:
-        return title in watched_pages
+        if title in watched_pages:
+            return True
 
+    return get_temporary_watch(title) is not None
+
+
+# =========================================================
+# VIGILÂNCIA TEMPORÁRIA DE PÁGINAS
+# =========================================================
+
+def temp_watch_key(title):
+    return str(title or "").replace("_", " ").strip().casefold()
+
+
+def save_temporary_watchlist():
+    with temporary_watchlist_persist_lock:
+        with temporary_watchlist_lock:
+            data = list(temporary_watched_pages.values())
+        atomic_write_json(TEMP_WATCHLIST_FILE, data)
+    print("💾 Vigilâncias temporárias salvas:", len(data))
+
+
+def load_temporary_watchlist():
+    global temporary_watched_pages
+    data = load_json(TEMP_WATCHLIST_FILE, [])
+    if not isinstance(data, list):
+        print("❌ Formato inválido de temporary_watchlist.json")
+        return
+    now = time.time()
+    loaded = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        expires_at = float(item.get("expires_at") or 0)
+        if not title or expires_at <= now:
+            continue
+        loaded[temp_watch_key(title)] = {
+            "title": title,
+            "expires_at": expires_at,
+        }
+    with temporary_watchlist_lock:
+        temporary_watched_pages = loaded
+    print("✅ Vigilâncias temporárias carregadas:", len(loaded))
+    try:
+        save_temporary_watchlist()
+    except Exception:
+        pass
+
+
+def cleanup_expired_temporary_watches():
+    now = time.time()
+    removed = False
+    with temporary_watchlist_lock:
+        expired = [
+            key for key, item in temporary_watched_pages.items()
+            if item.get("expires_at", 0) <= now
+        ]
+        for key in expired:
+            print("⌛ Vigilância temporária expirada:", temporary_watched_pages[key].get("title", key))
+            del temporary_watched_pages[key]
+            removed = True
+    if removed:
+        try:
+            save_temporary_watchlist()
+        except Exception as e:
+            print("⚠️ Erro ao salvar expiração de vigilância:", safe_exception(e))
+
+
+def add_temporary_watched_page(title):
+    expires_at = time.time() + TEMP_WATCH_DURATION_SECONDS
+    key = temp_watch_key(title)
+    with temporary_watchlist_lock:
+        previous = temporary_watched_pages.get(key)
+        temporary_watched_pages[key] = {
+            "title": title,
+            "expires_at": expires_at,
+        }
+    try:
+        save_temporary_watchlist()
+        return True
+    except Exception as e:
+        print("❌ Erro ao salvar vigilância temporária:", safe_exception(e))
+        with temporary_watchlist_lock:
+            if previous is None:
+                temporary_watched_pages.pop(key, None)
+            else:
+                temporary_watched_pages[key] = previous
+        return False
+
+
+def remove_temporary_watched_page(title):
+    key = temp_watch_key(title)
+    with temporary_watchlist_lock:
+        if key not in temporary_watched_pages:
+            return True, False
+        backup = temporary_watched_pages.pop(key)
+    try:
+        save_temporary_watchlist()
+        return True, True
+    except Exception as e:
+        print("❌ Erro ao remover vigilância temporária:", safe_exception(e))
+        with temporary_watchlist_lock:
+            temporary_watched_pages[key] = backup
+        return False, False
+
+
+def get_temporary_watch(title):
+    cleanup_expired_temporary_watches()
+    with temporary_watchlist_lock:
+        item = temporary_watched_pages.get(temp_watch_key(title))
+        return dict(item) if item else None
+
+
+def remove_any_watched_page(title):
+    """Remove vigilância permanente e/ou temporária da página."""
+    perm_success, perm_removed = remove_watched_page(title)
+    temp_success, temp_removed = remove_temporary_watched_page(title)
+    return (perm_success and temp_success), (perm_removed or temp_removed)
 
 # =========================================================
 # CONTAS OBSERVADAS
@@ -3347,12 +3494,7 @@ def posted_edit_status_monitor():
                 # que ainda não tinham reply_markup persistido no JSON.
                 status_reply_markup = record.get("reply_markup")
                 if not status_reply_markup:
-                    status_reply_markup = {
-                        "inline_keyboard": [[{
-                            "text": "🔎 Observar conta (6h)",
-                            "callback_data": f"observe:{revision_id}",
-                        }]]
-                    }
+                    status_reply_markup = tracked_edit_reply_markup(revision_id)
 
                 success = edit_telegram_message(
                     record["message_id"],
@@ -3460,12 +3602,7 @@ def page_deletion_worker():
 
                 status_reply_markup = record.get("reply_markup")
                 if not status_reply_markup:
-                    status_reply_markup = {
-                        "inline_keyboard": [[{
-                            "text": "🔎 Observar conta (6h)",
-                            "callback_data": f"observe:{revision_id}",
-                        }]]
-                    }
+                    status_reply_markup = tracked_edit_reply_markup(revision_id)
 
                 new_text = message_with_status(
                     record,
@@ -5194,11 +5331,38 @@ def edit_link_html(url):
     return f"🔗 Ver edição — {safe_url}"
 
 
+def tracked_edit_reply_markup(revision_id, alert_kind="normal"):
+    rows = [
+        [{
+            "text": "🔎 Observar conta (6h)",
+            "callback_data": f"observe:{revision_id}",
+        }],
+        [{
+            "text": "👁 Vigiar pág. (6h)",
+            "callback_data": f"watch:{revision_id}",
+        }],
+    ]
+
+    if alert_kind == "observed":
+        rows.append([{
+            "text": "⛔ Desobservar",
+            "callback_data": f"unobserve:{revision_id}",
+        }])
+    elif alert_kind == "watched":
+        rows.append([{
+            "text": "🙈 Desvigiar",
+            "callback_data": f"unwatch:{revision_id}",
+        }])
+
+    return {"inline_keyboard": rows}
+
+
 def tracked_queue_item(
     change,
     message,
     title,
-    stats_payload=None
+    stats_payload=None,
+    alert_kind="normal"
 ):
     revision = change.get("revision", {})
 
@@ -5214,12 +5378,10 @@ def tracked_queue_item(
         "diff_url": build_diff_url(change),
         "stats_payload": stats_payload,
         "parse_mode": "HTML",
-        "reply_markup": {
-            "inline_keyboard": [[{
-                "text": "🔎 Observar conta (6h)",
-                "callback_data": f"observe:{revision.get('new')}",
-            }]]
-        },
+        "reply_markup": tracked_edit_reply_markup(
+            revision.get("new"),
+            alert_kind=alert_kind,
+        ),
     }
 
 
@@ -5312,7 +5474,8 @@ def analysis_worker():
                     tracked_queue_item(
                         change,
                         message,
-                        f"Conta observada: {username}"
+                        f"Conta observada: {username}",
+                        alert_kind="observed"
                     )
                 )
 
@@ -5337,7 +5500,8 @@ def analysis_worker():
                     tracked_queue_item(
                         change,
                         message,
-                        title
+                        title,
+                        alert_kind="watched"
                     )
                 )
 
@@ -5566,6 +5730,7 @@ def process_telegram_command(message, from_channel=False):
 
     if command == "/status":
         cleanup_expired_observations()
+        cleanup_expired_temporary_watches()
         cleanup_expired_ignored_users()
         cleanup_posted_edits()
 
@@ -5575,7 +5740,10 @@ def process_telegram_command(message, from_channel=False):
             last_ptwiki = last_ptwiki_edit_at
 
         with watchlist_lock:
-            watch_count = len(watched_pages)
+            permanent_watch_count = len(watched_pages)
+        with temporary_watchlist_lock:
+            temporary_watch_count = len(temporary_watched_pages)
+        watch_count = permanent_watch_count + temporary_watch_count
 
         with observed_users_lock:
             observed_count = len(
@@ -6107,30 +6275,28 @@ def process_telegram_command(message, from_channel=False):
         return
 
     if command == "/vigiadas":
+        cleanup_expired_temporary_watches()
+        now = time.time()
         with watchlist_lock:
-            pages = sorted(
-                watched_pages,
-                key=str.lower
+            permanent_pages = sorted(watched_pages, key=str.lower)
+        with temporary_watchlist_lock:
+            temporary_items = sorted(
+                [dict(item) for item in temporary_watched_pages.values()],
+                key=lambda x: x.get("title", "").lower(),
             )
 
-        if not pages:
-            response_text = (
-                "👁 Nenhuma página está sendo vigiada."
-            )
+        if not permanent_pages and not temporary_items:
+            response_text = "👁 Nenhuma página está sendo vigiada."
         else:
-            response_text = (
-                "👁 Páginas vigiadas:\n\n"
-                +
-                "\n".join(
-                    f"• {page}"
-                    for page in pages
+            lines = [f"• {page}" for page in permanent_pages]
+            for item in temporary_items:
+                remaining = item.get("expires_at", 0) - now
+                lines.append(
+                    f"• {item.get('title')} — temporária, {format_remaining(remaining)} restantes"
                 )
-            )
+            response_text = "👁 Páginas vigiadas:\n\n" + "\n".join(lines)
 
-        send_telegram_message(
-            response_text,
-            chat_id=chat_id
-        )
+        send_telegram_message(response_text, chat_id=chat_id)
         return
 
     if command in (
@@ -6192,7 +6358,7 @@ def process_telegram_command(message, from_channel=False):
 
         else:
             success, removed = (
-                remove_watched_page(title)
+                remove_any_watched_page(title)
             )
 
             if not success:
@@ -6445,70 +6611,121 @@ def telegram_user_is_channel_admin(user_id):
         return False
 
 
-def process_observe_callback(callback):
+def process_edit_action_callback(callback):
     callback_id = callback.get("id")
     data = callback.get("data", "")
-    if not data.startswith("observe:"):
+    if ":" not in data:
+        answer_callback_query(callback_id)
+        return
+
+    action, revision_text = data.split(":", 1)
+    if action not in ("observe", "watch", "unobserve", "unwatch"):
         answer_callback_query(callback_id)
         return
 
     callback_message = callback.get("message") or {}
     callback_chat = callback_message.get("chat") or {}
-
     if not is_target_channel(callback_chat):
-        answer_callback_query(
-            callback_id,
-            "Este botão só funciona no canal configurado."
-        )
+        answer_callback_query(callback_id, "Este botão só funciona no canal configurado.")
         return
 
     clicker = callback.get("from") or {}
     clicker_id = clicker.get("id")
-
     if not clicker_id or not telegram_user_is_channel_admin(clicker_id):
-        answer_callback_query(
-            callback_id,
-            "Apenas administradores do canal podem observar contas."
-        )
+        answer_callback_query(callback_id, "Apenas administradores do canal podem alterar observações e vigilâncias.")
         return
 
-    revision_id = data.split(":", 1)[1]
     with posted_edits_lock:
-        record = posted_edits.get(str(revision_id))
+        record = posted_edits.get(str(revision_text))
 
-    if not record or not record.get("username"):
-        answer_callback_query(
-            callback_id,
-            "Não encontrei a conta deste alerta."
-        )
+    if not record:
+        answer_callback_query(callback_id, "Não encontrei os dados deste alerta.")
         return
 
-    username = record["username"]
-    if observe_user(username):
-        observer_name = telegram_person_display_name(clicker)
-        observer_line = (
-            f"\n👮 Colocada em observação por {html.escape(observer_name)}"
-            if observer_name
-            else ""
-        )
+    username = str(record.get("username") or "").strip()
+    title = str(record.get("title") or "").strip()
+    actor = telegram_person_display_name(clicker)
+    actor_html = html.escape(actor) if actor else None
 
-        answer_callback_query(
-            callback_id,
-            f"{username} em observação por 6 horas."
-        )
+    if action == "observe":
+        if not username:
+            answer_callback_query(callback_id, "Não encontrei a conta deste alerta.")
+            return
+        if not observe_user(username):
+            answer_callback_query(callback_id, "Não foi possível salvar a observação.")
+            return
+        answer_callback_query(callback_id, f"{username} em observação por 6 horas.")
+        actor_line = f"\n👮 Colocada em observação por {actor_html}" if actor_html else ""
         send_telegram_message(
             "🔎 Conta colocada em observação\n\n"
-            f'👤 <a href="{html.escape(user_contributions_url(username), quote=True)}">'
-            f"{html.escape(username)}</a>\n"
+            f'<a href="{html.escape(user_contributions_url(username), quote=True)}">👤 {html.escape(username)}</a>\n'
             "⏳ Duração: 6 horas"
-            f"{observer_line}",
+            f"{actor_line}",
             chat_id=TELEGRAM_CHANNEL,
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
-    else:
-        answer_callback_query(
-            callback_id,
-            "Não foi possível salvar a observação."
+        return
+
+    if action == "watch":
+        if not title:
+            answer_callback_query(callback_id, "Não encontrei a página deste alerta.")
+            return
+        if not add_temporary_watched_page(title):
+            answer_callback_query(callback_id, "Não foi possível salvar a vigilância.")
+            return
+        answer_callback_query(callback_id, f"{title} vigiada por 6 horas.")
+        actor_line = f"\n👮 Colocada em vigilância por {actor_html}" if actor_html else ""
+        send_telegram_message(
+            "👁 Página colocada em vigilância\n\n"
+            f"📝 {html.escape(title)}\n"
+            "⏳ Duração: 6 horas"
+            f"{actor_line}",
+            chat_id=TELEGRAM_CHANNEL,
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "unobserve":
+        if not username:
+            answer_callback_query(callback_id, "Não encontrei a conta deste alerta.")
+            return
+        success, removed = stop_observing_user(username)
+        if not success:
+            answer_callback_query(callback_id, "Não foi possível encerrar a observação.")
+            return
+        if not removed:
+            answer_callback_query(callback_id, f"{username} já não estava em observação.")
+            return
+        answer_callback_query(callback_id, f"Observação de {username} encerrada.")
+        actor_line = f"\n👮 Desobservada por {actor_html}" if actor_html else ""
+        send_telegram_message(
+            "⛔ Observação encerrada\n\n"
+            f'<a href="{html.escape(user_contributions_url(username), quote=True)}">👤 {html.escape(username)}</a>'
+            f"{actor_line}",
+            chat_id=TELEGRAM_CHANNEL,
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "unwatch":
+        if not title:
+            answer_callback_query(callback_id, "Não encontrei a página deste alerta.")
+            return
+        success, removed = remove_any_watched_page(title)
+        if not success:
+            answer_callback_query(callback_id, "Não foi possível encerrar a vigilância.")
+            return
+        if not removed:
+            answer_callback_query(callback_id, f"{title} já não estava sendo vigiada.")
+            return
+        answer_callback_query(callback_id, f"Vigilância de {title} encerrada.")
+        actor_line = f"\n👮 Retirada da vigilância por {actor_html}" if actor_html else ""
+        send_telegram_message(
+            "🙈 Vigilância encerrada\n\n"
+            f"📝 {html.escape(title)}"
+            f"{actor_line}",
+            chat_id=TELEGRAM_CHANNEL,
+            parse_mode="HTML",
         )
 
 
@@ -6568,7 +6785,7 @@ def telegram_command_listener():
                 callback = update.get("callback_query")
 
                 if callback:
-                    process_observe_callback(callback)
+                    process_edit_action_callback(callback)
                     continue
 
                 message = update.get("message")
@@ -6832,6 +7049,7 @@ def main():
         )
 
     load_watchlist()
+    load_temporary_watchlist()
     load_observed_users()
     load_ignored_users()
     load_abuse_filters()
@@ -6841,6 +7059,7 @@ def main():
     load_pending_summary_state()
 
     cleanup_expired_observations()
+    cleanup_expired_temporary_watches()
     cleanup_expired_ignored_users()
     cleanup_posted_edits()
     cleanup_detection_stats()
@@ -6863,6 +7082,7 @@ def main():
         MAX_USER_EDITS
     )
     print("⏳ Observação de conta: 6 horas")
+    print("👁 Vigilância temporária de página: 6 horas")
     print("🙈 Ignorar conta: 6 horas")
     print("🔒 Monitor de bloqueios: ativo")
     print("🛡️ Monitor de proteção de páginas: ativo")
