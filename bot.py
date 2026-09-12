@@ -20,8 +20,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.4"
-BOT_BUILD = "2.4-r2"
+BOT_VERSION = "2.5"
+BOT_BUILD = "2.5"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -687,7 +687,15 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.4":
+    if BOT_VERSION == "2.5":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🆕 Novidades da versão 2.5:\n"
+            "• os alertas de edições mantêm o atalho ‘Ver edição’ e agora também exibem o link bruto do diff ao lado;\n"
+            "• o mesmo formato é preservado quando um alerta é atualizado como revertido, patrulhado ou página eliminada."
+        )
+    elif BOT_VERSION == "2.4":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n"
@@ -5175,7 +5183,7 @@ def user_contributions_url(username):
 
 def edit_link_html(url):
     safe_url = html.escape(str(url or ""), quote=True)
-    return f'🔗 <a href="{safe_url}">Ver edição</a>'
+    return f'🔗 <a href="{safe_url}">Ver edição</a> — {safe_url}'
 
 
 def tracked_queue_item(
