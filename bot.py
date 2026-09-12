@@ -668,7 +668,15 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.3":
+    if BOT_VERSION == "2.4":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🆕 Novidades da versão 2.4:\n"
+            "• o alvo dos bloqueios agora reconhece também o prefixo Usuária:;\n"
+            "• permanecem normalizados Usuário(a):, Usuário:, Usuario(a):, Usuario: e User:, evitando duplicação do namespace nos links."
+        )
+    elif BOT_VERSION == "2.3":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -4036,6 +4044,7 @@ def extract_block_target(title):
     # de montar o link para evitar "Usuário:Usuário(a):Nome".
     for prefix in (
         "Usuário(a):",
+        "Usuária:",
         "Usuário:",
         "Usuario(a):",
         "Usuario:",
