@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.14"
+BOT_VERSION = "1.15"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2306,6 +2306,13 @@ def register_posted_edit(item, telegram_message):
         "rcid": item.get("rcid"),
         "title": item.get("page_title"),
         "username": item.get("username"),
+        "edit_comment": item.get("edit_comment"),
+        "diff_url": item.get("diff_url"),
+        "revert_risk": (
+            item.get("stats_payload", {}).get("revert_risk")
+            if isinstance(item.get("stats_payload"), dict)
+            else None
+        ),
         "message_id": message_id,
         "base_message": item.get("message", ""),
         "parse_mode": item.get("parse_mode"),
@@ -2863,27 +2870,100 @@ def get_patrol_status_batch(records):
         return {}
 
 
-def message_with_status(record, status):
-    base = record.get(
-        "base_message",
-        ""
-    ).rstrip()
+def get_reverter_username(title, revision_id):
+    """Tenta identificar quem realizou a reversão sem presumir um nome.
+
+    Procura revisões posteriores próximas e usa sinais explícitos do MediaWiki
+    (tags de rollback/undo e comentários de reversão). Se não houver evidência
+    suficiente, retorna None. Esta consulta só ocorre depois de a revisão já
+    ter sido confirmada como revertida.
+    """
+    try:
+        response = requests.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "prop": "revisions",
+                "titles": title,
+                "rvprop": "ids|user|comment|tags|timestamp",
+                "rvdir": "newer",
+                "rvstartid": int(revision_id),
+                "rvlimit": 20,
+            },
+            headers=HEADERS,
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("error"):
+            return None
+
+        pages = data.get("query", {}).get("pages", [])
+        for page in pages:
+            revisions = page.get("revisions", [])
+            for rev in revisions:
+                try:
+                    rid = int(rev.get("revid"))
+                except Exception:
+                    continue
+                if rid == int(revision_id):
+                    continue
+
+                tags = set(rev.get("tags") or [])
+                comment = (rev.get("comment") or "").casefold()
+                explicit_tag = bool(tags.intersection({
+                    "mw-rollback", "mw-undo", "mw-manual-revert"
+                }))
+                explicit_comment = any(x in comment for x in (
+                    "reverteu", "revertida", "revertido", "desfeita",
+                    "desfeito", "desfazer", "rollback"
+                ))
+                if explicit_tag or explicit_comment:
+                    return rev.get("user") or None
+    except Exception as e:
+        print("⚠️ Não foi possível identificar quem reverteu:", repr(e))
+    return None
+
+
+def message_with_status(record, status, reverter=None):
+    title = record.get("title") or "Sem título"
+    username = record.get("username") or "Desconhecido"
+    comment = record.get("edit_comment") or "Sem resumo"
+    risk = record.get("revert_risk")
+    diff_url = record.get("diff_url") or ""
+
+    risk_line = ""
+    if risk is not None:
+        try:
+            risk_line = f"\n🤖 Risco de reversão: {round(float(risk) * 100)}%\n"
+        except Exception:
+            pass
 
     if status == "reverted":
+        reverter_line = f"\nRevertido por: {reverter}" if reverter else ""
         return (
-            base
-            +
-            "\n\n↩️ Situação: revertida"
+            "↩️ Possível vandalismo revertido\n\n"
+            f"📝 {title}\n"
+            f"👤 {username}\n"
+            f"💬 {comment}\n"
+            f"{risk_line}\n"
+            f"🔗 {diff_url}"
+            f"{reverter_line}"
         )
 
     if status == "patrolled":
         return (
-            base
-            +
-            "\n\n✅ Situação: patrulhada"
+            "✅ Possível vandalismo patrulhado\n\n"
+            f"📝 {title}\n"
+            f"👤 {username}\n"
+            f"💬 {comment}\n"
+            f"{risk_line}\n"
+            f"🔗 {diff_url}"
         )
 
-    return base
+    return record.get("base_message", "").rstrip()
 
 
 def posted_edit_status_monitor():
@@ -2976,9 +3056,17 @@ def posted_edit_status_monitor():
                 and
                 new_status != current_status
             ):
+                reverter = None
+                if new_status == "reverted":
+                    reverter = get_reverter_username(
+                        record.get("title") or "",
+                        revision_id
+                    )
+
                 new_text = message_with_status(
                     record,
-                    new_status
+                    new_status,
+                    reverter=reverter
                 )
 
                 success = edit_telegram_message(
@@ -4102,6 +4190,8 @@ def tracked_queue_item(
         "rcid": change.get("id"),
         "page_title": change.get("title"),
         "username": change.get("user"),
+        "edit_comment": change.get("comment") or "Sem resumo",
+        "diff_url": build_diff_url(change),
         "stats_payload": stats_payload,
         "reply_markup": {
             "inline_keyboard": [[{
@@ -4145,14 +4235,11 @@ def format_message(change, result):
     )
 
     return (
-        f"🚨 Possível vandalismo — "
-        f"{final_score}%\n\n"
+        "🚨 Possível vandalismo\n\n"
         f"📝 {change.get('title', 'Sem título')}\n"
         f"👤 {change.get('user', 'Desconhecido')}\n"
         f"💬 {change.get('comment') or 'Sem resumo'}\n\n"
-        f"🤖 Risco de reversão Wikimedia: "
-        f"{revert_score}%\n"
-        f"⚠️ Sinais: {result['reason']}\n\n"
+        f"🤖 Risco de reversão: {revert_score}%\n\n"
         f"🔗 {build_diff_url(change)}"
     )
 
