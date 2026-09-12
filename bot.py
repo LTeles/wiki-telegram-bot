@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.0"
+BOT_VERSION = "2.1"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -201,6 +201,7 @@ user_cache = {}
 
 analysis_queue = queue.Queue()
 block_queue = queue.Queue()
+protection_queue = queue.Queue()
 page_deletion_queue = queue.Queue()
 
 # Controle de flooding dos alertas de bloqueio.
@@ -666,7 +667,17 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.0":
+    if BOT_VERSION == "2.1":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🆕 Novidades da versão 2.1:\n"
+            "• adicionado monitoramento dos registros de proteção de páginas;\n"
+            "• desproteções não geram mensagens;\n"
+            "• o alerta informa página, administrador, motivo, nível e duração da proteção;\n"
+            "• proteções são alertas independentes e não alteram o status de posts de edições acompanhadas."
+        )
+    elif BOT_VERSION == "2.0":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -4337,6 +4348,266 @@ def block_worker():
 
 
 # =========================================================
+# PROTEÇÃO DE PÁGINAS
+# =========================================================
+
+PROTECTION_LEVEL_NAMES = {
+    "all": "todos os usuários",
+    "autoconfirmed": "autoconfirmados",
+    "confirmed": "confirmados",
+    "extendedconfirmed": "autoconfirmados estendidos",
+    "autoreviewer": "autorrevisores",
+    "autoreview": "autorrevisores",
+    "autopatrolled": "autorrevisores",
+    "autoreviewers": "autorrevisores",
+    "rollbacker": "reversores",
+    "eliminator": "eliminadores",
+    "templateeditor": "editores de predefinições",
+    "sysop": "administradores",
+}
+
+PROTECTION_TYPE_NAMES = {
+    "edit": "Edição",
+    "move": "Movimentação",
+    "create": "Criação",
+    "upload": "Envio de arquivo",
+}
+
+
+def get_protection_log_details(log_id):
+    """Busca o evento exato no registro de proteção."""
+    try:
+        response = requests.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "list": "logevents",
+                "leids": log_id,
+                "leprop": (
+                    "ids|title|type|user|"
+                    "timestamp|comment|details"
+                ),
+            },
+            headers=HEADERS,
+            timeout=20,
+        )
+        response.raise_for_status()
+        events = (
+            response.json()
+            .get("query", {})
+            .get("logevents", [])
+        )
+        return events[0] if events else None
+    except Exception as e:
+        print(
+            "⚠️ Erro ao obter detalhes da proteção:",
+            log_id,
+            safe_exception(e),
+        )
+        return None
+
+
+def protection_log_url(title):
+    encoded_title = quote(str(title or "").replace(" ", "_"), safe="")
+    return (
+        "https://pt.wikipedia.org/w/index.php"
+        "?title=Special:Log&type=protect"
+        f"&page={encoded_title}"
+    )
+
+
+def protection_level_name(level):
+    raw = str(level or "").strip()
+    if not raw:
+        return "nível não informado"
+    return PROTECTION_LEVEL_NAMES.get(raw, raw)
+
+
+def protection_type_name(kind):
+    raw = str(kind or "").strip()
+    if not raw:
+        return "Proteção"
+    return PROTECTION_TYPE_NAMES.get(raw, raw.capitalize())
+
+
+def get_protection_details(event, fallback_change=None):
+    """Extrai os níveis de proteção no formato atual da API.
+
+    A Action API normalmente devolve params.details como uma lista de
+    {type, level, expiry}. Também aceitamos o mesmo formato vindo do
+    EventStreams como fallback para tolerar falhas na consulta adicional.
+    """
+    sources = [event]
+    if fallback_change:
+        sources.append(fallback_change)
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+
+        params = source.get("params")
+        if not isinstance(params, dict):
+            params = source.get("log_params")
+        if not isinstance(params, dict):
+            params = {}
+
+        details = params.get("details")
+        if details is None:
+            details = source.get("details")
+
+        if isinstance(details, list):
+            result = []
+            for item in details:
+                if not isinstance(item, dict):
+                    continue
+                level = item.get("level")
+                # Nível "all" significa sem restrição para aquela ação;
+                # não o apresentamos como uma proteção ativa.
+                if str(level or "").strip().lower() == "all":
+                    continue
+                result.append({
+                    "type": item.get("type"),
+                    "level": level,
+                    "expiry": item.get("expiry"),
+                })
+            if result:
+                return result
+
+    return []
+
+
+def protection_duration(expiry, timestamp=None):
+    if expiry is None or str(expiry).strip() == "":
+        return "não informada"
+    return duration_from_expiry(expiry, timestamp)
+
+
+def format_protection_message(event, change):
+    title = str(
+        event.get("title")
+        or change.get("title")
+        or "Página não informada"
+    )
+    protector = str(
+        event.get("user")
+        or change.get("user")
+        or "Não informado"
+    )
+    reason = str(
+        event.get("comment")
+        or change.get("comment")
+        or "Motivo não informado"
+    )
+    action = str(
+        event.get("action")
+        or change.get("log_action")
+        or "protect"
+    )
+    timestamp = event.get("timestamp") or change.get("timestamp")
+    details = get_protection_details(event, change)
+
+    heading = (
+        "🛡️ Proteção de página alterada"
+        if action == "modify"
+        else "🛡️ Página protegida"
+    )
+
+    lines = [
+        heading,
+        "",
+        (
+            f'📝 <a href="{protection_log_url(title)}">'
+            f"{html.escape(title)}</a>"
+        ),
+        f"🛡 Administrador: {html.escape(protector)}",
+        f"📌 Motivo: {html.escape(reason)}",
+    ]
+
+    if details:
+        lines.extend(["", "🔐 Proteção:"])
+        for detail in details:
+            kind = protection_type_name(detail.get("type"))
+            level = protection_level_name(detail.get("level"))
+            duration = protection_duration(
+                detail.get("expiry"),
+                timestamp,
+            )
+            lines.append(
+                f"• {html.escape(kind)}: "
+                f"{html.escape(level)} — "
+                f"{html.escape(duration)}"
+            )
+    else:
+        # Não inventa nível/duração quando a API não os forneceu.
+        lines.extend([
+            "",
+            "🔐 Nível/duração: não informados pela API",
+        ])
+
+    return "\n".join(lines)
+
+
+def protection_worker():
+    """Publica apenas proteções/alterações de proteção.
+
+    Estes alertas são independentes de posted_edits. Em particular, uma
+    proteção da mesma página de um alerta pendente NÃO altera status,
+    patrulhamento, reversão, eliminação ou a lista de pendências.
+    """
+    print("✅ Monitor de proteção de páginas iniciado.")
+
+    while True:
+        change = protection_queue.get()
+        try:
+            log_id = change.get("log_id")
+            if not log_id:
+                print("⚠️ Evento de proteção sem log_id.")
+                continue
+
+            details = get_protection_log_details(log_id)
+            if details is None:
+                # Sem detalhes confiáveis, não publicamos uma mensagem
+                # incompleta nem tentamos inferir níveis de proteção.
+                continue
+
+            if details.get("type") != "protect":
+                continue
+
+            action = (
+                details.get("action")
+                or change.get("log_action")
+            )
+
+            # Exclui explicitamente desproteções. "protect" cria proteção
+            # e "modify" altera uma proteção que continua ativa.
+            if action not in ("protect", "modify"):
+                continue
+
+            telegram_queue.put({
+                "message": format_protection_message(details, change),
+                "title": "Registro de proteção",
+                "parse_mode": "HTML",
+            })
+
+            print(
+                "🛡️ Proteção detectada:",
+                details.get("title"),
+                "| ação:",
+                action,
+            )
+
+        except Exception as e:
+            print(
+                "❌ Erro no monitor de proteção:",
+                safe_exception(e),
+            )
+        finally:
+            protection_queue.task_done()
+
+
+# =========================================================
 # DIFF / REVERT RISK / HEURÍSTICAS
 # =========================================================
 
@@ -5143,7 +5414,8 @@ def process_telegram_command(message, from_channel=False):
                 f"🔄 Patrulhamento: lote a cada 50s "
                 f"(até ~72 chamadas/h)\n"
                 f"⏱ Atualização de status: alvo < 60s\n"
-                f"🔒 Monitor de bloqueios: ativo\n\n"
+                f"🔒 Monitor de bloqueios: ativo\n"
+                f"🛡️ Monitor de proteção de páginas: ativo\n\n"
                 f"🔎 Triagem: "
                 f"{REVERT_RISK_THRESHOLD:.0%}\n"
                 f"🚨 Publicação: "
@@ -5152,6 +5424,8 @@ def process_telegram_command(message, from_channel=False):
                 f"{analysis_queue.qsize()}\n"
                 f"🔒 Fila bloqueios: "
                 f"{block_queue.qsize()}\n"
+                f"🛡️ Fila proteções: "
+                f"{protection_queue.qsize()}\n"
                 f"📤 Fila Telegram: "
                 f"{telegram_queue.qsize()}"
             ),
@@ -6127,6 +6401,20 @@ def wikimedia_loop():
                         ):
                             handle_block_event(change)
 
+                    elif log_type == "protect":
+                        # Registra somente proteção e alteração de uma
+                        # proteção existente. Desproteções são ignoradas.
+                        if action in ("protect", "modify"):
+                            protection_queue.put(change)
+                            print(
+                                "🛡️ Evento de proteção de página:",
+                                change.get("title"),
+                                "| ação:",
+                                action,
+                                "| por:",
+                                change.get("user"),
+                            )
+
                     elif (
                         log_type == "delete"
                         and action == "delete"
@@ -6236,6 +6524,7 @@ def main():
     print("⏳ Observação de conta: 6 horas")
     print("🙈 Ignorar conta: 6 horas")
     print("🔒 Monitor de bloqueios: ativo")
+    print("🛡️ Monitor de proteção de páginas: ativo")
     print(
         "🛡 Monitor de filtros de abuso: ativo"
     )
@@ -6268,6 +6557,7 @@ def main():
         ("telegram-sender", telegram_sender),
         ("analysis-worker", analysis_worker),
         ("block-worker", block_worker),
+        ("protection-worker", protection_worker),
         ("page-deletion-worker", page_deletion_worker),
         ("eventstream-watchdog", eventstream_watchdog),
         ("telegram-listener", telegram_command_listener),
