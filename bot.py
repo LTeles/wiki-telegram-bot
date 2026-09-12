@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.2"
+BOT_VERSION = "2.3"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -668,7 +668,15 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.2":
+    if BOT_VERSION == "2.3":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🆕 Novidades da versão 2.3:\n"
+            "• corrigido o link dos registros de bloqueio quando o alvo vem como Usuário(a):Nome;\n"
+            "• o prefixo do namespace agora é normalizado antes de gerar o link e exibir o alvo, evitando duplicação de Usuário:."
+        )
+    elif BOT_VERSION == "2.2":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -4022,15 +4030,21 @@ def extract_block_target(title):
     if not title:
         return "Desconhecido"
 
+    # O título de eventos de bloqueio pode vir localizado pela wiki.
+    # Na ptwiki, além de "Usuário:", alguns eventos podem usar
+    # "Usuário(a):". Removemos qualquer prefixo de namespace antes
+    # de montar o link para evitar "Usuário:Usuário(a):Nome".
     for prefix in (
+        "Usuário(a):",
         "Usuário:",
+        "Usuario(a):",
         "Usuario:",
         "User:"
     ):
-        if title.startswith(prefix):
-            return title[len(prefix):]
+        if title.casefold().startswith(prefix.casefold()):
+            return title[len(prefix):].strip()
 
-    return title
+    return title.strip()
 
 
 def translate_duration_text(value):
