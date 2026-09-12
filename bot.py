@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.22"
+BOT_VERSION = "2.0"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -666,10 +666,21 @@ def announce_new_version_if_needed():
         )
         return
 
-    message = (
-        "✅ Bot atualizado com sucesso\n\n"
-        f"🤖 Versão {BOT_VERSION}"
-    )
+    if BOT_VERSION == "2.0":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🆕 Novidades da versão 2.0:\n"
+            "• o detector agora também analisa páginas recém-criadas;\n"
+            "• novas páginas usam os mesmos filtros, Revert Risk e limiares do detector;\n"
+            "• alertas de criação passam a ser acompanhados para reversão, patrulhamento e eliminação;\n"
+            "• páginas novas também entram no acompanhamento de pendências e nas estatísticas."
+        )
+    else:
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}"
+        )
 
     sent = send_telegram_message(message)
 
@@ -4345,6 +4356,44 @@ def clean_html(text):
     return text.strip()
 
 
+def get_new_revision_content(revision_id):
+    """Obtém o conteúdo de uma revisão que criou uma página."""
+    try:
+        response = requests.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "prop": "revisions",
+                "revids": revision_id,
+                "rvprop": "content",
+                "rvslots": "main",
+            },
+            headers=HEADERS,
+            timeout=30
+        )
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", [])
+        if not pages:
+            return {"added": "", "removed": ""}
+        revisions = pages[0].get("revisions", [])
+        if not revisions:
+            return {"added": "", "removed": ""}
+        slots = revisions[0].get("slots", {})
+        content = slots.get("main", {}).get("content", "")
+        return {
+            "added": (content or "")[:MAX_DIFF_CHARS],
+            "removed": "",
+        }
+    except Exception as e:
+        print(
+            "⚠️ Erro ao obter conteúdo da página nova:",
+            safe_exception(e)
+        )
+        return {"added": "", "removed": ""}
+
+
 def get_revision_diff(old_revision, new_revision):
     response = requests.get(
         WIKIPEDIA_API,
@@ -4617,6 +4666,12 @@ def build_diff_url(change):
     old_revision = revision.get("old")
     new_revision = revision.get("new")
 
+    if change.get("type") == "new" or not old_revision:
+        return (
+            "https://pt.wikipedia.org/w/index.php"
+            f"?diff={new_revision}"
+        )
+
     return (
         "https://pt.wikipedia.org/w/index.php"
         f"?diff={new_revision}"
@@ -4684,8 +4739,14 @@ def format_message(change, result):
         result["revert_risk"] * 100
     )
 
+    heading = (
+        "🆕 Possível vandalismo — página criada"
+        if change.get("type") == "new"
+        else "🚨 Possível vandalismo"
+    )
+
     return (
-        "🚨 Possível vandalismo\n\n"
+        f"{heading}\n\n"
         f"📝 {change.get('title', 'Sem título')}\n"
         f"👤 {change.get('user', 'Desconhecido')}\n"
         f"💬 {change.get('comment') or 'Sem resumo'}\n\n"
@@ -4709,7 +4770,12 @@ def analysis_worker():
             old_revision = revision.get("old")
             new_revision = revision.get("new")
 
-            if not old_revision or not new_revision:
+            is_new_page = change.get("type") == "new"
+
+            if not new_revision:
+                continue
+
+            if not is_new_page and not old_revision:
                 continue
 
             username = change.get("user", "")
@@ -4807,10 +4873,15 @@ def analysis_worker():
                 continue
 
             # 6. Diff + heurísticas
-            diff = get_revision_diff(
-                old_revision,
-                new_revision
-            )
+            if is_new_page:
+                diff = get_new_revision_content(
+                    new_revision
+                )
+            else:
+                diff = get_revision_diff(
+                    old_revision,
+                    new_revision
+                )
 
             result = analyze_vandalism(
                 change,
@@ -6070,8 +6141,8 @@ def wikimedia_loop():
 
                     continue
 
-                # Edições
-                if change.get("type") != "edit":
+                # Edições e criação de páginas
+                if change.get("type") not in ("edit", "new"):
                     continue
 
                 if change.get("bot", False):
