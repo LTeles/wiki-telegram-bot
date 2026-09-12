@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.17"
+BOT_VERSION = "1.18"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -798,8 +798,6 @@ def load_observed_users():
 
         if (
             not username
-            or
-            not reason
             or
             expires_at <= now
         ):
