@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.16"
+BOT_VERSION = "1.17"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -75,6 +75,10 @@ ABUSE_FILTER_BATCH_LIMIT = 500
 
 POSTED_EDIT_CHECK_SECONDS = 60
 POSTED_EDIT_TRACK_SECONDS = 48 * 60 * 60
+
+# Resumo periódico dos alertas ainda pendentes no canal.
+PENDING_SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60
+PENDING_SUMMARY_MAX_ITEMS = 20
 
 # Patrulhamento: teto explícito de uma chamada à API por minuto.
 PATROL_REQUEST_INTERVAL_SECONDS = 60
@@ -133,6 +137,11 @@ DETECTION_STATS_FILE = os.environ.get(
     "/data/detection_stats.json"
 )
 
+PENDING_SUMMARY_STATE_FILE = os.environ.get(
+    "PENDING_SUMMARY_STATE_FILE",
+    "/data/pending_summary_state.json"
+)
+
 
 # =========================================================
 # ESTADO EM MEMÓRIA
@@ -167,6 +176,13 @@ detection_stats = {
     "last_report_date": None,
 }
 detection_stats_lock = threading.Lock()
+
+# Estado do último resumo periódico de pendências.
+pending_summary_state = {
+    "last_sent_at": 0.0,
+    "last_signature": "",
+}
+pending_summary_lock = threading.Lock()
 
 user_cache = {}
 
@@ -249,6 +265,7 @@ def ensure_storage():
         ABUSE_FILTER_STATE_FILE,
         POSTED_EDITS_FILE,
         DETECTION_STATS_FILE,
+        PENDING_SUMMARY_STATE_FILE,
     ]
 
     directories = {
@@ -281,6 +298,7 @@ def ensure_storage():
         print("📁 Estado dos filtros:", ABUSE_FILTER_STATE_FILE)
         print("📁 Edições publicadas:", POSTED_EDITS_FILE)
         print("📁 Estatísticas do detector:", DETECTION_STATS_FILE)
+        print("📁 Resumo de pendências:", PENDING_SUMMARY_STATE_FILE)
         print("📁 Versão do bot:", BOT_VERSION_FILE)
 
         return True
@@ -3135,6 +3153,146 @@ def posted_edit_status_monitor():
 
 
 # =========================================================
+# RESUMO PERIÓDICO DE ALERTAS PENDENTES
+# =========================================================
+
+def load_pending_summary_state():
+    global pending_summary_state
+    data = load_json(PENDING_SUMMARY_STATE_FILE, {})
+    loaded = {"last_sent_at": 0.0, "last_signature": ""}
+    if isinstance(data, dict):
+        try:
+            loaded["last_sent_at"] = float(data.get("last_sent_at", 0) or 0)
+        except Exception:
+            pass
+        signature = data.get("last_signature", "")
+        if isinstance(signature, str):
+            loaded["last_signature"] = signature
+    with pending_summary_lock:
+        pending_summary_state = loaded
+    print("✅ Estado do resumo de pendências carregado.")
+
+
+def save_pending_summary_state():
+    with pending_summary_lock:
+        data = dict(pending_summary_state)
+    atomic_write_json(PENDING_SUMMARY_STATE_FILE, data)
+
+
+def telegram_post_url(message_id):
+    channel = str(TELEGRAM_CHANNEL or "").strip()
+    if channel.startswith("@"):
+        username = channel[1:]
+        if username:
+            return f"https://t.me/{username}/{int(message_id)}"
+    return None
+
+
+def get_pending_posted_edits():
+    cleanup_posted_edits()
+    now = time.time()
+    with posted_edits_lock:
+        items = [
+            dict(item)
+            for item in posted_edits.values()
+            if not item.get("status")
+            and now - float(item.get("posted_at", 0)) <= POSTED_EDIT_TRACK_SECONDS
+        ]
+    items.sort(key=lambda item: float(item.get("posted_at", 0)), reverse=True)
+    return items
+
+
+def pending_summary_signature(items):
+    values = []
+    for item in items:
+        try:
+            revision_id = int(item.get("revision_id"))
+            message_id = int(item.get("message_id"))
+        except Exception:
+            continue
+        values.append(f"{revision_id}:{message_id}")
+    return "|".join(values)
+
+
+def build_pending_summary_message(items):
+    total = len(items)
+    visible = items[:PENDING_SUMMARY_MAX_ITEMS]
+    lines = []
+    for item in visible:
+        link = telegram_post_url(item.get("message_id"))
+        if not link:
+            continue
+        title = str(item.get("title") or "Sem título")
+        username = str(item.get("username") or "Desconhecido")
+        label = html.escape(f"{title} — {username}")
+        lines.append(f'• <a href="{html.escape(link, quote=True)}">{label}</a>')
+    if not lines:
+        return None
+    extra = total - len(visible)
+    extra_line = f"\n\n➕ {extra} outros alertas pendentes." if extra > 0 else ""
+    plural = "s" if total != 1 else ""
+    return (
+        "🕒 <b>Alertas ainda pendentes</b>\n\n"
+        f"🚨 {total} alerta{plural} ainda sem reversão ou patrulhamento:\n\n"
+        + "\n".join(lines)
+        + extra_line
+        + "\n\n⏳ Considerados apenas alertas das últimas 48h."
+    )
+
+
+def pending_alerts_summary_scheduler():
+    print("✅ Resumo de pendências: a cada 2 horas, até 20 links, janela de 48h.")
+    with pending_summary_lock:
+        never_sent = not pending_summary_state.get("last_sent_at")
+    if never_sent:
+        with pending_summary_lock:
+            pending_summary_state["last_sent_at"] = time.time()
+        try:
+            save_pending_summary_state()
+        except Exception:
+            pass
+    while True:
+        time.sleep(60)
+        try:
+            now = time.time()
+            with pending_summary_lock:
+                last_sent_at = float(pending_summary_state.get("last_sent_at", 0) or 0)
+                last_signature = str(pending_summary_state.get("last_signature", "") or "")
+            if now - last_sent_at < PENDING_SUMMARY_INTERVAL_SECONDS:
+                continue
+            items = get_pending_posted_edits()
+            if not items:
+                with pending_summary_lock:
+                    pending_summary_state["last_sent_at"] = now
+                    pending_summary_state["last_signature"] = ""
+                save_pending_summary_state()
+                continue
+            signature = pending_summary_signature(items)
+            if signature == last_signature:
+                with pending_summary_lock:
+                    pending_summary_state["last_sent_at"] = now
+                save_pending_summary_state()
+                print("ℹ️ Resumo de pendências não publicado: lista inalterada.")
+                continue
+            message = build_pending_summary_message(items)
+            if not message:
+                print("⚠️ Não foi possível montar links públicos para o resumo de pendências.")
+                with pending_summary_lock:
+                    pending_summary_state["last_sent_at"] = now
+                save_pending_summary_state()
+                continue
+            result = send_telegram_message(message, parse_mode="HTML")
+            if result:
+                with pending_summary_lock:
+                    pending_summary_state["last_sent_at"] = now
+                    pending_summary_state["last_signature"] = signature
+                save_pending_summary_state()
+                print("✅ Resumo de pendências publicado:", len(items), "alertas.")
+        except Exception as e:
+            print("⚠️ Erro no resumo de pendências:", repr(e))
+
+
+# =========================================================
 # TELEGRAM SENDER
 # =========================================================
 
@@ -4548,6 +4706,11 @@ def process_telegram_command(message, from_channel=False):
             tracked_count = len(
                 posted_edits
             )
+            pending_count = sum(
+                1
+                for item in posted_edits.values()
+                if not item.get("status")
+            )
 
         with detection_stats_lock:
             stats_count = len(
@@ -4622,6 +4785,10 @@ def process_telegram_command(message, from_channel=False):
                 f"{filter_count}\n"
                 f"📝 Edições acompanhadas: "
                 f"{tracked_count}\n"
+                f"🕒 Alertas pendentes: "
+                f"{pending_count}\n"
+                f"📌 Resumo de pendências: a cada 2h "
+                f"(máx. 20 links, 48h)\n"
                 f"📊 Registros estatísticos (90d): "
                 f"{stats_count}\n"
                 f"🕗 Relatório diário: 20:05 (Brasília)\n"
@@ -5635,6 +5802,7 @@ def main():
     load_abuse_filter_state()
     load_posted_edits()
     load_detection_stats()
+    load_pending_summary_state()
 
     cleanup_expired_observations()
     cleanup_expired_ignored_users()
@@ -5684,6 +5852,10 @@ def main():
     print(
         "🗃 Histórico estatístico: 90 dias"
     )
+    print(
+        "🕒 Resumo de pendências: a cada 2 horas, "
+        "máx. 20 links, janela de 48h"
+    )
 
     threads = [
         ("telegram-sender", telegram_sender),
@@ -5694,6 +5866,7 @@ def main():
         ("abuse-filter-monitor", abuse_filter_monitor),
         ("posted-edit-status", posted_edit_status_monitor),
         ("daily-detection-report", daily_detection_report_scheduler),
+        ("pending-alerts-summary", pending_alerts_summary_scheduler),
     ]
 
     for name, target in threads:
