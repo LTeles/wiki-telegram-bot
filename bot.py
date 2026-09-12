@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.1"
+BOT_VERSION = "2.2"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -231,6 +231,7 @@ wikimedia_authenticated = False
 wikimedia_authenticated_user = None
 wikimedia_auth_error = None
 wikimedia_rights = set()
+wikimedia_groups = set()
 
 # Diagnóstico do acesso de patrulhamento.
 patrol_api_test_ok = None
@@ -667,7 +668,17 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.1":
+    if BOT_VERSION == "2.2":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🆕 Novidades da versão 2.2:\n"
+            "• consultas do AbuseFilter agora reutilizam explicitamente a sessão autenticada do TelesGramBot;\n"
+            "• filtros e registros restritos passam a aproveitar os direitos efetivos da conta;\n"
+            "• se a sessão expirar, o bot tenta renovar o login automaticamente;\n"
+            "• /status agora informa o grupo confirmed e os principais direitos relacionados ao AbuseFilter."
+        )
+    elif BOT_VERSION == "2.1":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -1146,6 +1157,77 @@ def get_ignored_user(username):
 
 
 # =========================================================
+# LEITURA AUTENTICADA DA API WIKIMEDIA
+# =========================================================
+
+def wikimedia_api_get(params, timeout=25, require_auth_when_available=True):
+    """
+    GET na Action API reutilizando a sessão Bot Password quando ela estiver
+    autenticada. Se a sessão expirar, tenta autenticar novamente uma vez.
+
+    Quando não há credenciais/sessão autenticada, preserva o comportamento
+    público anterior e faz a consulta anonimamente.
+    """
+    request_params = dict(params)
+
+    if wikimedia_authenticated and require_auth_when_available:
+        # Garante que uma sessão expirada não passe silenciosamente a fazer
+        # consultas anônimas, o que é especialmente importante para filtros
+        # privados/restritos.
+        request_params.setdefault("assert", "user")
+        session = wikimedia_session
+    else:
+        session = requests
+
+    response = session.get(
+        WIKIPEDIA_API,
+        params=request_params,
+        headers=None if session is wikimedia_session else HEADERS,
+        timeout=timeout,
+    )
+
+    # HTTP 401/403 pode indicar perda da sessão.
+    if (
+        session is wikimedia_session
+        and response.status_code in (401, 403)
+    ):
+        if wikimedia_login():
+            request_params["assert"] = "user"
+            response = wikimedia_session.get(
+                WIKIPEDIA_API,
+                params=request_params,
+                timeout=timeout,
+            )
+
+    response.raise_for_status()
+    data = response.json()
+
+    # Com assert=user, sessão expirada costuma aparecer como erro da API
+    # mesmo com HTTP 200. Reautentica uma única vez e repete a chamada.
+    error = data.get("error") if isinstance(data, dict) else None
+    if (
+        session is wikimedia_session
+        and isinstance(error, dict)
+        and error.get("code") in {
+            "assertuserfailed",
+            "notloggedin",
+            "readapidenied",
+        }
+    ):
+        if wikimedia_login():
+            request_params["assert"] = "user"
+            response = wikimedia_session.get(
+                WIKIPEDIA_API,
+                params=request_params,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+    return response, data
+
+
+# =========================================================
 # FILTROS DE ABUSO
 # =========================================================
 
@@ -1183,9 +1265,8 @@ def get_abuse_filter_info(filter_id):
     try:
         numeric_id = int(filter_id)
 
-        response = requests.get(
-            WIKIPEDIA_API,
-            params={
+        response, data = wikimedia_api_get(
+            {
                 "action": "query",
                 "format": "json",
                 "formatversion": 2,
@@ -1197,12 +1278,8 @@ def get_abuse_filter_info(filter_id):
                 ),
                 "abflimit": 1,
             },
-            headers=HEADERS,
-            timeout=20
+            timeout=20,
         )
-
-        response.raise_for_status()
-        data = response.json()
 
         if data.get("error"):
             return None
@@ -1520,9 +1597,8 @@ def fetch_abuse_log_entries(filter_ids):
         chunk = filter_ids[start:start + 50]
 
         try:
-            response = requests.get(
-                WIKIPEDIA_API,
-                params={
+            response, data = wikimedia_api_get(
+                {
                     "action": "query",
                     "format": "json",
                     "formatversion": 2,
@@ -1535,12 +1611,8 @@ def fetch_abuse_log_entries(filter_ids):
                         "result|timestamp|hidden|revid"
                     ),
                 },
-                headers=HEADERS,
-                timeout=30
+                timeout=30,
             )
-
-            response.raise_for_status()
-            data = response.json()
 
             if data.get("error"):
                 print(
@@ -2613,6 +2685,7 @@ def wikimedia_login():
     global wikimedia_authenticated_user
     global wikimedia_auth_error
     global wikimedia_rights
+    global wikimedia_groups
     global patrol_visibility_supported
     global patrol_api_test_ok
     global patrol_api_test_code
@@ -2626,6 +2699,7 @@ def wikimedia_login():
         wikimedia_authenticated = False
         wikimedia_authenticated_user = None
         wikimedia_rights = set()
+        wikimedia_groups = set()
         wikimedia_auth_error = (
             "credenciais Wikimedia não configuradas"
         )
@@ -2703,7 +2777,7 @@ def wikimedia_login():
                 params={
                     "action": "query",
                     "meta": "userinfo",
-                    "uiprop": "rights",
+                    "uiprop": "rights|groups",
                     "format": "json",
                     "formatversion": 2,
                 },
@@ -2720,6 +2794,9 @@ def wikimedia_login():
             wikimedia_authenticated_user = userinfo.get("name")
             wikimedia_rights = set(
                 userinfo.get("rights", [])
+            )
+            wikimedia_groups = set(
+                userinfo.get("groups", [])
             )
             wikimedia_authenticated = not bool(
                 userinfo.get("anon")
@@ -2749,6 +2826,23 @@ def wikimedia_login():
                 "   autopatrol =",
                 "sim" if "autopatrol" in wikimedia_rights else "não"
             )
+            print(
+                "   grupo confirmed =",
+                "sim" if "confirmed" in wikimedia_groups else "não"
+            )
+            for right in (
+                "abusefilter-view",
+                "abusefilter-view-private",
+                "abusefilter-log",
+                "abusefilter-log-detail",
+                "abusefilter-log-private",
+                "abusefilter-access-protected-vars",
+                "abusefilter-protected-vars-log",
+            ):
+                print(
+                    f"   {right} =",
+                    "sim" if right in wikimedia_rights else "não"
+                )
 
             # O teste prático é deliberadamente executado mesmo se a lista
             # de rights não contiver patrol/patrolmarks. A resposta real do
@@ -2772,6 +2866,7 @@ def wikimedia_login():
             wikimedia_authenticated = False
             wikimedia_authenticated_user = None
             wikimedia_rights = set()
+            wikimedia_groups = set()
             patrol_visibility_supported = False
             wikimedia_auth_error = str(e)
             patrol_api_test_ok = False
@@ -5358,6 +5453,23 @@ def process_telegram_command(message, from_channel=False):
         autopatrol_right_text = (
             "sim" if "autopatrol" in wikimedia_rights else "não"
         )
+        confirmed_group_text = (
+            "sim" if "confirmed" in wikimedia_groups else "não"
+        )
+        abuse_right_names = (
+            "abusefilter-view",
+            "abusefilter-view-private",
+            "abusefilter-log",
+            "abusefilter-log-detail",
+            "abusefilter-log-private",
+            "abusefilter-access-protected-vars",
+            "abusefilter-protected-vars-log",
+        )
+        abuse_rights_text = "\n".join(
+            f"🔑 Direito {right}: "
+            + ("sim" if right in wikimedia_rights else "não")
+            for right in abuse_right_names
+        )
 
         if patrol_api_test_ok is True:
             patrol_test_text = "OK"
@@ -5410,6 +5522,9 @@ def process_telegram_command(message, from_channel=False):
                 f"🔑 Direito patrol: {patrol_right_text}\n"
                 f"🔑 Direito patrolmarks: {patrolmarks_right_text}\n"
                 f"🔑 Direito autopatrol: {autopatrol_right_text}\n"
+                f"👥 Grupo confirmed: {confirmed_group_text}\n"
+                f"🔐 AbuseFilter: consultas usam a sessão autenticada quando disponível\n"
+                f"{abuse_rights_text}\n"
                 f"🧪 Teste rcprop=patrolled: {patrol_test_text}\n"
                 f"🔄 Patrulhamento: lote a cada 50s "
                 f"(até ~72 chamadas/h)\n"
@@ -6527,6 +6642,9 @@ def main():
     print("🛡️ Monitor de proteção de páginas: ativo")
     print(
         "🛡 Monitor de filtros de abuso: ativo"
+    )
+    print(
+        "🔐 AbuseFilter: usa sessão autenticada Wikimedia quando disponível"
     )
     print(
         "↩️ Monitor de reversões: ativo"
