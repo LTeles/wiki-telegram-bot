@@ -21,7 +21,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.5"
-BOT_BUILD = "2.5"
+BOT_BUILD = "2.5-r2"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -692,8 +692,8 @@ def announce_new_version_if_needed():
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
             "🆕 Novidades da versão 2.5:\n"
-            "• os alertas de edições mantêm o atalho ‘Ver edição’ e agora também exibem o link bruto do diff ao lado;\n"
-            "• o mesmo formato é preservado quando um alerta é atualizado como revertido, patrulhado ou página eliminada."
+            "• os alertas de edições exibem ‘Ver edição’ apenas como texto, seguido do link bruto do diff;\n"
+            "• o único link clicável é o endereço exposto ao lado, inclusive após reversão, patrulhamento ou eliminação da página."
         )
     elif BOT_VERSION == "2.4":
         message = (
@@ -5183,7 +5183,7 @@ def user_contributions_url(username):
 
 def edit_link_html(url):
     safe_url = html.escape(str(url or ""), quote=True)
-    return f'🔗 <a href="{safe_url}">Ver edição</a> — {safe_url}'
+    return f"🔗 Ver edição — {safe_url}"
 
 
 def tracked_queue_item(
