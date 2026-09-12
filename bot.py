@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.15"
+BOT_VERSION = "1.16"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -488,7 +488,7 @@ def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None
             time.sleep(5)
 
 
-def edit_telegram_message(message_id, text, parse_mode=None):
+def edit_telegram_message(message_id, text, parse_mode=None, reply_markup=None):
     while True:
         try:
             payload = {
@@ -500,6 +500,12 @@ def edit_telegram_message(message_id, text, parse_mode=None):
 
             if parse_mode:
                 payload["parse_mode"] = parse_mode
+
+            # Reenvia explicitamente o teclado inline ao editar a mensagem.
+            # Isso garante que o botão "Observar conta" continue disponível
+            # após a mensagem ser marcada como patrulhada ou revertida.
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
 
             response = requests.post(
                 f"{TELEGRAM_API}/editMessageText",
@@ -2316,6 +2322,7 @@ def register_posted_edit(item, telegram_message):
         "message_id": message_id,
         "base_message": item.get("message", ""),
         "parse_mode": item.get("parse_mode"),
+        "reply_markup": item.get("reply_markup"),
         "posted_at": posted_at,
         "status": None,
     }
@@ -3069,12 +3076,26 @@ def posted_edit_status_monitor():
                     reverter=reverter
                 )
 
+                # Mantém o botão de observação mesmo depois que o texto
+                # da mensagem é alterado para "patrulhado" ou "revertido".
+                # O fallback cobre registros criados em versões anteriores,
+                # que ainda não tinham reply_markup persistido no JSON.
+                status_reply_markup = record.get("reply_markup")
+                if not status_reply_markup:
+                    status_reply_markup = {
+                        "inline_keyboard": [[{
+                            "text": "🔎 Observar conta (6h)",
+                            "callback_data": f"observe:{revision_id}",
+                        }]]
+                    }
+
                 success = edit_telegram_message(
                     record["message_id"],
                     new_text,
                     parse_mode=record.get(
                         "parse_mode"
-                    )
+                    ),
+                    reply_markup=status_reply_markup
                 )
 
                 if success:
