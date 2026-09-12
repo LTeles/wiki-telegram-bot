@@ -20,8 +20,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.5"
-BOT_BUILD = "2.5-r2"
+BOT_VERSION = "2.6"
+BOT_BUILD = "2.6"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -687,7 +687,15 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.5":
+    if BOT_VERSION == "2.6":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🆕 Novidades da versão 2.6:\n"
+            "• ao colocar uma conta em observação pelo botão, o alerta informa o nome do administrador do Telegram que realizou a ação;\n"
+            "• comandos /observar publicados no canal também exibem o responsável quando o Telegram fornece a identidade ou assinatura do autor."
+        )
+    elif BOT_VERSION == "2.5":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -5478,6 +5486,38 @@ def commands_message():
     )
 
 
+def telegram_person_display_name(user):
+    if not isinstance(user, dict):
+        return None
+
+    first_name = str(user.get("first_name") or "").strip()
+    last_name = str(user.get("last_name") or "").strip()
+    full_name = " ".join(part for part in (first_name, last_name) if part).strip()
+
+    if full_name:
+        return full_name
+
+    username = str(user.get("username") or "").strip()
+    if username:
+        return f"@{username}"
+
+    return None
+
+
+def observation_actor_from_channel_post(message):
+    # Em posts assinados de canal, o Telegram pode fornecer author_signature.
+    # Em algumas situações também há um objeto `from` identificável.
+    actor = telegram_person_display_name(message.get("from") or {})
+    if actor:
+        return actor
+
+    signature = str(message.get("author_signature") or "").strip()
+    if signature:
+        return signature
+
+    return None
+
+
 def process_telegram_command(message, from_channel=False):
     text = message.get("text", "").strip()
 
@@ -5633,7 +5673,8 @@ def process_telegram_command(message, from_channel=False):
             (
                 "🤖 Status do bot\n\n"
                 f"📦 Versão: {BOT_VERSION}\n"
-                f"🔧 Build: {BOT_BUILD}\n\n"
+                + (f"🔧 Build: {BOT_BUILD}\n" if BOT_BUILD != BOT_VERSION else "")
+                + "\n"
                 f"📡 EventStreams: {stream_status}\n"
                 f"🌐 Último evento Wikimedia: "
                 f"{format_age(last_stream)}\n"
@@ -5812,12 +5853,20 @@ def process_telegram_command(message, from_channel=False):
             canonical_username,
             reason
         ):
+            observation_actor = observation_actor_from_channel_post(message)
+            observation_actor_line = (
+                f"\n👮 Colocada em observação por {html.escape(observation_actor)}"
+                if observation_actor
+                else ""
+            )
+
             send_telegram_message(
                 (
                     "🔎 Conta colocada em observação\n\n"
                     f'👤 <a href="{html.escape(user_contributions_url(canonical_username), quote=True)}">'
                     f"{html.escape(canonical_username)}</a>\n"
-                    f"⏳ Duração: 6 horas\n\n"
+                    f"⏳ Duração: 6 horas"
+                    f"{observation_actor_line}\n\n"
                     "Toda edição desta conta será "
                     "publicada no canal durante "
                     "esse período."
@@ -6436,6 +6485,13 @@ def process_observe_callback(callback):
 
     username = record["username"]
     if observe_user(username):
+        observer_name = telegram_person_display_name(clicker)
+        observer_line = (
+            f"\n👮 Colocada em observação por {html.escape(observer_name)}"
+            if observer_name
+            else ""
+        )
+
         answer_callback_query(
             callback_id,
             f"{username} em observação por 6 horas."
@@ -6444,7 +6500,8 @@ def process_observe_callback(callback):
             "🔎 Conta colocada em observação\n\n"
             f'👤 <a href="{html.escape(user_contributions_url(username), quote=True)}">'
             f"{html.escape(username)}</a>\n"
-            "⏳ Duração: 6 horas",
+            "⏳ Duração: 6 horas"
+            f"{observer_line}",
             chat_id=TELEGRAM_CHANNEL,
             parse_mode="HTML"
         )
