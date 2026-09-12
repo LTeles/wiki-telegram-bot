@@ -21,7 +21,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.4"
-BOT_BUILD = "2.4-r1"
+BOT_BUILD = "2.4-r2"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -692,10 +692,10 @@ def announce_new_version_if_needed():
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n"
             f"🔧 Build {BOT_BUILD}\n\n"
-            "🆕 Novidades da versão 2.4:\n"
-            "• páginas /Testes no domínio de usuário deixam de entrar no detector;\n"
-            "• normalização de alvos de bloqueio contempla Usuário:, Usuário(a): e Usuária:;\n"
-            "• proteção de páginas agora tem o mesmo anti-flood dos bloqueios: até 5 alertas individuais por minuto; a partir do 6º, apenas um aviso com link para o registro."
+            "🔧 Ajustes do build 2.4-r2:\n"
+            "• links de edições agora aparecem resumidos como ‘Ver edição’;\n"
+            "• avisos de bloqueio passam a usar o título ‘Bloqueio aplicado’;\n"
+            "• confirmações de observação exibem o nome da conta com link direto para suas contribuições."
         )
     elif BOT_VERSION == "2.3":
         message = (
@@ -3172,9 +3172,9 @@ def get_reverter_username(title, revision_id):
 
 
 def message_with_status(record, status, reverter=None, deleter=None):
-    title = record.get("title") or "Sem título"
-    username = record.get("username") or "Desconhecido"
-    comment = record.get("edit_comment") or "Sem resumo"
+    title = html.escape(str(record.get("title") or "Sem título"))
+    username = html.escape(str(record.get("username") or "Desconhecido"))
+    comment = html.escape(str(record.get("edit_comment") or "Sem resumo"))
     risk = record.get("revert_risk")
     diff_url = record.get("diff_url") or ""
 
@@ -3185,15 +3185,19 @@ def message_with_status(record, status, reverter=None, deleter=None):
         except Exception:
             pass
 
+    edit_link = edit_link_html(diff_url)
+
     if status == "reverted":
-        reverter_line = f"\nRevertido por: {reverter}" if reverter else ""
+        reverter_line = (
+            f"\nRevertido por: {html.escape(str(reverter))}" if reverter else ""
+        )
         return (
             "↩️ Possível vandalismo revertido\n\n"
             f"📝 {title}\n"
             f"👤 {username}\n"
             f"💬 {comment}\n"
             f"{risk_line}\n"
-            f"🔗 {diff_url}"
+            f"{edit_link}"
             f"{reverter_line}"
         )
 
@@ -3204,18 +3208,20 @@ def message_with_status(record, status, reverter=None, deleter=None):
             f"👤 {username}\n"
             f"💬 {comment}\n"
             f"{risk_line}\n"
-            f"🔗 {diff_url}"
+            f"{edit_link}"
         )
 
     if status == "deleted":
-        deleter_line = f"\nEliminada por: {deleter}" if deleter else ""
+        deleter_line = (
+            f"\nEliminada por: {html.escape(str(deleter))}" if deleter else ""
+        )
         return (
             "🗑️ Página eliminada após alerta de possível vandalismo\n\n"
             f"📝 {title}\n"
             f"👤 {username}\n"
             f"💬 {comment}\n"
             f"{risk_line}\n"
-            f"🔗 {diff_url}"
+            f"{edit_link}"
             f"{deleter_line}"
         )
 
@@ -3335,9 +3341,7 @@ def posted_edit_status_monitor():
                 success = edit_telegram_message(
                     record["message_id"],
                     new_text,
-                    parse_mode=record.get(
-                        "parse_mode"
-                    ),
+                    parse_mode="HTML",
                     reply_markup=status_reply_markup
                 )
 
@@ -3379,7 +3383,7 @@ def posted_edit_status_monitor():
                             edit_telegram_message(
                                 record["message_id"],
                                 enriched_text,
-                                parse_mode=record.get("parse_mode"),
+                                parse_mode="HTML",
                                 reply_markup=status_reply_markup
                             )
 
@@ -3456,7 +3460,7 @@ def page_deletion_worker():
                 success = edit_telegram_message(
                     record["message_id"],
                     new_text,
-                    parse_mode=record.get("parse_mode"),
+                    parse_mode="HTML",
                     reply_markup=status_reply_markup
                 )
 
@@ -4409,7 +4413,7 @@ def format_block_message(event, change):
         "🔒 Bloqueio alterado/reaplicado"
         if action == "reblock"
         else
-        "🔒 Novo bloqueio aplicado"
+        "🔒 Bloqueio aplicado"
     )
 
     target_url = block_log_url(target)
@@ -5161,6 +5165,19 @@ def build_diff_url(change):
     )
 
 
+def user_contributions_url(username):
+    encoded_username = quote(str(username or "").replace(" ", "_"), safe="")
+    return (
+        "https://pt.wikipedia.org/wiki/"
+        f"Especial:Contribuições/{encoded_username}"
+    )
+
+
+def edit_link_html(url):
+    safe_url = html.escape(str(url or ""), quote=True)
+    return f'🔗 <a href="{safe_url}">Ver edição</a>'
+
+
 def tracked_queue_item(
     change,
     message,
@@ -5180,6 +5197,7 @@ def tracked_queue_item(
         "edit_comment": change.get("comment") or "Sem resumo",
         "diff_url": build_diff_url(change),
         "stats_payload": stats_payload,
+        "parse_mode": "HTML",
         "reply_markup": {
             "inline_keyboard": [[{
                 "text": "🔎 Observar conta (6h)",
@@ -5191,24 +5209,24 @@ def tracked_queue_item(
 
 def format_observed_message(change, observation):
     reason = (observation.get("reason") or "").strip()
-    reason_line = f"\n📌 Motivo: {reason}\n" if reason else ""
+    reason_line = f"\n📌 Motivo: {html.escape(reason)}\n" if reason else ""
     return (
         "👁 Edição de conta observada\n\n"
-        f"👤 {change.get('user', 'Desconhecido')}\n"
-        f"📝 {change.get('title', 'Sem título')}\n"
-        f"💬 {change.get('comment') or 'Sem resumo'}\n"
+        f"👤 {html.escape(str(change.get('user', 'Desconhecido')))}\n"
+        f"📝 {html.escape(str(change.get('title', 'Sem título')))}\n"
+        f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n"
         f"{reason_line}\n"
-        f"🔗 {build_diff_url(change)}"
+        f"{edit_link_html(build_diff_url(change))}"
     )
 
 
 def format_watched_message(change):
     return (
         "👁 Edição em página vigiada\n\n"
-        f"📝 {change.get('title', 'Sem título')}\n"
-        f"👤 {change.get('user', 'Desconhecido')}\n"
-        f"💬 {change.get('comment') or 'Sem resumo'}\n\n"
-        f"🔗 {build_diff_url(change)}"
+        f"📝 {html.escape(str(change.get('title', 'Sem título')))}\n"
+        f"👤 {html.escape(str(change.get('user', 'Desconhecido')))}\n"
+        f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n\n"
+        f"{edit_link_html(build_diff_url(change))}"
     )
 
 
@@ -5229,11 +5247,11 @@ def format_message(change, result):
 
     return (
         f"{heading}\n\n"
-        f"📝 {change.get('title', 'Sem título')}\n"
-        f"👤 {change.get('user', 'Desconhecido')}\n"
-        f"💬 {change.get('comment') or 'Sem resumo'}\n\n"
+        f"📝 {html.escape(str(change.get('title', 'Sem título')))}\n"
+        f"👤 {html.escape(str(change.get('user', 'Desconhecido')))}\n"
+        f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n\n"
         f"🤖 Risco de reversão: {revert_score}%\n\n"
-        f"🔗 {build_diff_url(change)}"
+        f"{edit_link_html(build_diff_url(change))}"
     )
 
 
@@ -5789,13 +5807,15 @@ def process_telegram_command(message, from_channel=False):
             send_telegram_message(
                 (
                     "🔎 Conta colocada em observação\n\n"
-                    f"👤 {canonical_username}\n"
+                    f'👤 <a href="{html.escape(user_contributions_url(canonical_username), quote=True)}">'
+                    f"{html.escape(canonical_username)}</a>\n"
                     f"⏳ Duração: 6 horas\n\n"
                     "Toda edição desta conta será "
                     "publicada no canal durante "
                     "esse período."
                 ),
-                chat_id=chat_id
+                chat_id=chat_id,
+                parse_mode="HTML"
             )
         else:
             send_telegram_message(
@@ -6414,9 +6434,11 @@ def process_observe_callback(callback):
         )
         send_telegram_message(
             "🔎 Conta colocada em observação\n\n"
-            f"👤 {username}\n"
+            f'👤 <a href="{html.escape(user_contributions_url(username), quote=True)}">'
+            f"{html.escape(username)}</a>\n"
             "⏳ Duração: 6 horas",
-            chat_id=TELEGRAM_CHANNEL
+            chat_id=TELEGRAM_CHANNEL,
+            parse_mode="HTML"
         )
     else:
         answer_callback_query(
