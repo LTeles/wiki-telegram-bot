@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.19"
+BOT_VERSION = "1.20"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -190,6 +190,7 @@ user_cache = {}
 
 analysis_queue = queue.Queue()
 block_queue = queue.Queue()
+page_deletion_queue = queue.Queue()
 telegram_queue = queue.Queue()
 
 stream_lock = threading.Lock()
@@ -2952,7 +2953,7 @@ def get_reverter_username(title, revision_id):
     return None
 
 
-def message_with_status(record, status, reverter=None):
+def message_with_status(record, status, reverter=None, deleter=None):
     title = record.get("title") or "Sem título"
     username = record.get("username") or "Desconhecido"
     comment = record.get("edit_comment") or "Sem resumo"
@@ -2988,6 +2989,18 @@ def message_with_status(record, status, reverter=None):
             f"🔗 {diff_url}"
         )
 
+    if status == "deleted":
+        deleter_line = f"\nEliminada por: {deleter}" if deleter else ""
+        return (
+            "🗑️ Página eliminada após alerta de possível vandalismo\n\n"
+            f"📝 {title}\n"
+            f"👤 {username}\n"
+            f"💬 {comment}\n"
+            f"{risk_line}\n"
+            f"🔗 {diff_url}"
+            f"{deleter_line}"
+        )
+
     return record.get("base_message", "").rstrip()
 
 
@@ -3016,7 +3029,7 @@ def posted_edit_status_monitor():
         active = [
             record
             for record in snapshot
-            if record.get("status") != "reverted"
+            if record.get("status") not in ("reverted", "deleted")
         ]
 
         if not active:
@@ -3162,6 +3175,106 @@ def posted_edit_status_monitor():
                     "⚠️ Erro ao salvar status de mensagens:",
                     repr(e)
                 )
+
+
+# =========================================================
+# ELIMINAÇÃO DE PÁGINAS / ALERTAS PENDENTES
+# =========================================================
+
+def page_title_key(title):
+    return str(title or "").replace("_", " ").strip().casefold()
+
+
+def page_deletion_worker():
+    """Atualiza imediatamente alertas pendentes quando a página é eliminada.
+
+    A informação vem do mesmo EventStreams já conectado pelo bot. Portanto,
+    este recurso não acrescenta polling nem consultas periódicas à Action API.
+    """
+    print("✅ Monitor de eliminação de páginas iniciado.")
+
+    while True:
+        change = page_deletion_queue.get()
+        try:
+            title = str(change.get("title") or "").strip()
+            deleter = str(change.get("user") or "").strip() or None
+
+            if not title:
+                continue
+
+            title_key = page_title_key(title)
+
+            with posted_edits_lock:
+                matches = [
+                    dict(item)
+                    for item in posted_edits.values()
+                    if not item.get("status")
+                    and page_title_key(item.get("title")) == title_key
+                ]
+
+            if not matches:
+                continue
+
+            changed_any = False
+
+            for record in matches:
+                revision_id = int(record["revision_id"])
+
+                status_reply_markup = record.get("reply_markup")
+                if not status_reply_markup:
+                    status_reply_markup = {
+                        "inline_keyboard": [[{
+                            "text": "🔎 Observar conta (6h)",
+                            "callback_data": f"observe:{revision_id}",
+                        }]]
+                    }
+
+                new_text = message_with_status(
+                    record,
+                    "deleted",
+                    deleter=deleter
+                )
+
+                success = edit_telegram_message(
+                    record["message_id"],
+                    new_text,
+                    parse_mode=record.get("parse_mode"),
+                    reply_markup=status_reply_markup
+                )
+
+                if success:
+                    with posted_edits_lock:
+                        live = posted_edits.get(str(revision_id))
+                        if live and not live.get("status"):
+                            live["status"] = "deleted"
+                            live["deleted_by"] = deleter
+                            live["deleted_at"] = time.time()
+
+                    changed_any = True
+                    print(
+                        "🗑️ Alerta marcado como página eliminada:",
+                        revision_id,
+                        "|",
+                        title,
+                        "| por:",
+                        deleter or "não informado"
+                    )
+
+                time.sleep(1)
+
+            if changed_any:
+                try:
+                    save_posted_edits()
+                except Exception as e:
+                    print(
+                        "⚠️ Erro ao salvar status de página eliminada:",
+                        repr(e)
+                    )
+
+        except Exception as e:
+            print("⚠️ Erro ao processar eliminação de página:", repr(e))
+        finally:
+            page_deletion_queue.task_done()
 
 
 # =========================================================
@@ -5721,17 +5834,12 @@ def wikimedia_loop():
                 if change.get("wiki") != "ptwiki":
                     continue
 
-                # Bloqueios
+                # Logs: bloqueios e eliminações de páginas.
                 if change.get("type") == "log":
-                    if (
-                        change.get("log_type")
-                        ==
-                        "block"
-                    ):
-                        action = change.get(
-                            "log_action"
-                        )
+                    log_type = change.get("log_type")
+                    action = change.get("log_action")
 
+                    if log_type == "block":
                         if action in (
                             "block",
                             "reblock"
@@ -5744,6 +5852,18 @@ def wikimedia_loop():
                                 "| ação:",
                                 action
                             )
+
+                    elif (
+                        log_type == "delete"
+                        and action == "delete"
+                    ):
+                        page_deletion_queue.put(change)
+                        print(
+                            "🗑️ Evento de eliminação de página:",
+                            change.get("title"),
+                            "| por:",
+                            change.get("user")
+                        )
 
                     continue
 
@@ -5874,6 +5994,7 @@ def main():
         ("telegram-sender", telegram_sender),
         ("analysis-worker", analysis_worker),
         ("block-worker", block_worker),
+        ("page-deletion-worker", page_deletion_worker),
         ("eventstream-watchdog", eventstream_watchdog),
         ("telegram-listener", telegram_command_listener),
         ("abuse-filter-monitor", abuse_filter_monitor),
