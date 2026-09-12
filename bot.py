@@ -20,7 +20,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.3"
+BOT_VERSION = "2.4"
+BOT_BUILD = "2.4-r1"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -78,6 +79,9 @@ ABUSE_FILTER_BATCH_LIMIT = 500
 # Do 6º em diante, os eventos individuais são suprimidos e uma única
 # mensagem direciona ao registro de bloqueios.
 MAX_BLOCK_ALERTS_PER_MINUTE = 5
+
+# A mesma política é aplicada aos registros de proteção de páginas.
+MAX_PROTECTION_ALERTS_PER_MINUTE = 5
 
 POSTED_EDIT_CHECK_SECONDS = 10
 REVISION_STATUS_INTERVAL_SECONDS = 30
@@ -207,6 +211,14 @@ page_deletion_queue = queue.Queue()
 # Controle de flooding dos alertas de bloqueio.
 block_rate_lock = threading.Lock()
 block_rate_state = {
+    "minute_bucket": None,
+    "count": 0,
+    "summary_sent": False,
+}
+
+# Controle de flooding dos alertas de proteção de páginas.
+protection_rate_lock = threading.Lock()
+protection_rate_state = {
     "minute_bucket": None,
     "count": 0,
     "summary_sent": False,
@@ -631,6 +643,11 @@ def load_saved_bot_version():
     data = load_json(BOT_VERSION_FILE, {})
 
     if isinstance(data, dict):
+        # Arquivos antigos guardavam apenas `version`. O fallback mantém
+        # compatibilidade e faz a primeira build nova ser anunciada.
+        build = data.get("build")
+        if build:
+            return str(build)
         version = data.get("version")
         if version:
             return str(version)
@@ -638,18 +655,19 @@ def load_saved_bot_version():
     return None
 
 
-def save_bot_version(version):
+def save_bot_version(version, build=None):
     atomic_write_json(
         BOT_VERSION_FILE,
         {
             "version": version,
+            "build": build or version,
             "updated_at": datetime.now(
                 timezone.utc
             ).isoformat()
         }
     )
 
-    print("💾 Versão registrada:", version)
+    print("💾 Versão/build registrada:", version, build or version)
 
 
 def announce_new_version_if_needed():
@@ -660,15 +678,26 @@ def announce_new_version_if_needed():
         saved_version or "nenhuma"
     )
     print("🤖 Versão atual:", BOT_VERSION)
+    print("🔧 Build atual:", BOT_BUILD)
 
-    if saved_version == BOT_VERSION:
+    if saved_version == BOT_BUILD:
         print(
             "ℹ️ Versão já anunciada. "
             "Nenhuma mensagem enviada."
         )
         return
 
-    if BOT_VERSION == "2.3":
+    if BOT_VERSION == "2.4":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n"
+            f"🔧 Build {BOT_BUILD}\n\n"
+            "🆕 Novidades da versão 2.4:\n"
+            "• páginas /Testes no domínio de usuário deixam de entrar no detector;\n"
+            "• normalização de alvos de bloqueio contempla Usuário:, Usuário(a): e Usuária:;\n"
+            "• proteção de páginas agora tem o mesmo anti-flood dos bloqueios: até 5 alertas individuais por minuto; a partir do 6º, apenas um aviso com link para o registro."
+        )
+    elif BOT_VERSION == "2.3":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -719,7 +748,7 @@ def announce_new_version_if_needed():
         return
 
     try:
-        save_bot_version(BOT_VERSION)
+        save_bot_version(BOT_VERSION, BOT_BUILD)
         print("✅ Nova versão anunciada e registrada.")
     except Exception as e:
         print(
@@ -4518,6 +4547,79 @@ def get_protection_log_details(log_id):
         return None
 
 
+def general_protection_log_url():
+    return (
+        "https://pt.wikipedia.org/w/index.php"
+        "?title=Special:Log&type=protect"
+    )
+
+
+def format_protection_burst_message():
+    url = general_protection_log_url()
+    return (
+        "⚠️ <b>Mais de 5 proteções no mesmo minuto</b>\n\n"
+        "Mais de 5 proteções ou alterações de proteção foram "
+        "efetuadas neste minuto. Para evitar flooding, os alertas "
+        "individuais adicionais foram suprimidos.\n\n"
+        f'🔗 <a href="{url}">Ver registro de proteções</a>'
+    )
+
+
+def handle_protection_event(change):
+    """Aplica anti-flood antes de consultar detalhes do registro.
+
+    Os cinco primeiros eventos do minuto são processados normalmente.
+    O sexto gera um único resumo, e o sexto e os seguintes não entram
+    na fila nem provocam consulta adicional a list=logevents.
+    """
+    now = time.time()
+    minute_bucket = int(now // 60)
+    send_summary = False
+    allow_individual = False
+
+    with protection_rate_lock:
+        if protection_rate_state["minute_bucket"] != minute_bucket:
+            protection_rate_state["minute_bucket"] = minute_bucket
+            protection_rate_state["count"] = 0
+            protection_rate_state["summary_sent"] = False
+
+        protection_rate_state["count"] += 1
+        count = protection_rate_state["count"]
+
+        if count <= MAX_PROTECTION_ALERTS_PER_MINUTE:
+            allow_individual = True
+        elif not protection_rate_state["summary_sent"]:
+            protection_rate_state["summary_sent"] = True
+            send_summary = True
+
+    if allow_individual:
+        protection_queue.put(change)
+        print(
+            "🛡️ Evento de proteção aceito:",
+            change.get("title"),
+            "| minuto:", minute_bucket,
+            "| posição:", count,
+        )
+        return
+
+    if send_summary:
+        telegram_queue.put({
+            "message": format_protection_burst_message(),
+            "title": "Muitas proteções",
+            "parse_mode": "HTML",
+        })
+        print(
+            "⚠️ Mais de 5 proteções no mesmo minuto; "
+            "alertas individuais adicionais suprimidos."
+        )
+    else:
+        print(
+            "⏭️ Proteção suprimida por limite anti-flood:",
+            change.get("title"),
+            "| posição:", count,
+        )
+
+
 def protection_log_url(title):
     encoded_title = quote(str(title or "").replace(" ", "_"), safe="")
     return (
@@ -5504,7 +5606,8 @@ def process_telegram_command(message, from_channel=False):
         send_telegram_message(
             (
                 "🤖 Status do bot\n\n"
-                f"📦 Versão: {BOT_VERSION}\n\n"
+                f"📦 Versão: {BOT_VERSION}\n"
+                f"🔧 Build: {BOT_BUILD}\n\n"
                 f"📡 EventStreams: {stream_status}\n"
                 f"🌐 Último evento Wikimedia: "
                 f"{format_age(last_stream)}\n"
@@ -6554,15 +6657,7 @@ def wikimedia_loop():
                         # Registra somente proteção e alteração de uma
                         # proteção existente. Desproteções são ignoradas.
                         if action in ("protect", "modify"):
-                            protection_queue.put(change)
-                            print(
-                                "🛡️ Evento de proteção de página:",
-                                change.get("title"),
-                                "| ação:",
-                                action,
-                                "| por:",
-                                change.get("user"),
-                            )
+                            handle_protection_event(change)
 
                     elif (
                         log_type == "delete"
@@ -6635,7 +6730,7 @@ def wikimedia_loop():
 def main():
     print("========================================")
     print("Detector de vandalismo ptwiki")
-    print(f"Versão {BOT_VERSION}")
+    print(f"Versão {BOT_VERSION} | Build {BOT_BUILD}")
     print("========================================")
 
     remove_telegram_webhook()
