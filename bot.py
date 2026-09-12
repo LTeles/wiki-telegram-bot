@@ -20,7 +20,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "1.18"
+BOT_VERSION = "1.19"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -73,15 +73,17 @@ IGNORE_DURATION_SECONDS = 6 * 60 * 60
 ABUSE_FILTER_POLL_SECONDS = 20
 ABUSE_FILTER_BATCH_LIMIT = 500
 
-POSTED_EDIT_CHECK_SECONDS = 60
+POSTED_EDIT_CHECK_SECONDS = 10
+REVISION_STATUS_INTERVAL_SECONDS = 30
 POSTED_EDIT_TRACK_SECONDS = 48 * 60 * 60
 
 # Resumo periódico dos alertas ainda pendentes no canal.
 PENDING_SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60
 PENDING_SUMMARY_MAX_ITEMS = 20
 
-# Patrulhamento: teto explícito de uma chamada à API por minuto.
-PATROL_REQUEST_INTERVAL_SECONDS = 60
+# Patrulhamento: consulta em lote a cada 50s para manter a atualização
+# normalmente abaixo de 1 minuto, deixando margem para rede/API/Telegram.
+PATROL_REQUEST_INTERVAL_SECONDS = 50
 PATROL_RECENTCHANGES_LIMIT = 500
 
 # Reversões são verificadas em lote, reduzindo chamadas individuais.
@@ -2447,8 +2449,8 @@ def test_patrol_visibility_access():
     Testa diretamente se a sessão autenticada consegue pedir
     rcprop=patrolled no RecentChanges.
 
-    Esta chamada diagnóstica também conta para o teto de patrulhamento:
-    após executá-la, o próximo lote normal só poderá ocorrer 60s depois.
+    Esta chamada diagnóstica também conta para o intervalo de patrulhamento:
+    após executá-la, o próximo lote normal só poderá ocorrer 50s depois.
     """
 
     global patrol_api_test_ok
@@ -2459,7 +2461,7 @@ def test_patrol_visibility_access():
 
     try:
         # Reserva o ciclo antes da chamada. Assim o teste de inicialização
-        # não permite uma segunda chamada de patrulhamento no mesmo minuto.
+        # não permite uma segunda chamada antes do intervalo configurado.
         with patrol_request_lock:
             last_patrol_request_at = time.monotonic()
 
@@ -2786,7 +2788,7 @@ def get_revision_tags_batch(revision_ids):
 
 def get_patrol_status_batch(records):
     """
-    Faz NO MÁXIMO UMA solicitação de patrulhamento por minuto.
+    Faz no máximo uma solicitação de patrulhamento a cada 50 segundos.
 
     A chamada busca até 500 mudanças recentes de uma vez e compara
     localmente os revids/rcids com as mensagens acompanhadas.
@@ -2994,10 +2996,10 @@ def posted_edit_status_monitor():
         "✅ Monitor de reversões/patrulhamento iniciado."
     )
     print(
-        "🔄 Patrulhamento em lote: máximo de 1 chamada/minuto."
+        "🔄 Patrulhamento em lote: máximo de 1 chamada a cada 50s."
     )
 
-    revision_cursor = 0
+    last_revision_check_at = 0.0
 
     while True:
         time.sleep(POSTED_EDIT_CHECK_SECONDS)
@@ -3021,35 +3023,32 @@ def posted_edit_status_monitor():
             continue
 
         # -------- Reversões em lote --------
-        # Até 50 revisões por chamada. Se houver mais, os lotes são
-        # percorridos em rodízio a cada ciclo para manter a carga baixa.
-        total_active = len(active)
+        # O loop acorda a cada 10s, mas as consultas de tags são feitas
+        # a cada 30s. Todas as revisões acompanhadas entram no mesmo ciclo,
+        # divididas em lotes de até 50 IDs por solicitação.
+        tags_by_revision = {}
+        now_monotonic = time.monotonic()
 
-        if revision_cursor >= total_active:
-            revision_cursor = 0
+        if (
+            now_monotonic - last_revision_check_at
+            >= REVISION_STATUS_INTERVAL_SECONDS
+        ):
+            last_revision_check_at = now_monotonic
 
-        ordered = (
-            active[revision_cursor:]
-            +
-            active[:revision_cursor]
-        )
-
-        revision_batch = ordered[:REVISION_TAG_BATCH_SIZE]
-        revision_cursor = (
-            revision_cursor
-            +
-            len(revision_batch)
-        ) % max(total_active, 1)
-
-        tags_by_revision = get_revision_tags_batch(
-            [
-                record["revision_id"]
-                for record in revision_batch
-            ]
-        )
+            for batch_start in range(0, len(active), REVISION_TAG_BATCH_SIZE):
+                revision_batch = active[
+                    batch_start:batch_start + REVISION_TAG_BATCH_SIZE
+                ]
+                batch_result = get_revision_tags_batch(
+                    [
+                        record["revision_id"]
+                        for record in revision_batch
+                    ]
+                )
+                tags_by_revision.update(batch_result)
 
         # -------- Patrulhamento em lote --------
-        # Teto rígido: no máximo uma chamada à API a cada 60 s.
+        # Teto rígido: no máximo uma chamada à API a cada 50 s.
         patrol_by_revision = get_patrol_status_batch(
             active
         )
@@ -3079,17 +3078,14 @@ def posted_edit_status_monitor():
                 and
                 new_status != current_status
             ):
-                reverter = None
-                if new_status == "reverted":
-                    reverter = get_reverter_username(
-                        record.get("title") or "",
-                        revision_id
-                    )
-
+                # Para não atrasar a atualização principal, uma reversão
+                # é publicada imediatamente sem esperar a consulta opcional
+                # que tenta descobrir quem reverteu. O nome é acrescentado
+                # em uma segunda edição logo depois, se puder ser identificado.
                 new_text = message_with_status(
                     record,
                     new_status,
-                    reverter=reverter
+                    reverter=None
                 )
 
                 # Mantém o botão de observação mesmo depois que o texto
@@ -3137,6 +3133,24 @@ def posted_edit_status_monitor():
                         "→",
                         new_status
                     )
+
+                    if new_status == "reverted":
+                        reverter = get_reverter_username(
+                            record.get("title") or "",
+                            revision_id
+                        )
+                        if reverter:
+                            enriched_text = message_with_status(
+                                record,
+                                "reverted",
+                                reverter=reverter
+                            )
+                            edit_telegram_message(
+                                record["message_id"],
+                                enriched_text,
+                                parse_mode=record.get("parse_mode"),
+                                reply_markup=status_reply_markup
+                            )
 
                 time.sleep(1)
 
@@ -4796,8 +4810,9 @@ def process_telegram_command(message, from_channel=False):
                 f"🔑 Direito patrolmarks: {patrolmarks_right_text}\n"
                 f"🔑 Direito autopatrol: {autopatrol_right_text}\n"
                 f"🧪 Teste rcprop=patrolled: {patrol_test_text}\n"
-                f"🔄 Patrulhamento: lote a cada 60s, "
-                f"máx. 1 chamada/min\n"
+                f"🔄 Patrulhamento: lote a cada 50s "
+                f"(até ~72 chamadas/h)\n"
+                f"⏱ Atualização de status: alvo < 60s\n"
                 f"🔒 Monitor de bloqueios: ativo\n\n"
                 f"🔎 Triagem: "
                 f"{REVERT_RISK_THRESHOLD:.0%}\n"
@@ -5841,7 +5856,7 @@ def main():
     )
     print(
         "🔄 Patrulhamento em lote: máximo de "
-        "1 chamada por minuto"
+        "1 chamada a cada 50s"
     )
     print(
         "📊 Relatório diário: 20:05 "
