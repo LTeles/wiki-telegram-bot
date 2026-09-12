@@ -668,15 +668,7 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.4":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🆕 Novidades da versão 2.4:\n"
-            "• o alvo dos bloqueios agora reconhece também o prefixo Usuária:;\n"
-            "• permanecem normalizados Usuário(a):, Usuário:, Usuario(a):, Usuario: e User:, evitando duplicação do namespace nos links."
-        )
-    elif BOT_VERSION == "2.3":
+    if BOT_VERSION == "2.3":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -4044,7 +4036,6 @@ def extract_block_target(title):
     # de montar o link para evitar "Usuário:Usuário(a):Nome".
     for prefix in (
         "Usuário(a):",
-        "Usuária:",
         "Usuário:",
         "Usuario(a):",
         "Usuario:",
@@ -6476,6 +6467,26 @@ def eventstream_watchdog():
 # WIKIMEDIA EVENTSTREAMS
 # =========================================================
 
+def is_user_tests_page(title):
+    """Ignora subpáginas /Testes no namespace de usuário."""
+    if not isinstance(title, str):
+        return False
+
+    normalized = title.strip()
+    if not re.match(
+        r"^(?:Usuário|Usuária|Usuário\s*\(a\)|Usuario|Usuaria|Usuario\s*\(a\)|User)\s*:",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        return False
+
+    return re.search(
+        r"/Testes(?:/|$)",
+        normalized,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
 def wikimedia_loop():
     global stream_connected
     global last_stream_event_at
@@ -6572,6 +6583,16 @@ def wikimedia_loop():
                     continue
 
                 if change.get("bot", False):
+                    continue
+
+                # Páginas pessoais de testes não entram no pipeline de
+                # análise/alertas. Aceita as formas localizadas do
+                # namespace de usuário e qualquer subpágina de /Testes.
+                if is_user_tests_page(change.get("title", "")):
+                    print(
+                        "🧪 Página de testes de usuário ignorada:",
+                        change.get("title"),
+                    )
                     continue
 
                 with stream_lock:
