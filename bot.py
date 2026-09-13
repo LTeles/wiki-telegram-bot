@@ -20,8 +20,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.10"
-BOT_BUILD = "2.10"
+BOT_VERSION = "2.11"
+BOT_BUILD = "2.11-r2"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -717,7 +717,15 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.10":
+    if BOT_VERSION == "2.11":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🔗 Links de contribuições:\n"
+            "• o nome da conta passa a ser clicável nos alertas de novas edições, levando diretamente às contribuições;\n"
+            "• respostas e listagens de comandos que exibem contas também usam o nome como link para as contribuições."
+        )
+    elif BOT_VERSION == "2.10":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -3443,7 +3451,7 @@ def observation_remaining_line(username):
 
 def message_with_status(record, status, reverter=None, deleter=None):
     title = html.escape(str(record.get("title") or "Sem título"))
-    username = html.escape(str(record.get("username") or "Desconhecido"))
+    username = user_contributions_link_html(record.get("username") or "Desconhecido")
     comment = html.escape(str(record.get("edit_comment") or "Sem resumo"))
     risk = record.get("revert_risk")
     diff_url = record.get("diff_url") or ""
@@ -5464,6 +5472,16 @@ def user_contributions_url(username):
     )
 
 
+def user_contributions_link_html(username):
+    display_name = str(username or "Desconhecido")
+    safe_name = html.escape(display_name)
+    safe_url = html.escape(
+        user_contributions_url(display_name),
+        quote=True
+    )
+    return f'<a href="{safe_url}">{safe_name}</a>'
+
+
 def edit_link_html(url):
     safe_url = html.escape(str(url or ""), quote=True)
     return f"🔗 Ver edição — {safe_url}"
@@ -5548,7 +5566,7 @@ def format_observed_message(change, observation):
     reason_line = f"\n📌 Motivo: {html.escape(reason)}\n" if reason else ""
     return (
         "👁 Edição de conta observada\n\n"
-        f"👤 {html.escape(str(change.get('user', 'Desconhecido')))}\n"
+        f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
         f"📝 {html.escape(str(change.get('title', 'Sem título')))}\n"
         f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n"
         f"{reason_line}\n"
@@ -5560,7 +5578,7 @@ def format_watched_message(change):
     return (
         "👁 Edição em página vigiada\n\n"
         f"📝 {html.escape(str(change.get('title', 'Sem título')))}\n"
-        f"👤 {html.escape(str(change.get('user', 'Desconhecido')))}\n"
+        f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
         f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n\n"
         f"{edit_link_html(build_diff_url(change))}"
     )
@@ -5584,7 +5602,7 @@ def format_message(change, result):
     return (
         f"{heading}\n\n"
         f"📝 {html.escape(str(change.get('title', 'Sem título')))}\n"
-        f"👤 {html.escape(str(change.get('user', 'Desconhecido')))}\n"
+        f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
         f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n\n"
         f"🤖 Risco de reversão: {revert_score}%\n\n"
         f"{edit_link_html(build_diff_url(change))}"
@@ -6137,10 +6155,14 @@ def process_telegram_command(message, from_channel=False):
 
             lines.append(
                 (
-                    f"• {item['username']}\n"
+                    f"• {user_contributions_link_html(item['username'])}\n"
                     f"  ⏳ "
                     f"{format_remaining(remaining_time)}"
-                    + (f"\n  📌 {item.get('reason')}" if item.get('reason') else "")
+                    + (
+                        f"\n  📌 {html.escape(str(item.get('reason')))}"
+                        if item.get('reason')
+                        else ""
+                    )
                 )
             )
 
@@ -6150,7 +6172,8 @@ def process_telegram_command(message, from_channel=False):
                 +
                 "\n\n".join(lines)
             ),
-            chat_id=chat_id
+            chat_id=chat_id,
+            parse_mode="HTML"
         )
         return
 
@@ -6273,18 +6296,19 @@ def process_telegram_command(message, from_channel=False):
             )
         elif not removed:
             response_text = (
-                f"ℹ️ {canonical_username} "
+                f"ℹ️ {user_contributions_link_html(canonical_username)} "
                 "não estava em observação."
             )
         else:
             response_text = (
                 "⛔ Observação encerrada\n\n"
-                f"👤 {canonical_username}"
+                f"👤 {user_contributions_link_html(canonical_username)}"
             )
 
         send_telegram_message(
             response_text,
-            chat_id=chat_id
+            chat_id=chat_id,
+            parse_mode="HTML"
         )
         return
 
@@ -6325,7 +6349,7 @@ def process_telegram_command(message, from_channel=False):
 
             lines.append(
                 (
-                    f"• {item['username']} — "
+                    f"• {user_contributions_link_html(item['username'])} — "
                     f"{format_remaining(remaining_time)} restantes"
                 )
             )
@@ -6336,7 +6360,8 @@ def process_telegram_command(message, from_channel=False):
                 +
                 "\n".join(lines)
             ),
-            chat_id=chat_id
+            chat_id=chat_id,
+            parse_mode="HTML"
         )
         return
 
@@ -6380,7 +6405,7 @@ def process_telegram_command(message, from_channel=False):
             send_telegram_message(
                 (
                     "🙈 Conta temporariamente ignorada\n\n"
-                    f"👤 {canonical_username}\n"
+                    f"👤 {user_contributions_link_html(canonical_username)}\n"
                     "⏳ Duração: 6 horas\n\n"
                     "As edições desta conta não serão "
                     "avaliadas pelo detector normal de "
@@ -6388,7 +6413,8 @@ def process_telegram_command(message, from_channel=False):
                     "ℹ️ Contas observadas e páginas "
                     "vigiadas continuam tendo prioridade."
                 ),
-                chat_id=chat_id
+                chat_id=chat_id,
+                parse_mode="HTML"
             )
         else:
             send_telegram_message(
@@ -6438,20 +6464,21 @@ def process_telegram_command(message, from_channel=False):
             )
         elif not removed:
             response_text = (
-                f"ℹ️ {canonical_username} "
+                f"ℹ️ {user_contributions_link_html(canonical_username)} "
                 "não estava na lista de ignoradas."
             )
         else:
             response_text = (
                 "👀 Conta removida da lista de ignoradas\n\n"
-                f"👤 {canonical_username}\n\n"
+                f"👤 {user_contributions_link_html(canonical_username)}\n\n"
                 "As próximas edições voltarão a seguir "
                 "o fluxo normal de análise."
             )
 
         send_telegram_message(
             response_text,
-            chat_id=chat_id
+            chat_id=chat_id,
+            parse_mode="HTML"
         )
         return
 
