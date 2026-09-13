@@ -21,8 +21,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.13"
-BOT_BUILD = "2.13"
+BOT_VERSION = "2.14"
+BOT_BUILD = "2.14"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -90,8 +90,9 @@ REVISION_STATUS_INTERVAL_SECONDS = 30
 POSTED_EDIT_TRACK_SECONDS = 48 * 60 * 60
 
 # Resumo periódico dos alertas ainda pendentes no canal.
-PENDING_SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60
-PENDING_SUMMARY_MAX_ITEMS = 20
+PENDING_SUMMARY_INTERVAL_SECONDS = 60 * 60
+PENDING_SUMMARY_MAX_ITEMS = 10
+PENDING_COMMAND_PAGE_SIZE = 10
 
 # Patrulhamento: consulta em lote a cada 50s para manter a atualização
 # normalmente abaixo de 1 minuto, deixando margem para rede/API/Telegram.
@@ -694,6 +695,34 @@ def edit_telegram_message(message_id, text, parse_mode=None, reply_markup=None):
             time.sleep(5)
 
 
+def edit_telegram_message_in_chat(chat_id, message_id, text, parse_mode=None, reply_markup=None):
+    try:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+
+        response = requests.post(
+            f"{TELEGRAM_API}/editMessageText",
+            json=payload,
+            timeout=30,
+        )
+        if response.status_code == 400 and "message is not modified" in response.text.lower():
+            return True
+        response.raise_for_status()
+        data = response.json()
+        return bool(data.get("ok"))
+    except Exception as e:
+        print("⚠️ Erro ao paginar pendentes:", safe_exception(e))
+        return False
+
+
 # =========================================================
 # VERSIONAMENTO
 # =========================================================
@@ -746,7 +775,18 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.13":
+    if BOT_VERSION == "2.14":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🕒 Gestão de avisos pendentes:\n"
+            "• novo comando /pendentes, com paginação de 10 itens e ordem do mais antigo para o mais recente;\n"
+            "• a navegação edita a mesma mensagem, evitando poluição do canal;\n"
+            "• o resumo automático passa a ser horário e mostra apenas os 10 pendentes de maior prioridade;\n"
+            "• a prioridade usa score final e risco de reversão quando disponíveis, com o mais antigo como desempate;\n"
+            "• alertas de contas observadas e páginas vigiadas continuam visíveis em /pendentes, mas não recebem prioridade artificial sem avaliação de risco."
+        )
+    elif BOT_VERSION == "2.13":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -3074,6 +3114,11 @@ def register_posted_edit(item, telegram_message):
             if isinstance(item.get("stats_payload"), dict)
             else None
         ),
+        "final_score": (
+            item.get("stats_payload", {}).get("score")
+            if isinstance(item.get("stats_payload"), dict)
+            else None
+        ),
         "message_id": message_id,
         "base_message": item.get("message", ""),
         "parse_mode": item.get("parse_mode"),
@@ -4140,8 +4185,55 @@ def get_pending_posted_edits():
             if not item.get("status")
             and now - float(item.get("posted_at", 0)) <= POSTED_EDIT_TRACK_SECONDS
         ]
-    items.sort(key=lambda item: float(item.get("posted_at", 0)), reverse=True)
+    # Visão geral padrão: cronológica, do mais antigo para o mais recente.
+    items.sort(key=lambda item: float(item.get("posted_at", 0)))
     return items
+
+
+def detection_score_map():
+    """Mapa revision_id -> (score final, revert risk) para compatibilidade
+    com alertas antigos que ainda não têm final_score salvo em posted_edits."""
+    result = {}
+    with detection_stats_lock:
+        for item in detection_stats.get("records", []):
+            try:
+                rid = int(item.get("revision_id"))
+            except Exception:
+                continue
+            result[rid] = (
+                item.get("score"),
+                item.get("revert_risk"),
+            )
+    return result
+
+
+def pending_item_risk_values(item, score_map=None):
+    score = item.get("final_score")
+    risk = item.get("revert_risk")
+
+    try:
+        rid = int(item.get("revision_id"))
+    except Exception:
+        rid = None
+
+    if score_map is not None and rid in score_map:
+        old_score, old_risk = score_map[rid]
+        if score is None:
+            score = old_score
+        if risk is None:
+            risk = old_risk
+
+    try:
+        score = float(score) if score is not None else None
+    except Exception:
+        score = None
+
+    try:
+        risk = float(risk) if risk is not None else None
+    except Exception:
+        risk = None
+
+    return score, risk
 
 
 def pending_summary_signature(items):
@@ -4156,34 +4248,119 @@ def pending_summary_signature(items):
     return "|".join(values)
 
 
+def pending_kind_label(item):
+    kind = str(item.get("alert_kind") or "normal")
+    if kind == "observed":
+        return " · 👤 conta observada"
+    if kind == "watched":
+        return " · 👁 página vigiada"
+    return ""
+
+
+def pending_item_html(item, number=None, score_map=None):
+    link = telegram_post_url(item.get("message_id"))
+    if not link:
+        return None
+
+    title = html.escape(str(item.get("title") or "Sem título"))
+    username = html.escape(str(item.get("username") or "Desconhecido"))
+    age = format_age(float(item.get("posted_at", 0) or 0))
+    score, risk = pending_item_risk_values(item, score_map)
+
+    prefix = f"{number}. " if number is not None else "• "
+    line1 = f'{prefix}<b>{title}</b> — {username}{pending_kind_label(item)}'
+
+    details = []
+    if risk is not None:
+        details.append(f"🤖 Risco de reversão: {risk:.0%}")
+    if score is not None and (risk is None or abs(score - risk) >= 0.005):
+        details.append(f"🎯 Score: {score:.0%}")
+    details.append(f"⏳ {age}")
+    line2 = " · ".join(details)
+    line3 = f'🔗 <a href="{html.escape(link, quote=True)}">Ver aviso</a>'
+
+    return f"{line1}\n{line2}\n{line3}"
+
+
+def build_pending_page(items, page=0):
+    total = len(items)
+    if total == 0:
+        return "🕒 <b>Avisos pendentes</b>\n\n✅ Nenhum aviso pendente.", None
+
+    pages = max(1, (total + PENDING_COMMAND_PAGE_SIZE - 1) // PENDING_COMMAND_PAGE_SIZE)
+    page = max(0, min(int(page), pages - 1))
+    start = page * PENDING_COMMAND_PAGE_SIZE
+    visible = items[start:start + PENDING_COMMAND_PAGE_SIZE]
+    score_map = detection_score_map()
+
+    blocks = []
+    for offset, item in enumerate(visible, start=start + 1):
+        rendered = pending_item_html(item, number=offset, score_map=score_map)
+        if rendered:
+            blocks.append(rendered)
+
+    text = (
+        "🕒 <b>Avisos pendentes</b>\n"
+        "Ordem: mais antigo → mais recente\n\n"
+        + "\n\n".join(blocks)
+        + f"\n\n📄 Página {page + 1}/{pages} · {total} avisos pendentes"
+    )
+
+    buttons = []
+    row = []
+    if page > 0:
+        row.append({"text": "◀️ Anterior", "callback_data": f"pend:{page - 1}"})
+    if page < pages - 1:
+        row.append({"text": "Próxima ▶️", "callback_data": f"pend:{page + 1}"})
+    if row:
+        buttons.append(row)
+
+    markup = {"inline_keyboard": buttons} if buttons else None
+    return text, markup
+
+
+def prioritized_pending_items(items):
+    score_map = detection_score_map()
+
+    def key(item):
+        score, risk = pending_item_risk_values(item, score_map)
+        has_detector_value = score is not None or risk is not None
+        return (
+            0 if has_detector_value else 1,
+            -(score if score is not None else -1),
+            -(risk if risk is not None else -1),
+            float(item.get("posted_at", 0)),
+        )
+
+    return sorted(items, key=key)
+
+
 def build_pending_summary_message(items):
     total = len(items)
-    visible = items[:PENDING_SUMMARY_MAX_ITEMS]
-    lines = []
-    for item in visible:
-        link = telegram_post_url(item.get("message_id"))
-        if not link:
-            continue
-        title = str(item.get("title") or "Sem título")
-        username = str(item.get("username") or "Desconhecido")
-        label = html.escape(f"{title} — {username}")
-        lines.append(f'• <a href="{html.escape(link, quote=True)}">{label}</a>')
-    if not lines:
+    prioritized = prioritized_pending_items(items)
+    visible = prioritized[:PENDING_SUMMARY_MAX_ITEMS]
+    score_map = detection_score_map()
+
+    blocks = []
+    for number, item in enumerate(visible, start=1):
+        rendered = pending_item_html(item, number=number, score_map=score_map)
+        if rendered:
+            blocks.append(rendered)
+
+    if not blocks:
         return None
-    extra = total - len(visible)
-    extra_line = f"\n\n➕ {extra} outros alertas pendentes." if extra > 0 else ""
-    plural = "s" if total != 1 else ""
+
     return (
-        "🕒 <b>Alertas ainda pendentes</b>\n\n"
-        f"🚨 {total} alerta{plural} ainda sem reversão ou patrulhamento:\n\n"
-        + "\n".join(lines)
-        + extra_line
-        + "\n\n⏳ Considerados apenas alertas das últimas 48h."
+        "⚠️ <b>Avisos pendentes prioritários</b>\n"
+        "Ordem: maior prioridade de risco\n\n"
+        + "\n\n".join(blocks)
+        + f"\n\n📊 <b>{total} avisos pendentes no total</b>"
+        + f"\nExibindo os {len(blocks)} de maior prioridade."
     )
 
 
 def pending_alerts_summary_scheduler():
-    print("✅ Resumo de pendências: a cada 2 horas, até 20 links, janela de 48h.")
+    print("✅ Resumo de pendências: a cada 1 hora, top 10 por prioridade, janela de 48h.")
     with pending_summary_lock:
         never_sent = not pending_summary_state.get("last_sent_at")
     if never_sent:
@@ -4193,6 +4370,7 @@ def pending_alerts_summary_scheduler():
             save_pending_summary_state()
         except Exception:
             pass
+
     while True:
         time.sleep(60)
         try:
@@ -4200,8 +4378,10 @@ def pending_alerts_summary_scheduler():
             with pending_summary_lock:
                 last_sent_at = float(pending_summary_state.get("last_sent_at", 0) or 0)
                 last_signature = str(pending_summary_state.get("last_signature", "") or "")
+
             if now - last_sent_at < PENDING_SUMMARY_INTERVAL_SECONDS:
                 continue
+
             items = get_pending_posted_edits()
             if not items:
                 with pending_summary_lock:
@@ -4209,6 +4389,8 @@ def pending_alerts_summary_scheduler():
                     pending_summary_state["last_signature"] = ""
                 save_pending_summary_state()
                 continue
+
+            # Assinatura da fila inteira. Se nada mudou, não repete o resumo.
             signature = pending_summary_signature(items)
             if signature == last_signature:
                 with pending_summary_lock:
@@ -4216,20 +4398,35 @@ def pending_alerts_summary_scheduler():
                 save_pending_summary_state()
                 print("ℹ️ Resumo de pendências não publicado: lista inalterada.")
                 continue
+
             message = build_pending_summary_message(items)
             if not message:
-                print("⚠️ Não foi possível montar links públicos para o resumo de pendências.")
                 with pending_summary_lock:
                     pending_summary_state["last_sent_at"] = now
                 save_pending_summary_state()
                 continue
-            result = send_telegram_message(message, parse_mode="HTML")
+
+            result = send_telegram_message(
+                message,
+                parse_mode="HTML",
+                reply_markup={
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "📋 Ver todos os pendentes",
+                                "callback_data": "pend:0",
+                            }
+                        ]
+                    ]
+                },
+            )
             if result:
                 with pending_summary_lock:
                     pending_summary_state["last_sent_at"] = now
                     pending_summary_state["last_signature"] = signature
                 save_pending_summary_state()
-                print("✅ Resumo de pendências publicado:", len(items), "alertas.")
+                print("✅ Resumo prioritário de pendências publicado:", len(items), "alertas.")
+
         except Exception as e:
             print("⚠️ Erro no resumo de pendências:", safe_exception(e))
 
@@ -6598,6 +6795,17 @@ def process_telegram_command(message, from_channel=False):
         )
         return
 
+    if command == "/pendentes":
+        items = get_pending_posted_edits()
+        pending_text, pending_markup = build_pending_page(items, page=0)
+        send_telegram_message(
+            pending_text,
+            chat_id=chat_id,
+            parse_mode="HTML",
+            reply_markup=pending_markup,
+        )
+        return
+
     if command == "/status":
         cleanup_expired_observations()
         cleanup_expired_temporary_watches()
@@ -6734,8 +6942,8 @@ def process_telegram_command(message, from_channel=False):
                 f"{tracked_count}\n"
                 f"🕒 Alertas pendentes: "
                 f"{pending_count}\n"
-                f"📌 Resumo de pendências: a cada 2h "
-                f"(máx. 20 links, 48h)\n"
+                f"📌 Resumo prioritário: a cada 1h "
+                f"(top 10, 48h)\n"
                 f"📊 Registros estatísticos (90d): "
                 f"{stats_count}\n"
                 f"🕗 Relatório diário: 20:05 (Brasília)\n"
@@ -7558,6 +7766,40 @@ def process_edit_action_callback(callback):
     callback_id = callback.get("id")
     data = callback.get("data", "")
 
+    if data.startswith("pend:"):
+        callback_message = callback.get("message") or {}
+        callback_chat = callback_message.get("chat") or {}
+        clicker = callback.get("from") or {}
+        clicker_id = clicker.get("id")
+
+        if is_target_channel(callback_chat):
+            if not clicker_id or not telegram_user_is_channel_admin(clicker_id):
+                answer_callback_query(
+                    callback_id,
+                    "Apenas administradores do canal podem navegar nesta lista."
+                )
+                return
+
+        try:
+            page = int(data.split(":", 1)[1])
+        except Exception:
+            page = 0
+
+        items = get_pending_posted_edits()
+        pending_text, pending_markup = build_pending_page(items, page=page)
+        ok = edit_telegram_message_in_chat(
+            callback_chat.get("id"),
+            callback_message.get("message_id"),
+            pending_text,
+            parse_mode="HTML",
+            reply_markup=pending_markup,
+        )
+        answer_callback_query(
+            callback_id,
+            "Página atualizada." if ok else "Não foi possível atualizar a página."
+        )
+        return
+
     if data.startswith("act:"):
         process_reversible_action_callback(
             callback,
@@ -8090,8 +8332,8 @@ def main():
         "🗃 Histórico estatístico: 90 dias"
     )
     print(
-        "🕒 Resumo de pendências: a cada 2 horas, "
-        "máx. 20 links, janela de 48h"
+        "🕒 Resumo prioritário: a cada 1 hora, "
+        "top 10 por risco, janela de 48h"
     )
 
     threads = [
