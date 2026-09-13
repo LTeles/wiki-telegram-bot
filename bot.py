@@ -20,8 +20,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.9"
-BOT_BUILD = "2.9"
+BOT_VERSION = "2.10"
+BOT_BUILD = "2.10"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -445,9 +445,14 @@ def is_target_channel(chat):
     return str(chat_id) == str(TELEGRAM_CHANNEL)
 
 
-def safe_exception(error):
-    """Retorna erro apropriado para log sem expor credenciais."""
-    text = repr(error)
+def safe_log_text(value, max_length=1200):
+    """Sanitiza texto antes de gravá-lo em logs.
+
+    Remove credenciais conhecidas, caracteres de controle que poderiam
+    falsificar/quebrar linhas de log e limita o tamanho para evitar que
+    respostas externas causem flooding nos logs.
+    """
+    text = str(value)
 
     secrets = [
         TELEGRAM_TOKEN,
@@ -458,14 +463,27 @@ def safe_exception(error):
         if secret:
             text = text.replace(str(secret), "***REDACTED***")
 
-    # O token do Telegram faz parte da própria URL da Bot API.
     if TELEGRAM_TOKEN:
         text = text.replace(
             f"/bot{TELEGRAM_TOKEN}/",
             "/bot***REDACTED***/",
         )
 
+    # Preserva tabulação e espaço, mas neutraliza CR/LF e outros controles.
+    text = "".join(
+        ch if (ch == "\t" or ord(ch) >= 32) else " "
+        for ch in text
+    )
+
+    if len(text) > max_length:
+        text = text[:max_length] + "…[truncado]"
+
     return text
+
+
+def safe_exception(error):
+    """Retorna exceção apropriada para log sem expor credenciais."""
+    return safe_log_text(repr(error))
 
 
 # =========================================================
@@ -557,7 +575,7 @@ def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None
                 print(
                     "❌ Telegram rejeitou mensagem:",
                     response.status_code,
-                    response.text
+                    safe_log_text(response.text)
                 )
                 return None
 
@@ -570,7 +588,7 @@ def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None
             data = response.json()
 
             if not data.get("ok"):
-                print("❌ Telegram retornou erro:", data)
+                print("❌ Telegram retornou erro:", safe_log_text(data))
                 return None
 
             return data.get("result")
@@ -631,7 +649,7 @@ def edit_telegram_message(message_id, text, parse_mode=None, reply_markup=None):
                     "⚠️ Telegram não permitiu editar mensagem:",
                     message_id,
                     response.status_code,
-                    response.text
+                    safe_log_text(response.text)
                 )
                 return False
 
@@ -699,7 +717,17 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.9":
+    if BOT_VERSION == "2.10":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🔐 Auditoria de segurança:\n"
+            "• campos externos usados em HTML foram revisados e links passam por escape consistente;\n"
+            "• comandos que alteram estado ganharam uma barreira central de autorização;\n"
+            "• logs externos são sanitizados, truncados e têm credenciais ocultadas;\n"
+            "• confirmações de botões são limitadas para evitar erros com títulos muito longos."
+        )
+    elif BOT_VERSION == "2.9":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -1787,7 +1815,7 @@ def format_abuse_filter_message(entry, watched_info):
     log_url = abuse_filter_log_url(log_id)
 
     header = (
-        f'🛡 <a href="{html.escape(filter_url)}">'
+        f'🛡 <a href="{html.escape(filter_url, quote=True)}">'
         f"Filtro de abusos {html.escape(str(filter_id))}</a> "
         "acionado"
     )
@@ -1808,7 +1836,7 @@ def format_abuse_filter_message(entry, watched_info):
         f"📝 Página: {html.escape(str(title))}\n"
         f"⚙️ Ação: {html.escape(str(action))}\n"
         f"🚨 Resultado: {html.escape(str(result))}\n\n"
-        f'🔗 <a href="{html.escape(log_url)}">'
+        f'🔗 <a href="{html.escape(log_url, quote=True)}">'
         "Registro do filtro</a>"
     )
 
@@ -4267,7 +4295,7 @@ def build_account_message(username):
     )
 
     message = (
-        f'👤 <a href="{user_url}">'
+        f'👤 <a href="{html.escape(user_url, quote=True)}">'
         f"{html.escape(username)}</a>\n\n"
         f"✏️ Edições na Wikipédia em português: "
         f"{editcount}\n"
@@ -4552,7 +4580,7 @@ def format_block_burst_message():
         "Mais de 5 bloqueios ou reaplicações de bloqueio foram "
         "efetuados neste minuto. Para evitar flooding, os alertas "
         "individuais adicionais foram suprimidos.\n\n"
-        f'🔗 <a href="{url}">Ver registro de bloqueios</a>'
+        f'🔗 <a href="{html.escape(url, quote=True)}">Ver registro de bloqueios</a>'
     )
 
 
@@ -4683,7 +4711,7 @@ def format_block_message(event, change):
 
     return (
         f"{heading}\n\n"
-        f'👤 <a href="{target_url}">'
+        f'👤 <a href="{html.escape(target_url, quote=True)}">'
         f"{html.escape(target)}</a>\n"
         f"📌 Motivo: {html.escape(reason)}\n"
         f"⏳ Duração: {html.escape(duration)}\n"
@@ -4828,7 +4856,7 @@ def format_protection_burst_message():
         "Mais de 5 proteções ou alterações de proteção foram "
         "efetuadas neste minuto. Para evitar flooding, os alertas "
         "individuais adicionais foram suprimidos.\n\n"
-        f'🔗 <a href="{url}">Ver registro de proteções</a>'
+        f'🔗 <a href="{html.escape(url, quote=True)}">Ver registro de proteções</a>'
     )
 
 
@@ -4996,7 +5024,7 @@ def format_protection_message(event, change):
         heading,
         "",
         (
-            f'📝 <a href="{protection_log_url(title)}">'
+            f'📝 <a href="{html.escape(protection_log_url(title), quote=True)}">'
             f"{html.escape(title)}</a>"
         ),
         f"🛡 Administrador: {html.escape(protector)}",
@@ -5839,6 +5867,29 @@ def process_telegram_command(message, from_channel=False):
         if remaining
         else ""
     )
+
+    # Barreira central para comandos que alteram estado. As verificações
+    # específicas existentes em cada comando permanecem como defesa em
+    # profundidade, mas um novo caminho não deve conseguir contorná-las.
+    mutating_commands = {
+        "/observar",
+        "/desobservar",
+        "/ignorar",
+        "/designorar",
+        "/vigiar",
+        "/desvigiar",
+        "/vigiarfiltro",
+        "/desvigiarfiltro",
+    }
+
+    if command in mutating_commands and (
+        not from_channel or not is_target_channel(chat)
+    ):
+        send_telegram_message(
+            "⚠️ Este comando administrativo deve ser publicado diretamente no canal configurado.",
+            chat_id=chat_id,
+        )
+        return
 
     if command == "/start":
         send_telegram_message(
@@ -6686,7 +6737,9 @@ def process_telegram_command(message, from_channel=False):
 def answer_callback_query(callback_query_id, text=None):
     payload = {"callback_query_id": callback_query_id}
     if text:
-        payload["text"] = text
+        # Evita falha 400 caso título/nome vindo da Wikipédia torne a
+        # confirmação maior que o limite aceito pelo Telegram.
+        payload["text"] = safe_log_text(text, max_length=180)
     try:
         requests.post(
             f"{TELEGRAM_API}/answerCallbackQuery",
@@ -6894,7 +6947,7 @@ def telegram_command_listener():
                 print("❌ TELEGRAM 409 CONFLICT")
                 print(
                     "Resposta Telegram:",
-                    response.text
+                    safe_log_text(response.text)
                 )
                 time.sleep(30)
                 continue
