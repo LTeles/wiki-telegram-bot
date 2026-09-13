@@ -21,7 +21,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.7"
-BOT_BUILD = "2.7"
+BOT_BUILD = "2.7-r2"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -5355,6 +5355,21 @@ def tracked_edit_reply_markup(revision_id, alert_kind="normal"):
         ]
         return {"inline_keyboard": rows}
 
+    # Em alertas de uma página já vigiada, não oferecemos "Vigiar página"
+    # novamente. Mantemos a possibilidade de observar a conta e desvigiar.
+    if alert_kind == "watched":
+        rows = [
+            [{
+                "text": "🔎 Observar conta (6h)",
+                "callback_data": f"observe:{revision_id}",
+            }],
+            [{
+                "text": "🙈 Desvigiar",
+                "callback_data": f"unwatch:{revision_id}",
+            }],
+        ]
+        return {"inline_keyboard": rows}
+
     rows = [
         [{
             "text": "🔎 Observar conta (6h)",
@@ -5365,12 +5380,6 @@ def tracked_edit_reply_markup(revision_id, alert_kind="normal"):
             "callback_data": f"watch:{revision_id}",
         }],
     ]
-
-    if alert_kind == "watched":
-        rows.append([{
-            "text": "🙈 Desvigiar",
-            "callback_data": f"unwatch:{revision_id}",
-        }])
 
     return {"inline_keyboard": rows}
 
