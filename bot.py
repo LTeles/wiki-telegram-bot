@@ -20,8 +20,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.11"
-BOT_BUILD = "2.11-r2"
+BOT_VERSION = "2.12"
+BOT_BUILD = "2.12"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -120,6 +120,11 @@ OBSERVED_USERS_FILE = os.environ.get(
     "/data/observed_users.json"
 )
 
+POST_BLOCK_OBSERVATIONS_FILE = os.environ.get(
+    "POST_BLOCK_OBSERVATIONS_FILE",
+    "/data/post_block_observations.json"
+)
+
 TEMP_WATCHLIST_FILE = os.environ.get(
     "TEMP_WATCHLIST_FILE",
     "/data/temporary_watchlist.json"
@@ -175,6 +180,13 @@ temporary_watchlist_persist_lock = threading.Lock()
 observed_users = {}
 observed_users_lock = threading.Lock()
 observed_users_persist_lock = threading.Lock()
+
+# Observações automáticas agendadas para começar quando um bloqueio
+# temporário terminar. Persistidas separadamente para sobreviver a
+# reinicializações/redeploys.
+post_block_observations = {}
+post_block_observations_lock = threading.Lock()
+post_block_observations_persist_lock = threading.Lock()
 
 ignored_users = {}
 ignored_users_lock = threading.Lock()
@@ -308,6 +320,7 @@ def ensure_storage():
     files = [
         WATCHLIST_FILE,
         OBSERVED_USERS_FILE,
+        POST_BLOCK_OBSERVATIONS_FILE,
         TEMP_WATCHLIST_FILE,
         IGNORED_USERS_FILE,
         BOT_VERSION_FILE,
@@ -343,6 +356,7 @@ def ensure_storage():
         print("✅ Armazenamento gravável.")
         print("📁 Watchlist:", WATCHLIST_FILE)
         print("📁 Contas observadas:", OBSERVED_USERS_FILE)
+        print("📁 Observações pós-bloqueio:", POST_BLOCK_OBSERVATIONS_FILE)
         print("📁 Vigilância temporária:", TEMP_WATCHLIST_FILE)
         print("📁 Contas ignoradas:", IGNORED_USERS_FILE)
         print("📁 Filtros de abuso:", ABUSE_FILTERS_FILE)
@@ -717,7 +731,18 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.11":
+    if BOT_VERSION == "2.12":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🔎 Observação automática pós-bloqueio:\n"
+            "• contas registradas bloqueadas temporariamente entram automaticamente em observação por 6 horas após o fim do bloqueio;\n"
+            "• desbloqueio antecipado inicia a observação imediatamente;\n"
+            "• rebloqueio atualiza o horário programado;\n"
+            "• IPs/faixas e bloqueios indefinidos ficam fora da automação;\n"
+            "• agendamentos são persistidos em /data."
+        )
+    elif BOT_VERSION == "2.11":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -1237,6 +1262,252 @@ def get_observation(username):
         )
 
         return dict(item) if item else None
+
+
+# =========================================================
+# OBSERVAÇÃO AUTOMÁTICA APÓS BLOQUEIO
+# =========================================================
+
+def save_post_block_observations():
+    with post_block_observations_persist_lock:
+        with post_block_observations_lock:
+            data = list(post_block_observations.values())
+
+        atomic_write_json(
+            POST_BLOCK_OBSERVATIONS_FILE,
+            data
+        )
+
+
+def load_post_block_observations():
+    global post_block_observations
+
+    data = load_json(
+        POST_BLOCK_OBSERVATIONS_FILE,
+        []
+    )
+
+    if not isinstance(data, list):
+        print("❌ Formato inválido de post_block_observations.json")
+        return
+
+    loaded = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        username = str(item.get("username") or "").strip()
+        starts_at = item.get("starts_at")
+
+        try:
+            starts_at = float(starts_at)
+        except (TypeError, ValueError):
+            continue
+
+        if not username:
+            continue
+
+        loaded[username_key(username)] = {
+            "username": username,
+            "starts_at": starts_at,
+            "scheduled_at": float(item.get("scheduled_at") or time.time()),
+            "source": "block",
+        }
+
+    with post_block_observations_lock:
+        post_block_observations = loaded
+
+    print(
+        "✅ Observações pós-bloqueio carregadas:",
+        len(loaded)
+    )
+
+
+def block_expiry_timestamp(event, fallback_change=None):
+    candidates = []
+
+    params = event.get("params", {})
+    if isinstance(params, dict):
+        candidates.append(params.get("expiry"))
+
+    if fallback_change:
+        stream_params = fallback_change.get("log_params", {})
+        if isinstance(stream_params, dict):
+            candidates.append(stream_params.get("expiry"))
+
+    for expiry in candidates:
+        if expiry is None:
+            continue
+
+        expiry_text = str(expiry).strip()
+        if not expiry_text:
+            continue
+
+        if expiry_text.casefold() in (
+            "infinite",
+            "infinity",
+            "indefinite",
+            "indefinitely",
+            "never",
+        ):
+            return None
+
+        try:
+            return datetime.fromisoformat(
+                expiry_text.replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:
+            continue
+
+    return None
+
+
+def schedule_post_block_observation(username, starts_at):
+    if not username or is_ip_address(username):
+        return False
+
+    key = username_key(username)
+    item = {
+        "username": username,
+        "starts_at": float(starts_at),
+        "scheduled_at": time.time(),
+        "source": "block",
+    }
+
+    with post_block_observations_lock:
+        previous = post_block_observations.get(key)
+        post_block_observations[key] = item
+
+    try:
+        save_post_block_observations()
+        return True
+    except Exception as e:
+        print(
+            "❌ Erro ao salvar observação pós-bloqueio:",
+            safe_exception(e)
+        )
+        with post_block_observations_lock:
+            if previous is None:
+                post_block_observations.pop(key, None)
+            else:
+                post_block_observations[key] = previous
+        return False
+
+
+def cancel_post_block_observation(username):
+    key = username_key(username)
+
+    with post_block_observations_lock:
+        previous = post_block_observations.pop(key, None)
+
+    if previous is None:
+        return None
+
+    try:
+        save_post_block_observations()
+    except Exception as e:
+        print(
+            "⚠️ Erro ao persistir cancelamento pós-bloqueio:",
+            safe_exception(e)
+        )
+
+    return previous
+
+
+def start_automatic_observation(username, reason):
+    if not username or is_ip_address(username):
+        return False
+
+    if not observe_user(username, reason):
+        return False
+
+    telegram_queue.put({
+        "message": (
+            "🔎 Observação automática iniciada\n\n"
+            f"👤 {user_contributions_link_html(username)}\n"
+            "⏳ Duração: 6 horas\n"
+            f"📌 Motivo: {html.escape(reason)}"
+        ),
+        "title": "Observação automática",
+        "parse_mode": "HTML",
+    })
+
+    print(
+        "🔎 Observação automática iniciada:",
+        username,
+        "|",
+        reason
+    )
+    return True
+
+
+def activate_due_post_block_observations():
+    now = time.time()
+
+    with post_block_observations_lock:
+        due = [
+            dict(item)
+            for item in post_block_observations.values()
+            if float(item.get("starts_at") or 0) <= now
+        ]
+
+    for item in due:
+        username = item.get("username")
+        if not username:
+            continue
+
+        # Remove primeiro do agendamento. Se a ativação falhar, o item é
+        # recolocado para nova tentativa no próximo ciclo.
+        removed = cancel_post_block_observation(username)
+        if removed is None:
+            continue
+
+        if not start_automatic_observation(
+            username,
+            "término de bloqueio"
+        ):
+            schedule_post_block_observation(
+                username,
+                now + 60
+            )
+
+
+def post_block_observation_scheduler():
+    print("✅ Agendador de observação pós-bloqueio iniciado.")
+
+    while True:
+        try:
+            activate_due_post_block_observations()
+        except Exception as e:
+            print(
+                "⚠️ Erro no agendador pós-bloqueio:",
+                safe_exception(e)
+            )
+
+        time.sleep(15)
+
+
+def handle_unblock_for_observation(change):
+    target = extract_block_target(
+        change.get("title") or ""
+    )
+
+    if not target or target == "Desconhecido":
+        return
+
+    if is_ip_address(target):
+        return
+
+    scheduled = cancel_post_block_observation(target)
+
+    # Só inicia automaticamente no desbloqueio se havia uma observação
+    # pós-bloqueio programada para aquela conta. Assim, desbloqueios de
+    # contas que nunca entraram nessa automação não criam observações.
+    if scheduled:
+        start_automatic_observation(
+            scheduled.get("username") or target,
+            "desbloqueio antecipado"
+        )
 
 
 # =========================================================
@@ -4717,6 +4988,13 @@ def format_block_message(event, change):
 
     target_url = block_log_url(target)
 
+    automatic_line = ""
+    if event.get("_post_block_observation_scheduled"):
+        automatic_line = (
+            "\n\n🔎 Observação automática programada\n"
+            "A conta será observada por 6 horas após o término do bloqueio."
+        )
+
     return (
         f"{heading}\n\n"
         f'👤 <a href="{html.escape(target_url, quote=True)}">'
@@ -4725,6 +5003,7 @@ def format_block_message(event, change):
         f"⏳ Duração: {html.escape(duration)}\n"
         f"🛡 Aplicado por: "
         f"{html.escape(blocker)}"
+        f"{automatic_line}"
     )
 
 
@@ -4761,6 +5040,37 @@ def block_worker():
 
             if action not in ("block", "reblock"):
                 continue
+
+            target = extract_block_target(
+                details.get("title")
+                or change.get("title")
+                or ""
+            )
+
+            expiry_at = block_expiry_timestamp(
+                details,
+                change
+            )
+
+            scheduled = False
+
+            # Apenas contas registradas. IPs/faixas e bloqueios indefinidos
+            # ficam fora da automação.
+            if (
+                target
+                and target != "Desconhecido"
+                and not is_ip_address(target)
+                and expiry_at is not None
+            ):
+                canonical_target = normalize_username(target)
+
+                if canonical_target:
+                    scheduled = schedule_post_block_observation(
+                        canonical_target,
+                        expiry_at
+                    )
+
+            details["_post_block_observation_scheduled"] = scheduled
 
             telegram_queue.put(
                 {
@@ -7166,6 +7476,8 @@ def wikimedia_loop():
                             "reblock"
                         ):
                             handle_block_event(change)
+                        elif action == "unblock":
+                            handle_unblock_for_observation(change)
 
                     elif log_type == "protect":
                         # Registra somente proteção e alteração de uma
@@ -7261,6 +7573,7 @@ def main():
     load_watchlist()
     load_temporary_watchlist()
     load_observed_users()
+    load_post_block_observations()
     load_ignored_users()
     load_abuse_filters()
     load_abuse_filter_state()
@@ -7269,6 +7582,7 @@ def main():
     load_pending_summary_state()
 
     cleanup_expired_observations()
+    activate_due_post_block_observations()
     cleanup_expired_temporary_watches()
     cleanup_expired_ignored_users()
     cleanup_posted_edits()
@@ -7295,6 +7609,7 @@ def main():
     print("👁 Vigilância temporária de página: 6 horas")
     print("🙈 Ignorar conta: 6 horas")
     print("🔒 Monitor de bloqueios: ativo")
+    print("🔎 Observação automática pós-bloqueio: ativa")
     print("🛡️ Monitor de proteção de páginas: ativo")
     print(
         "🛡 Monitor de filtros de abuso: ativo"
@@ -7331,6 +7646,7 @@ def main():
         ("telegram-sender", telegram_sender),
         ("analysis-worker", analysis_worker),
         ("block-worker", block_worker),
+        ("post-block-observation", post_block_observation_scheduler),
         ("protection-worker", protection_worker),
         ("page-deletion-worker", page_deletion_worker),
         ("eventstream-watchdog", eventstream_watchdog),
