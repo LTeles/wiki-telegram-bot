@@ -21,7 +21,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.12"
-BOT_BUILD = "2.12"
+BOT_BUILD = "2.12-r2"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -5775,10 +5775,14 @@ def build_diff_url(change):
 
 
 def user_contributions_url(username):
-    encoded_username = quote(str(username or "").replace(" ", "_"), safe="")
+    encoded_username = quote(
+        str(username or "").replace("_", " ").strip(),
+        safe=""
+    )
     return (
-        "https://pt.wikipedia.org/wiki/"
-        f"Especial:Contribuições/{encoded_username}"
+        "https://pt.wikipedia.org/w/index.php"
+        "?title=Especial%3AContribui%C3%A7%C3%B5es"
+        f"&target={encoded_username}"
     )
 
 
