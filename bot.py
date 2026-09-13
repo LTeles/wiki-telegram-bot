@@ -21,8 +21,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.15"
-BOT_BUILD = "2.15-r3"
+BOT_VERSION = "2.16"
+BOT_BUILD = "2.16"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -777,7 +777,18 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.15":
+    if BOT_VERSION == "2.16":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🧩 Redução de falsos positivos:\n"
+            "• alterações técnicas mínimas passam a receber um redutor conservador no score final;\n"
+            "• mudanças isoladas e plausíveis de dimensão de imagem, como 250px → 270px, recebem redutor forte;\n"
+            "• pequenas alterações numéricas em parâmetros técnicos também podem receber redutor;\n"
+            "• o benefício não é aplicado quando há linguagem ofensiva, repetição anormal, remoção destrutiva ou texto sem sentido;\n"
+            "• os limiares globais de 25% para triagem e 45% para publicação permanecem inalterados."
+        )
+    elif BOT_VERSION == "2.15":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -6485,6 +6496,106 @@ def nonsense_score(text):
     return 0.0
 
 
+def normalized_diff_lines(value):
+    lines = []
+    for raw in str(value or "").splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def benign_technical_change(diff):
+    """
+    Reconhece alterações técnicas mínimas e de baixo risco.
+
+    Nesta primeira versão o redutor é deliberadamente conservador:
+    - poucas linhas alteradas;
+    - pouca diferença textual;
+    - nenhuma heurística forte de vandalismo;
+    - mudança isolada de dimensão em px ou pequena alteração numérica
+      dentro de um parâmetro de predefinição/infobox.
+
+    O objetivo é reduzir falsos positivos como 250px -> 270px sem
+    transformar qualquer mudança numérica em edição automaticamente segura.
+    """
+    added = normalized_diff_lines(diff.get("added", ""))
+    removed = normalized_diff_lines(diff.get("removed", ""))
+
+    if not added or not removed:
+        return None
+
+    if len(added) > 3 or len(removed) > 3:
+        return None
+
+    added_text = "\n".join(added)
+    removed_text = "\n".join(removed)
+
+    if len(added_text) > 500 or len(removed_text) > 500:
+        return None
+
+    # Não aplica redutor quando o próprio conteúdo já contém sinal forte.
+    signals = [
+        profanity_score(added_text),
+        repetition_score(added_text),
+        destructive_score(added_text, removed_text),
+        nonsense_score(added_text),
+    ]
+    if max(signals) >= 0.75:
+        return None
+
+    def skeleton(value):
+        # Mantém a estrutura e substitui números por marcador.
+        value = value.casefold()
+        value = re.sub(r"(?<![\w])\d+(?:[.,]\d+)?(?=\s*px\b)", "<num>", value)
+        value = re.sub(r"(?<![\w])\d+(?:[.,]\d+)?(?![\w])", "<num>", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    # Caso mais seguro: uma única linha em que apenas o número mudou.
+    if len(added) == 1 and len(removed) == 1:
+        old = removed[0]
+        new = added[0]
+
+        px_old = re.search(r"(?<!\w)(\d{1,4})\s*px\b", old, flags=re.I)
+        px_new = re.search(r"(?<!\w)(\d{1,4})\s*px\b", new, flags=re.I)
+
+        if px_old and px_new and skeleton(old) == skeleton(new):
+            old_px = int(px_old.group(1))
+            new_px = int(px_new.group(1))
+
+            # Dimensões absurdas não recebem o benefício.
+            if 20 <= old_px <= 2000 and 20 <= new_px <= 2000:
+                ratio = max(old_px, new_px) / max(1, min(old_px, new_px))
+                if ratio <= 2.0:
+                    return {
+                        "factor": 0.55,
+                        "reason": "alteração técnica mínima de dimensão de imagem",
+                    }
+
+        # Pequena troca numérica isolada em parâmetro de predefinição.
+        # Exige '=' para não reduzir datas/quantidades alteradas em prosa.
+        if "=" in old and "=" in new and skeleton(old) == skeleton(new):
+            nums_old = re.findall(r"(?<!\w)\d+(?:[.,]\d+)?(?!\w)", old)
+            nums_new = re.findall(r"(?<!\w)\d+(?:[.,]\d+)?(?!\w)", new)
+
+            if len(nums_old) == 1 and len(nums_new) == 1:
+                try:
+                    a = float(nums_old[0].replace(",", "."))
+                    b = float(nums_new[0].replace(",", "."))
+                    magnitude = max(abs(a), abs(b), 1.0)
+                    relative_change = abs(a - b) / magnitude
+                except Exception:
+                    relative_change = 1.0
+
+                if relative_change <= 0.25:
+                    return {
+                        "factor": 0.70,
+                        "reason": "pequena alteração numérica em parâmetro técnico",
+                    }
+
+    return None
+
+
 def analyze_vandalism(change, diff, revert_risk):
     added = diff.get("added", "")
     removed = diff.get("removed", "")
@@ -6518,7 +6629,14 @@ def analyze_vandalism(change, diff, revert_risk):
     if strong_signals >= 2:
         score += 0.05
 
-    score = min(score, 1.0)
+    benign = benign_technical_change(diff)
+
+    # O redutor só atua quando não existe sinal heurístico forte.
+    # Ele reduz o score final, não altera o Revert Risk original registrado.
+    if benign:
+        score *= float(benign.get("factor", 1.0))
+
+    score = min(max(score, 0.0), 1.0)
 
     reasons = []
 
@@ -6551,6 +6669,11 @@ def analyze_vandalism(change, diff, revert_risk):
             "texto possivelmente sem sentido"
         )
 
+    if benign:
+        reasons.append(
+            str(benign.get("reason") or "alteração técnica mínima")
+        )
+
     if not reasons:
         reasons.append("edição suspeita")
 
@@ -6558,6 +6681,7 @@ def analyze_vandalism(change, diff, revert_risk):
         "score": score,
         "revert_risk": revert_risk,
         "reason": ", ".join(reasons),
+        "benign_reduction": benign,
     }
 
 
@@ -6874,6 +6998,16 @@ def analysis_worker():
                 "|",
                 title
             )
+
+            if result.get("benign_reduction"):
+                print(
+                    "🧩 Redutor benigno:",
+                    result["benign_reduction"].get("reason"),
+                    "| fator",
+                    result["benign_reduction"].get("factor"),
+                    "|",
+                    title
+                )
 
             if (
                 result["score"]
