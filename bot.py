@@ -20,8 +20,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.6"
-BOT_BUILD = "2.6-r4"
+BOT_VERSION = "2.7"
+BOT_BUILD = "2.7"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -699,7 +699,15 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.6":
+    if BOT_VERSION == "2.7":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🔧 Ajuste de interface:\n"
+            "• alertas de contas já observadas mostram apenas o botão ‘Desobservar’ para a conta;\n"
+            "• o botão ‘Vigiar página (6h)’ permanece disponível normalmente."
+        )
+    elif BOT_VERSION == "2.6":
         if BOT_BUILD == "2.6-r4":
             message = (
                 "✅ Bot atualizado com sucesso\n\n"
@@ -5332,6 +5340,21 @@ def edit_link_html(url):
 
 
 def tracked_edit_reply_markup(revision_id, alert_kind="normal"):
+    # Em alertas gerados por uma conta já observada, não faz sentido
+    # oferecer simultaneamente "Observar" e "Desobservar".
+    if alert_kind == "observed":
+        rows = [
+            [{
+                "text": "⛔ Desobservar",
+                "callback_data": f"unobserve:{revision_id}",
+            }],
+            [{
+                "text": "👁 Vigiar página (6h)",
+                "callback_data": f"watch:{revision_id}",
+            }],
+        ]
+        return {"inline_keyboard": rows}
+
     rows = [
         [{
             "text": "🔎 Observar conta (6h)",
@@ -5343,12 +5366,7 @@ def tracked_edit_reply_markup(revision_id, alert_kind="normal"):
         }],
     ]
 
-    if alert_kind == "observed":
-        rows.append([{
-            "text": "⛔ Desobservar",
-            "callback_data": f"unobserve:{revision_id}",
-        }])
-    elif alert_kind == "watched":
+    if alert_kind == "watched":
         rows.append([{
             "text": "🙈 Desvigiar",
             "callback_data": f"unwatch:{revision_id}",
