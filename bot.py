@@ -20,8 +20,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.8"
-BOT_BUILD = "2.8"
+BOT_VERSION = "2.9"
+BOT_BUILD = "2.9"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -699,7 +699,15 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.8":
+    if BOT_VERSION == "2.9":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🆕 Ajuste nos alertas de contas observadas:\n"
+            "• quando uma edição de conta observada é revertida, o post passa a indicar explicitamente esse contexto;\n"
+            "• o post informa também quanto tempo resta para o fim da observação."
+        )
+    elif BOT_VERSION == "2.8":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -2739,6 +2747,7 @@ def register_posted_edit(item, telegram_message):
         "base_message": item.get("message", ""),
         "parse_mode": item.get("parse_mode"),
         "reply_markup": item.get("reply_markup"),
+        "alert_kind": item.get("alert_kind", "normal"),
         "posted_at": posted_at,
         "status": None,
     }
@@ -3388,6 +3397,22 @@ def get_reverter_username(title, revision_id):
     return None
 
 
+def observation_remaining_line(username):
+    observation = get_observation(username)
+    if not observation:
+        return ""
+
+    try:
+        remaining = float(observation.get("expires_at") or 0) - time.time()
+    except Exception:
+        return ""
+
+    if remaining <= 0:
+        return ""
+
+    return f"\n⏳ Tempo restante de observação: {format_remaining(remaining)}"
+
+
 def message_with_status(record, status, reverter=None, deleter=None):
     title = html.escape(str(record.get("title") or "Sem título"))
     username = html.escape(str(record.get("username") or "Desconhecido"))
@@ -3418,6 +3443,22 @@ def message_with_status(record, status, reverter=None, deleter=None):
         reverter_line = (
             f"\nRevertido por: {html.escape(str(reverter))}" if reverter else ""
         )
+
+        if record.get("alert_kind") == "observed":
+            remaining_line = observation_remaining_line(
+                record.get("username") or ""
+            )
+            return (
+                "↩️ Edição de conta observada revertida\n\n"
+                f"📝 {title}\n"
+                f"👤 {username}\n"
+                f"💬 {comment}\n"
+                f"{risk_line}\n"
+                f"{edit_link}"
+                f"{reverter_line}"
+                f"{remaining_line}"
+            )
+
         return (
             "↩️ Possível vandalismo revertido\n\n"
             f"📝 {title}\n"
@@ -5465,6 +5506,7 @@ def tracked_queue_item(
         "edit_comment": change.get("comment") or "Sem resumo",
         "diff_url": build_diff_url(change),
         "stats_payload": stats_payload,
+        "alert_kind": alert_kind,
         "parse_mode": "HTML",
         "reply_markup": tracked_edit_reply_markup(
             revision.get("new"),
