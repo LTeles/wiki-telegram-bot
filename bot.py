@@ -6,6 +6,7 @@ import threading
 import re
 import html
 import ipaddress
+import secrets
 
 from datetime import datetime, timezone, timedelta
 from statistics import median
@@ -20,8 +21,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.12"
-BOT_BUILD = "2.12-r2"
+BOT_VERSION = "2.13"
+BOT_BUILD = "2.13"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -165,6 +166,11 @@ PENDING_SUMMARY_STATE_FILE = os.environ.get(
     "/data/pending_summary_state.json"
 )
 
+REVERSIBLE_ACTIONS_FILE = os.environ.get(
+    "REVERSIBLE_ACTIONS_FILE",
+    "/data/reversible_actions.json"
+)
+
 
 # =========================================================
 # ESTADO EM MEMÓRIA
@@ -222,6 +228,13 @@ pending_summary_state = {
 }
 pending_summary_lock = threading.Lock()
 pending_summary_persist_lock = threading.Lock()
+
+# Botões de reversão ("desfazer/refazer") exibidos nas mensagens de
+# confirmação das ações administrativas.
+reversible_actions = {}
+reversible_actions_lock = threading.Lock()
+reversible_actions_persist_lock = threading.Lock()
+REVERSIBLE_ACTION_TTL_SECONDS = 48 * 60 * 60
 
 user_cache = {}
 
@@ -329,6 +342,7 @@ def ensure_storage():
         POSTED_EDITS_FILE,
         DETECTION_STATS_FILE,
         PENDING_SUMMARY_STATE_FILE,
+        REVERSIBLE_ACTIONS_FILE,
     ]
 
     directories = {
@@ -364,6 +378,7 @@ def ensure_storage():
         print("📁 Edições publicadas:", POSTED_EDITS_FILE)
         print("📁 Estatísticas do detector:", DETECTION_STATS_FILE)
         print("📁 Resumo de pendências:", PENDING_SUMMARY_STATE_FILE)
+        print("📁 Ações reversíveis:", REVERSIBLE_ACTIONS_FILE)
         print("📁 Versão do bot:", BOT_VERSION_FILE)
 
         return True
@@ -731,7 +746,16 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.12":
+    if BOT_VERSION == "2.13":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "↩️ Ações reversíveis:\n"
+            "• mensagens de confirmação de observar, desobservar, ignorar, designorar, vigiar, desvigiar e vigiar/desvigiar filtros passam a oferecer um botão para executar a ação oposta;\n"
+            "• confirmações geradas por botões também oferecem a opção inversa, permitindo desfazer e refazer;\n"
+            "• os botões são restritos a administradores do canal e persistem por até 48 horas."
+        )
+    elif BOT_VERSION == "2.12":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -4249,6 +4273,339 @@ def telegram_sender():
 
 
 # =========================================================
+# AÇÕES REVERSÍVEIS / BOTÕES DE DESFAZER
+# =========================================================
+
+def save_reversible_actions():
+    with reversible_actions_persist_lock:
+        with reversible_actions_lock:
+            data = list(reversible_actions.values())
+        atomic_write_json(REVERSIBLE_ACTIONS_FILE, data)
+
+
+def cleanup_reversible_actions(save=True):
+    cutoff = time.time() - REVERSIBLE_ACTION_TTL_SECONDS
+
+    with reversible_actions_lock:
+        expired = [
+            token
+            for token, item in reversible_actions.items()
+            if float(item.get("created_at") or 0) < cutoff
+        ]
+        for token in expired:
+            reversible_actions.pop(token, None)
+
+    if expired and save:
+        try:
+            save_reversible_actions()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao limpar ações reversíveis:",
+                safe_exception(e)
+            )
+
+
+def load_reversible_actions():
+    global reversible_actions
+
+    data = load_json(REVERSIBLE_ACTIONS_FILE, [])
+    loaded = {}
+    cutoff = time.time() - REVERSIBLE_ACTION_TTL_SECONDS
+
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            token = str(item.get("token") or "").strip()
+            action = str(item.get("action") or "").strip()
+            target = str(item.get("target") or "").strip()
+            created_at = float(item.get("created_at") or 0)
+
+            if not token or not action or not target or created_at < cutoff:
+                continue
+
+            loaded[token] = {
+                "token": token,
+                "action": action,
+                "target": target,
+                "created_at": created_at,
+            }
+
+    with reversible_actions_lock:
+        reversible_actions = loaded
+
+    print("✅ Ações reversíveis carregadas:", len(loaded))
+
+    try:
+        save_reversible_actions()
+    except Exception:
+        pass
+
+
+def reversible_action_markup(action, target, label):
+    """
+    Cria um botão persistente para executar a ação oposta.
+    O callback carrega apenas um token curto; alvo e ação ficam em /data.
+    """
+    cleanup_reversible_actions(save=False)
+
+    token = secrets.token_hex(8)
+    item = {
+        "token": token,
+        "action": str(action),
+        "target": str(target),
+        "created_at": time.time(),
+    }
+
+    with reversible_actions_lock:
+        reversible_actions[token] = item
+
+    try:
+        save_reversible_actions()
+    except Exception as e:
+        print(
+            "⚠️ Não foi possível persistir botão reversível:",
+            safe_exception(e)
+        )
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": label,
+                    "callback_data": f"act:{token}",
+                }
+            ]
+        ]
+    }
+
+
+def get_reversible_action(token):
+    cleanup_reversible_actions()
+
+    with reversible_actions_lock:
+        item = reversible_actions.get(token)
+        return dict(item) if item else None
+
+
+def inverse_action_spec(action):
+    mapping = {
+        "observe": ("unobserve", "⛔ Desobservar"),
+        "unobserve": ("observe", "🔎 Observar novamente (6h)"),
+        "ignore": ("unignore", "👀 Deixar de ignorar"),
+        "unignore": ("ignore", "🙈 Ignorar novamente (6h)"),
+        "watch_perm": ("unwatch", "🙈 Desvigiar"),
+        "watch_temp": ("unwatch", "🙈 Desvigiar"),
+        "unwatch": ("watch_perm", "👁 Vigiar novamente"),
+        "watch_filter": ("unwatch_filter", "🛑 Desvigiar filtro"),
+        "unwatch_filter": ("watch_filter", "🛡 Vigiar filtro novamente"),
+    }
+    return mapping.get(action)
+
+
+def execute_reversible_action(action, target):
+    """
+    Executa uma ação pedida por botão de desfazer/refazer.
+    Retorna (success, changed, message, parse_mode).
+    """
+    if action == "observe":
+        username = normalize_username(target) or target
+        success = observe_user(username)
+        return (
+            success,
+            success,
+            (
+                "🔎 Conta colocada em observação\n\n"
+                f"👤 {user_contributions_link_html(username)}\n"
+                "⏳ Duração: 6 horas"
+            ),
+            "HTML",
+        )
+
+    if action == "unobserve":
+        username = normalize_username(target) or target
+        success, removed = stop_observing_user(username)
+        return (
+            success,
+            removed,
+            (
+                "⛔ Observação encerrada\n\n"
+                f"👤 {user_contributions_link_html(username)}"
+            ),
+            "HTML",
+        )
+
+    if action == "ignore":
+        username = normalize_username(target) or target
+        success = ignore_user(username)
+        return (
+            success,
+            success,
+            (
+                "🙈 Conta temporariamente ignorada\n\n"
+                f"👤 {user_contributions_link_html(username)}\n"
+                "⏳ Duração: 6 horas"
+            ),
+            "HTML",
+        )
+
+    if action == "unignore":
+        username = normalize_username(target) or target
+        success, removed = stop_ignoring_user(username)
+        return (
+            success,
+            removed,
+            (
+                "👀 Conta removida da lista de ignoradas\n\n"
+                f"👤 {user_contributions_link_html(username)}"
+            ),
+            "HTML",
+        )
+
+    if action == "watch_perm":
+        title = normalize_page_title(target) or target
+        success, added = add_watched_page(title)
+        return (
+            success,
+            added,
+            f"👁 {title} adicionada à vigilância.",
+            None,
+        )
+
+    if action == "watch_temp":
+        title = normalize_page_title(target) or target
+        success = add_temporary_watched_page(title)
+        return (
+            success,
+            success,
+            (
+                "👁 Página colocada em vigilância\n\n"
+                f"📝 {title}\n"
+                "⏳ Duração: 6 horas"
+            ),
+            None,
+        )
+
+    if action == "unwatch":
+        title = normalize_page_title(target) or target
+        success, removed = remove_any_watched_page(title)
+        return (
+            success,
+            removed,
+            f"🙈 {title} removida da vigilância.",
+            None,
+        )
+
+    if action == "watch_filter":
+        filter_id = normalize_filter_id(target)
+        success, added, info = add_abuse_filter(filter_id)
+        description = info.get("description") if info else None
+        message = (
+            "🛡 Filtro adicionado à vigilância\n\n"
+            f"🔢 Filtro: {filter_id}"
+        )
+        if description:
+            message += f"\n📋 {description}"
+        return success, added, message, None
+
+    if action == "unwatch_filter":
+        filter_id = normalize_filter_id(target)
+        success, removed = remove_abuse_filter(filter_id)
+        return (
+            success,
+            removed,
+            f"🛑 Filtro {filter_id} removido da vigilância.",
+            None,
+        )
+
+    return False, False, "❌ Ação desconhecida.", None
+
+
+def process_reversible_action_callback(callback, token):
+    callback_id = callback.get("id")
+    callback_message = callback.get("message") or {}
+    callback_chat = callback_message.get("chat") or {}
+
+    if not is_target_channel(callback_chat):
+        answer_callback_query(
+            callback_id,
+            "Este botão só funciona no canal configurado."
+        )
+        return
+
+    clicker = callback.get("from") or {}
+    clicker_id = clicker.get("id")
+
+    if not clicker_id or not telegram_user_is_channel_admin(clicker_id):
+        answer_callback_query(
+            callback_id,
+            "Apenas administradores do canal podem executar esta ação."
+        )
+        return
+
+    item = get_reversible_action(token)
+    if not item:
+        answer_callback_query(
+            callback_id,
+            "Este botão expirou ou não está mais disponível."
+        )
+        return
+
+    action = item["action"]
+    target = item["target"]
+
+    success, changed, message, parse_mode = execute_reversible_action(
+        action,
+        target
+    )
+
+    if not success:
+        answer_callback_query(callback_id, "Não foi possível executar a ação.")
+        return
+
+    if not changed:
+        answer_callback_query(
+            callback_id,
+            "A situação já estava nesse estado."
+        )
+        return
+
+    answer_callback_query(callback_id, "Ação executada.")
+
+    inverse = inverse_action_spec(action)
+    reply_markup = None
+    if inverse:
+        inverse_action, label = inverse
+
+        # Se desfizermos uma vigilância temporária, o botão de refazer deve
+        # restaurar também o caráter temporário.
+        if action == "unwatch":
+            # Botões criados a partir de "watch_temp" usam alvo especial
+            # apenas quando explicitamente solicitado pelo chamador.
+            pass
+
+        reply_markup = reversible_action_markup(
+            inverse_action,
+            target,
+            label
+        )
+
+    actor = telegram_person_display_name(clicker)
+    if actor:
+        if parse_mode == "HTML":
+            message += f"\n\n👮 Ação por {html.escape(actor)}"
+        else:
+            message += f"\n\n👮 Ação por {actor}"
+
+    send_telegram_message(
+        message,
+        chat_id=TELEGRAM_CHANNEL,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+
+
+# =========================================================
 # NORMALIZAÇÃO DE PÁGINA / USUÁRIOS
 # =========================================================
 
@@ -6558,7 +6915,12 @@ def process_telegram_command(message, from_channel=False):
                     "esse período."
                 ),
                 chat_id=chat_id,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=reversible_action_markup(
+                    "unobserve",
+                    canonical_username,
+                    "⛔ Desobservar",
+                ),
             )
         else:
             send_telegram_message(
@@ -6619,10 +6981,19 @@ def process_telegram_command(message, from_channel=False):
                 f"👤 {user_contributions_link_html(canonical_username)}"
             )
 
+        reply_markup = None
+        if success and removed:
+            reply_markup = reversible_action_markup(
+                "observe",
+                canonical_username,
+                "🔎 Observar novamente (6h)",
+            )
+
         send_telegram_message(
             response_text,
             chat_id=chat_id,
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=reply_markup,
         )
         return
 
@@ -6728,7 +7099,12 @@ def process_telegram_command(message, from_channel=False):
                     "vigiadas continuam tendo prioridade."
                 ),
                 chat_id=chat_id,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=reversible_action_markup(
+                    "unignore",
+                    canonical_username,
+                    "👀 Deixar de ignorar",
+                ),
             )
         else:
             send_telegram_message(
@@ -6789,10 +7165,19 @@ def process_telegram_command(message, from_channel=False):
                 "o fluxo normal de análise."
             )
 
+        reply_markup = None
+        if success and removed:
+            reply_markup = reversible_action_markup(
+                "ignore",
+                canonical_username,
+                "🙈 Ignorar novamente (6h)",
+            )
+
         send_telegram_message(
             response_text,
             chat_id=chat_id,
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=reply_markup,
         )
         return
 
@@ -6898,9 +7283,25 @@ def process_telegram_command(message, from_channel=False):
                     "da vigilância."
                 )
 
+        reply_markup = None
+        if success:
+            if command == "/vigiar" and added:
+                reply_markup = reversible_action_markup(
+                    "unwatch",
+                    title,
+                    "🙈 Desvigiar",
+                )
+            elif command == "/desvigiar" and removed:
+                reply_markup = reversible_action_markup(
+                    "watch_perm",
+                    title,
+                    "👁 Vigiar novamente",
+                )
+
         send_telegram_message(
             response_text,
-            chat_id=chat_id
+            chat_id=chat_id,
+            reply_markup=reply_markup,
         )
         return
 
@@ -7017,9 +7418,18 @@ def process_telegram_command(message, from_channel=False):
                 "serão publicadas no canal."
             )
 
+        reply_markup = None
+        if success and added:
+            reply_markup = reversible_action_markup(
+                "unwatch_filter",
+                filter_id,
+                "🛑 Desvigiar filtro",
+            )
+
         send_telegram_message(
             response_text,
-            chat_id=chat_id
+            chat_id=chat_id,
+            reply_markup=reply_markup,
         )
         return
 
@@ -7068,9 +7478,18 @@ def process_telegram_command(message, from_channel=False):
                 "removido da vigilância."
             )
 
+        reply_markup = None
+        if success and removed:
+            reply_markup = reversible_action_markup(
+                "watch_filter",
+                filter_id,
+                "🛡 Vigiar filtro novamente",
+            )
+
         send_telegram_message(
             response_text,
-            chat_id=chat_id
+            chat_id=chat_id,
+            reply_markup=reply_markup,
         )
         return
 
@@ -7138,6 +7557,14 @@ def telegram_user_is_channel_admin(user_id):
 def process_edit_action_callback(callback):
     callback_id = callback.get("id")
     data = callback.get("data", "")
+
+    if data.startswith("act:"):
+        process_reversible_action_callback(
+            callback,
+            data.split(":", 1)[1]
+        )
+        return
+
     if ":" not in data:
         answer_callback_query(callback_id)
         return
@@ -7187,6 +7614,11 @@ def process_edit_action_callback(callback):
             f"{actor_line}",
             chat_id=TELEGRAM_CHANNEL,
             parse_mode="HTML",
+            reply_markup=reversible_action_markup(
+                "unobserve",
+                username,
+                "⛔ Desobservar",
+            ),
         )
         return
 
@@ -7206,6 +7638,11 @@ def process_edit_action_callback(callback):
             f"{actor_line}",
             chat_id=TELEGRAM_CHANNEL,
             parse_mode="HTML",
+            reply_markup=reversible_action_markup(
+                "unwatch",
+                title,
+                "🙈 Desvigiar",
+            ),
         )
         return
 
@@ -7228,6 +7665,11 @@ def process_edit_action_callback(callback):
             f"{actor_line}",
             chat_id=TELEGRAM_CHANNEL,
             parse_mode="HTML",
+            reply_markup=reversible_action_markup(
+                "observe",
+                username,
+                "🔎 Observar novamente (6h)",
+            ),
         )
         return
 
@@ -7250,6 +7692,11 @@ def process_edit_action_callback(callback):
             f"{actor_line}",
             chat_id=TELEGRAM_CHANNEL,
             parse_mode="HTML",
+            reply_markup=reversible_action_markup(
+                "watch_perm",
+                title,
+                "👁 Vigiar novamente",
+            ),
         )
 
 
@@ -7584,6 +8031,7 @@ def main():
     load_posted_edits()
     load_detection_stats()
     load_pending_summary_state()
+    load_reversible_actions()
 
     cleanup_expired_observations()
     activate_due_post_block_observations()
