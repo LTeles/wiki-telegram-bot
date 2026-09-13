@@ -21,7 +21,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.6"
-BOT_BUILD = "2.6-r3"
+BOT_BUILD = "2.6-r4"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -700,19 +700,19 @@ def announce_new_version_if_needed():
         return
 
     if BOT_VERSION == "2.6":
-        if BOT_BUILD == "2.6-r3":
+        if BOT_BUILD == "2.6-r4":
             message = (
                 "✅ Bot atualizado com sucesso\n\n"
                 f"🤖 Versão {BOT_VERSION}\n\n"
                 "🔧 Ajuste de interface:\n"
-                "• os botões ‘Observar conta (6h)’ e ‘Vigiar pág. (6h)’ agora aparecem em linhas separadas para melhor visualização no Telegram."
+                "• os botões ‘Observar conta (6h)’ e ‘Vigiar página (6h)’ agora aparecem em linhas separadas para melhor visualização no Telegram."
             )
         elif BOT_BUILD == "2.6-r2":
             message = (
                 "✅ Bot atualizado com sucesso\n\n"
                 f"🤖 Versão {BOT_VERSION}\n\n"
                 "🔧 Ajustes:\n"
-                "• adicionado botão ‘Vigiar pág. (6h)’ aos alertas de edição;\n"
+                "• adicionado botão ‘Vigiar página (6h)’ aos alertas de edição;\n"
                 "• edições de contas observadas oferecem botão ‘Desobservar’;\n"
                 "• edições de páginas vigiadas oferecem botão ‘Desvigiar’;\n"
                 "• confirmações informam o administrador do Telegram responsável pela vigilância, desobservação ou desvigilância."
@@ -5338,7 +5338,7 @@ def tracked_edit_reply_markup(revision_id, alert_kind="normal"):
             "callback_data": f"observe:{revision_id}",
         }],
         [{
-            "text": "👁 Vigiar pág. (6h)",
+            "text": "👁 Vigiar página (6h)",
             "callback_data": f"watch:{revision_id}",
         }],
     ]
