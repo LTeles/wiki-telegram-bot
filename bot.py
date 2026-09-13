@@ -21,8 +21,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.14"
-BOT_BUILD = "2.14"
+BOT_VERSION = "2.15"
+BOT_BUILD = "2.15-r3"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -92,7 +92,9 @@ POSTED_EDIT_TRACK_SECONDS = 48 * 60 * 60
 # Resumo periódico dos alertas ainda pendentes no canal.
 PENDING_SUMMARY_INTERVAL_SECONDS = 60 * 60
 PENDING_SUMMARY_MAX_ITEMS = 10
-PENDING_COMMAND_PAGE_SIZE = 10
+PENDING_COMMAND_PAGE_SIZE = 5
+PENDING_RECONCILE_INTERVAL_SECONDS = 30 * 60
+PENDING_PAGE_BATCH_SIZE = 50
 
 # Patrulhamento: consulta em lote a cada 50s para manter a atualização
 # normalmente abaixo de 1 minuto, deixando margem para rede/API/Telegram.
@@ -775,7 +777,18 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.14":
+    if BOT_VERSION == "2.15":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🧹 Reconciliação de avisos pendentes:\n"
+            "• o bot passa a revisar periodicamente páginas associadas a avisos ainda pendentes;\n"
+            "• títulos inexistentes só são marcados como eliminados quando há confirmação no registro de eliminações da Wikipédia;\n"
+            "• eliminações perdidas durante reinicializações ou redeploys passam a ser recuperadas automaticamente;\n"
+            "• uma página eliminada deixa de constar como pendente mesmo se a mensagem antiga não puder ser editada no Telegram;\n"
+            "• novo comando /revisarpendentes permite disparar a revisão manualmente."
+        )
+    elif BOT_VERSION == "2.14":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -4051,12 +4064,98 @@ def page_title_key(title):
     return str(title or "").replace("_", " ").strip().casefold()
 
 
-def page_deletion_worker():
-    """Atualiza imediatamente alertas pendentes quando a página é eliminada.
-
-    A informação vem do mesmo EventStreams já conectado pelo bot. Portanto,
-    este recurso não acrescenta polling nem consultas periódicas à Action API.
+def mark_pending_title_deleted(title, deleter=None, deleted_at=None):
     """
+    Resolve todos os alertas pendentes de um título confirmado como eliminado.
+
+    O status persistente é atualizado mesmo se o Telegram não permitir editar
+    uma mensagem antiga. Assim, um caso já resolvido nunca continua aparecendo
+    em /pendentes apenas por falha de edição da mensagem original.
+    """
+    title = str(title or "").strip()
+    if not title:
+        return 0
+
+    title_key = page_title_key(title)
+    deleted_at = float(deleted_at or time.time())
+
+    with posted_edits_lock:
+        matches = [
+            dict(item)
+            for item in posted_edits.values()
+            if not item.get("status")
+            and page_title_key(item.get("title")) == title_key
+        ]
+
+    if not matches:
+        return 0
+
+    resolved = 0
+
+    for record in matches:
+        revision_id = int(record["revision_id"])
+
+        # Primeiro persiste a resolução lógica.
+        with posted_edits_lock:
+            live = posted_edits.get(str(revision_id))
+            if live and not live.get("status"):
+                live["status"] = "deleted"
+                live["deleted_by"] = deleter
+                live["deleted_at"] = deleted_at
+                resolved += 1
+
+        # Depois tenta refletir o estado na mensagem original.
+        status_reply_markup = record.get("reply_markup")
+        if not status_reply_markup:
+            status_reply_markup = tracked_edit_reply_markup(revision_id)
+
+        new_text = message_with_status(
+            record,
+            "deleted",
+            deleter=deleter
+        )
+
+        success = edit_telegram_message(
+            record["message_id"],
+            new_text,
+            parse_mode="HTML",
+            reply_markup=status_reply_markup
+        )
+
+        if success:
+            print(
+                "🗑️ Alerta marcado como página eliminada:",
+                revision_id,
+                "|",
+                title,
+                "| por:",
+                deleter or "não informado"
+            )
+        else:
+            print(
+                "ℹ️ Página eliminada confirmada; status removido das pendências "
+                "mesmo sem conseguir editar a mensagem Telegram:",
+                revision_id,
+                "|",
+                title
+            )
+
+        time.sleep(0.3)
+
+    if resolved:
+        try:
+            save_posted_edits()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao salvar status de página eliminada:",
+                safe_exception(e)
+            )
+
+    return resolved
+
+
+def page_deletion_worker():
+    """Atualiza alertas pendentes assim que EventStreams informa eliminação."""
     print("✅ Monitor de eliminação de páginas iniciado.")
 
     while True:
@@ -4065,77 +4164,233 @@ def page_deletion_worker():
             title = str(change.get("title") or "").strip()
             deleter = str(change.get("user") or "").strip() or None
 
-            if not title:
-                continue
-
-            title_key = page_title_key(title)
-
-            with posted_edits_lock:
-                matches = [
-                    dict(item)
-                    for item in posted_edits.values()
-                    if not item.get("status")
-                    and page_title_key(item.get("title")) == title_key
-                ]
-
-            if not matches:
-                continue
-
-            changed_any = False
-
-            for record in matches:
-                revision_id = int(record["revision_id"])
-
-                status_reply_markup = record.get("reply_markup")
-                if not status_reply_markup:
-                    status_reply_markup = tracked_edit_reply_markup(revision_id)
-
-                new_text = message_with_status(
-                    record,
-                    "deleted",
-                    deleter=deleter
+            if title:
+                mark_pending_title_deleted(
+                    title,
+                    deleter=deleter,
+                    deleted_at=time.time(),
                 )
-
-                success = edit_telegram_message(
-                    record["message_id"],
-                    new_text,
-                    parse_mode="HTML",
-                    reply_markup=status_reply_markup
-                )
-
-                if success:
-                    with posted_edits_lock:
-                        live = posted_edits.get(str(revision_id))
-                        if live and not live.get("status"):
-                            live["status"] = "deleted"
-                            live["deleted_by"] = deleter
-                            live["deleted_at"] = time.time()
-
-                    changed_any = True
-                    print(
-                        "🗑️ Alerta marcado como página eliminada:",
-                        revision_id,
-                        "|",
-                        title,
-                        "| por:",
-                        deleter or "não informado"
-                    )
-
-                time.sleep(1)
-
-            if changed_any:
-                try:
-                    save_posted_edits()
-                except Exception as e:
-                    print(
-                        "⚠️ Erro ao salvar status de página eliminada:",
-                        safe_exception(e)
-                    )
 
         except Exception as e:
             print("⚠️ Erro ao processar eliminação de página:", safe_exception(e))
         finally:
             page_deletion_queue.task_done()
+
+
+def get_missing_pending_titles(titles):
+    """
+    Consulta existência atual dos títulos em lotes.
+    Retorna apenas títulos que a API informa como inexistentes.
+    """
+    unique = []
+    seen = set()
+
+    for title in titles:
+        title = str(title or "").strip()
+        key = page_title_key(title)
+        if title and key not in seen:
+            seen.add(key)
+            unique.append(title)
+
+    missing = []
+
+    for start in range(0, len(unique), PENDING_PAGE_BATCH_SIZE):
+        batch = unique[start:start + PENDING_PAGE_BATCH_SIZE]
+
+        try:
+            response = wikimedia_session.get(
+                WIKIPEDIA_API,
+                params={
+                    "action": "query",
+                    "format": "json",
+                    "formatversion": 2,
+                    "prop": "info",
+                    "titles": "|".join(batch),
+                },
+                timeout=25,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            for page in data.get("query", {}).get("pages", []):
+                if page.get("missing") is True or "missing" in page:
+                    title = str(page.get("title") or "").strip()
+                    if title:
+                        missing.append(title)
+
+        except Exception as e:
+            print(
+                "⚠️ Erro ao verificar existência de páginas pendentes:",
+                safe_exception(e)
+            )
+
+    return missing
+
+
+def get_latest_deletion_log(title):
+    """
+    Confirma que um título inexistente foi realmente eliminado.
+    Evita classificar como 'deleted' um título ausente por outros motivos
+    (por exemplo, movimentação sem deixar redirecionamento).
+    """
+    try:
+        response = wikimedia_session.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "list": "logevents",
+                "letype": "delete",
+                "leaction": "delete/delete",
+                "letitle": title,
+                "leprop": "title|user|timestamp|type|details",
+                "lelimit": 1,
+                "ledir": "older",
+            },
+            timeout=25,
+        )
+        response.raise_for_status()
+        events = response.json().get("query", {}).get("logevents", [])
+
+        if not events:
+            return None
+
+        event = events[0]
+        return {
+            "title": str(event.get("title") or title),
+            "user": str(event.get("user") or "").strip() or None,
+            "timestamp": event.get("timestamp"),
+        }
+
+    except Exception as e:
+        print(
+            "⚠️ Erro ao consultar registro de eliminação:",
+            safe_exception(e)
+        )
+        return None
+
+
+def parse_mediawiki_timestamp(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(
+            str(value),
+            "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def reconcile_pending_resolutions():
+    """
+    Revisão complementar das pendências.
+
+    Reversão e patrulhamento continuam sendo tratados pelos monitores
+    existentes. Aqui procuramos especialmente eliminações que possam ter
+    ocorrido enquanto o bot estava offline ou durante um redeploy.
+    """
+    items = get_pending_posted_edits()
+
+    if not items:
+        return {
+            "checked": 0,
+            "missing": 0,
+            "deleted_titles": 0,
+            "resolved_alerts": 0,
+        }
+
+    titles = [
+        item.get("title")
+        for item in items
+        if item.get("title")
+    ]
+
+    missing_titles = get_missing_pending_titles(titles)
+    deleted_titles = 0
+    resolved_alerts = 0
+
+    for title in missing_titles:
+        deletion = get_latest_deletion_log(title)
+
+        # Só encerra como eliminada quando há confirmação no log.
+        if not deletion:
+            continue
+
+        deleted_titles += 1
+        resolved_alerts += mark_pending_title_deleted(
+            deletion.get("title") or title,
+            deleter=deletion.get("user"),
+            deleted_at=parse_mediawiki_timestamp(
+                deletion.get("timestamp")
+            ) or time.time(),
+        )
+
+    return {
+        "checked": len(items),
+        "missing": len(missing_titles),
+        "deleted_titles": deleted_titles,
+        "resolved_alerts": resolved_alerts,
+    }
+
+
+def pending_resolution_reconciliation_scheduler():
+    """
+    Faz uma revisão logo após o início e depois a cada 30 minutos.
+    Isso recupera eliminações perdidas em períodos de indisponibilidade.
+    """
+    time.sleep(8)
+
+    while True:
+        try:
+            result = reconcile_pending_resolutions()
+            if result["resolved_alerts"]:
+                print(
+                    "🧹 Reconciliação de pendências:",
+                    result["resolved_alerts"],
+                    "alerta(s) removido(s) como página eliminada."
+                )
+        except Exception as e:
+            print(
+                "⚠️ Erro na reconciliação de pendências:",
+                safe_exception(e)
+            )
+
+        time.sleep(PENDING_RECONCILE_INTERVAL_SECONDS)
+
+
+def manual_pending_reconciliation(chat_id):
+    try:
+        send_telegram_message(
+            "🔎 Revisando avisos pendentes e procurando páginas eliminadas...",
+            chat_id=chat_id,
+        )
+
+        result = reconcile_pending_resolutions()
+
+        send_telegram_message(
+            (
+                "🧹 Revisão de pendências concluída\n\n"
+                f"📋 Pendências verificadas: {result['checked']}\n"
+                f"❓ Títulos atualmente inexistentes: {result['missing']}\n"
+                f"🗑️ Páginas com eliminação confirmada: {result['deleted_titles']}\n"
+                f"✅ Avisos removidos das pendências: {result['resolved_alerts']}\n\n"
+                "↩️ Reversões e ✅ patrulhamentos continuam sendo tratados "
+                "pelos monitores normais do bot."
+            ),
+            chat_id=chat_id,
+        )
+
+    except Exception as e:
+        send_telegram_message(
+            "❌ Não foi possível concluir a revisão das pendências.",
+            chat_id=chat_id,
+        )
+        print(
+            "⚠️ Erro na revisão manual de pendências:",
+            safe_exception(e)
+        )
 
 
 # =========================================================
@@ -6766,6 +7021,7 @@ def process_telegram_command(message, from_channel=False):
         "/desvigiar",
         "/vigiarfiltro",
         "/desvigiarfiltro",
+        "/revisarpendentes",
     }
 
     if command in mutating_commands and (
@@ -6804,6 +7060,22 @@ def process_telegram_command(message, from_channel=False):
             parse_mode="HTML",
             reply_markup=pending_markup,
         )
+        return
+
+    if command == "/revisarpendentes":
+        if not from_channel or not is_target_channel(chat):
+            send_telegram_message(
+                "⚠️ /revisarpendentes deve ser publicado diretamente no canal.",
+                chat_id=chat_id,
+            )
+            return
+
+        threading.Thread(
+            target=manual_pending_reconciliation,
+            args=(chat_id,),
+            daemon=True,
+            name="manual-pending-reconciliation",
+        ).start()
         return
 
     if command == "/status":
@@ -6944,6 +7216,7 @@ def process_telegram_command(message, from_channel=False):
                 f"{pending_count}\n"
                 f"📌 Resumo prioritário: a cada 1h "
                 f"(top 10, 48h)\n"
+                f"🧹 Reconciliação de pendências: a cada 30 min\n"
                 f"📊 Registros estatísticos (90d): "
                 f"{stats_count}\n"
                 f"🕗 Relatório diário: 20:05 (Brasília)\n"
@@ -8335,6 +8608,10 @@ def main():
         "🕒 Resumo prioritário: a cada 1 hora, "
         "top 10 por risco, janela de 48h"
     )
+    print(
+        "🧹 Reconciliação de pendências: a cada 30 minutos, "
+        "com confirmação de páginas eliminadas"
+    )
 
     threads = [
         ("telegram-sender", telegram_sender),
@@ -8349,6 +8626,7 @@ def main():
         ("posted-edit-status", posted_edit_status_monitor),
         ("daily-detection-report", daily_detection_report_scheduler),
         ("pending-alerts-summary", pending_alerts_summary_scheduler),
+        ("pending-resolution-reconciliation", pending_resolution_reconciliation_scheduler),
     ]
 
     for name, target in threads:
