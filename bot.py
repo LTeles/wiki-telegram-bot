@@ -20,8 +20,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.7"
-BOT_BUILD = "2.7-r2"
+BOT_VERSION = "2.8"
+BOT_BUILD = "2.8"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -699,7 +699,15 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.7":
+    if BOT_VERSION == "2.8":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "🆕 Ajuste no acompanhamento de reversões:\n"
+            "• quando o próprio editor reverte a edição publicada, o alerta passa a ser marcado como ‘Edição autorrevertida’;\n"
+            "• autorreversões não entram nas estatísticas do detector nem no resumo de alertas pendentes."
+        )
+    elif BOT_VERSION == "2.7":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -2237,6 +2245,44 @@ def mark_detection_stat_reverted(
             )
 
 
+def remove_detection_stat(revision_id):
+    """Remove uma revisão das estatísticas do detector.
+
+    Usado para autorreversões: elas continuam registradas em posted_edits
+    para que a mensagem possa exibir o desfecho, mas não contam como acerto,
+    erro ou pendência estatística do detector.
+    """
+    changed = False
+
+    with detection_stats_lock:
+        records = detection_stats.get("records", [])
+        kept = []
+
+        for item in records:
+            try:
+                same_revision = int(item.get("revision_id", 0)) == int(revision_id)
+            except Exception:
+                same_revision = False
+
+            if same_revision:
+                changed = True
+                continue
+
+            kept.append(item)
+
+        if changed:
+            detection_stats["records"] = kept
+
+    if changed:
+        try:
+            save_detection_stats()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao remover autorreversão das estatísticas:",
+                safe_exception(e)
+            )
+
+
 def format_percent(value):
     return (
         f"{value:.1f}"
@@ -3358,6 +3404,16 @@ def message_with_status(record, status, reverter=None, deleter=None):
 
     edit_link = edit_link_html(diff_url)
 
+    if status == "self_reverted":
+        return (
+            "↩️ Edição autorrevertida\n\n"
+            f"📝 {title}\n"
+            f"👤 {username}\n"
+            f"💬 {comment}\n"
+            f"{risk_line}\n"
+            f"{edit_link}"
+        )
+
     if status == "reverted":
         reverter_line = (
             f"\nRevertido por: {html.escape(str(reverter))}" if reverter else ""
@@ -3424,7 +3480,7 @@ def posted_edit_status_monitor():
         active = [
             record
             for record in snapshot
-            if record.get("status") not in ("reverted", "deleted")
+            if record.get("status") not in ("reverted", "self_reverted", "deleted")
         ]
 
         if not active:
@@ -3486,20 +3542,32 @@ def posted_edit_status_monitor():
                 and
                 new_status != current_status
             ):
-                # Para não atrasar a atualização principal, uma reversão
-                # é publicada imediatamente sem esperar a consulta opcional
-                # que tenta descobrir quem reverteu. O nome é acrescentado
-                # em uma segunda edição logo depois, se puder ser identificado.
+                reverter = None
+
+                # Quando a revisão foi revertida, identifica primeiro o autor
+                # da reversão para distinguir uma reversão comum de uma
+                # autorreversão. A comparação usa a mesma normalização de nomes
+                # já empregada pelo bot (espaços/underscores e casefold).
+                if new_status == "reverted":
+                    reverter = get_reverter_username(
+                        record.get("title") or "",
+                        revision_id
+                    )
+
+                    if (
+                        reverter
+                        and username_key(reverter)
+                        == username_key(record.get("username"))
+                    ):
+                        new_status = "self_reverted"
+
                 new_text = message_with_status(
                     record,
                     new_status,
-                    reverter=None
+                    reverter=reverter if new_status == "reverted" else None
                 )
 
-                # Mantém o botão de observação mesmo depois que o texto
-                # da mensagem é alterado para "patrulhado" ou "revertido".
-                # O fallback cobre registros criados em versões anteriores,
-                # que ainda não tinham reply_markup persistido no JSON.
+                # Mantém os botões já associados ao tipo original do alerta.
                 status_reply_markup = record.get("reply_markup")
                 if not status_reply_markup:
                     status_reply_markup = tracked_edit_reply_markup(revision_id)
@@ -3519,10 +3587,21 @@ def posted_edit_status_monitor():
 
                         if live:
                             live["status"] = new_status
+                            if reverter:
+                                live["reverted_by"] = reverter
+                            if new_status in ("reverted", "self_reverted"):
+                                live["reverted_at"] = time.time()
 
                     changed_any = True
 
-                    if new_status == "reverted":
+                    if new_status == "self_reverted":
+                        # Uma autorreversão não conta como acerto nem erro do
+                        # detector. Removemos a revisão das estatísticas; como
+                        # ela agora possui status, também deixa imediatamente
+                        # de aparecer no resumo de alertas pendentes.
+                        remove_detection_stat(revision_id)
+
+                    elif new_status == "reverted":
                         mark_detection_stat_reverted(
                             revision_id,
                             time.time()
@@ -3534,24 +3613,6 @@ def posted_edit_status_monitor():
                         "→",
                         new_status
                     )
-
-                    if new_status == "reverted":
-                        reverter = get_reverter_username(
-                            record.get("title") or "",
-                            revision_id
-                        )
-                        if reverter:
-                            enriched_text = message_with_status(
-                                record,
-                                "reverted",
-                                reverter=reverter
-                            )
-                            edit_telegram_message(
-                                record["message_id"],
-                                enriched_text,
-                                parse_mode="HTML",
-                                reply_markup=status_reply_markup
-                            )
 
                 time.sleep(1)
 
