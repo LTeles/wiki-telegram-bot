@@ -21,8 +21,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.16"
-BOT_BUILD = "2.16"
+BOT_VERSION = "2.17"
+BOT_BUILD = "2.17"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -777,7 +777,17 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.16":
+    if BOT_VERSION == "2.17":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "💬 Ajuste contextual por namespace:\n"
+            "• mensagens assinadas em páginas de discussão passam a receber risco menor quando não há sinais fortes de vandalismo;\n"
+            "• links externos nessas mensagens ainda acrescentam risco, preservando sensibilidade a spam;\n"
+            "• o mesmo formato de mensagem/assinatura fora de páginas de discussão recebe acréscimo de risco;\n"
+            "• sinais fortes de vandalismo continuam prevalecendo e não são neutralizados pelo contexto de discussão."
+        )
+    elif BOT_VERSION == "2.16":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -6596,6 +6606,118 @@ def benign_technical_change(diff):
     return None
 
 
+def is_discussion_namespace(change):
+    """
+    MediaWiki organiza, em regra, namespaces de discussão nos IDs ímpares
+    pareados aos namespaces de conteúdo. Usa o ID quando disponível e cai
+    para o prefixo do título como fallback.
+    """
+    try:
+        namespace = int(change.get("namespace"))
+        if namespace > 0 and namespace % 2 == 1:
+            return True
+    except Exception:
+        pass
+
+    title = str(change.get("title") or "")
+    if ":" not in title:
+        return False
+
+    prefix = title.split(":", 1)[0].casefold()
+    return "discussão" in prefix or "discussao" in prefix or prefix.endswith(" talk")
+
+
+def looks_like_signed_discussion_comment(added_text):
+    """
+    Detecta uma assinatura típica já expandida pelo MediaWiki:
+    usuário/contribuições + horário/data + UTC.
+    """
+    value = str(added_text or "")
+
+    timestamp = bool(
+        re.search(
+            r"\b\d{1,2}h\d{2}min\s+de\s+\d{1,2}\s+de\s+"
+            r"[A-Za-zÀ-ÿ]+\s+de\s+\d{4}\s*\(UTC\)",
+            value,
+            flags=re.I,
+        )
+        or
+        re.search(
+            r"\b\d{1,2}:\d{2},\s*\d{1,2}\s+[A-Za-zÀ-ÿ]+\s+\d{4}\s*\(UTC\)",
+            value,
+            flags=re.I,
+        )
+    )
+
+    identity_marker = bool(
+        re.search(
+            r"(Especial:Contribui|Usu[aá]ri[oa](?:\(a\))?:|discuss[aã]o)",
+            value,
+            flags=re.I,
+        )
+    )
+
+    raw_signature = "~~~~" in value
+
+    return raw_signature or (timestamp and identity_marker)
+
+
+def count_external_links(value):
+    return len(
+        re.findall(
+            r"https?://[^\s\]\[<>\"']+",
+            str(value or ""),
+            flags=re.I,
+        )
+    )
+
+
+def contextual_discussion_adjustment(change, diff, strong_signals):
+    """
+    Ajuste contextual por namespace.
+
+    Em páginas de discussão, uma mensagem assinada tem contexto legítimo e
+    recebe redutor moderado. Links externos ainda elevam o risco, pois podem
+    ser spam.
+
+    No domínio principal, uma mensagem com formato de discussão/assinatura
+    é contextualizada como inadequada e recebe acréscimo, especialmente se
+    trouxer link externo.
+
+    Sinais fortes de vandalismo nunca recebem o redutor de discussão.
+    """
+    added = str(diff.get("added", "") or "")
+    signed = looks_like_signed_discussion_comment(added)
+    links = count_external_links(added)
+    talk = is_discussion_namespace(change)
+
+    if talk and signed and strong_signals == 0:
+        # Comentário assinado é esperado em discussão.
+        # Um link mantém parte da suspeita para não mascarar spam.
+        return {
+            "multiplier": 0.62,
+            "additive": min(0.12, 0.06 * links),
+            "reason": (
+                "comentário assinado em página de discussão"
+                + (" com link externo" if links else "")
+            ),
+            "kind": "talk_signed",
+        }
+
+    if not talk and signed:
+        # Assinatura de discussão inserida em artigo/conteúdo é anômala.
+        return {
+            "multiplier": 1.0,
+            "additive": 0.10 + min(0.10, 0.05 * links),
+            "reason": (
+                "formato de mensagem de discussão inserido fora de página de discussão"
+            ),
+            "kind": "signed_outside_talk",
+        }
+
+    return None
+
+
 def analyze_vandalism(change, diff, revert_risk):
     added = diff.get("added", "")
     removed = diff.get("removed", "")
@@ -6631,10 +6753,19 @@ def analyze_vandalism(change, diff, revert_risk):
 
     benign = benign_technical_change(diff)
 
-    # O redutor só atua quando não existe sinal heurístico forte.
-    # Ele reduz o score final, não altera o Revert Risk original registrado.
+    # O redutor técnico atua apenas em mudanças mínimas reconhecidas.
     if benign:
         score *= float(benign.get("factor", 1.0))
+
+    context_adjustment = contextual_discussion_adjustment(
+        change,
+        diff,
+        strong_signals,
+    )
+
+    if context_adjustment:
+        score *= float(context_adjustment.get("multiplier", 1.0))
+        score += float(context_adjustment.get("additive", 0.0))
 
     score = min(max(score, 0.0), 1.0)
 
@@ -6674,6 +6805,14 @@ def analyze_vandalism(change, diff, revert_risk):
             str(benign.get("reason") or "alteração técnica mínima")
         )
 
+    if context_adjustment:
+        reasons.append(
+            str(
+                context_adjustment.get("reason")
+                or "ajuste contextual por namespace"
+            )
+        )
+
     if not reasons:
         reasons.append("edição suspeita")
 
@@ -6682,6 +6821,7 @@ def analyze_vandalism(change, diff, revert_risk):
         "revert_risk": revert_risk,
         "reason": ", ".join(reasons),
         "benign_reduction": benign,
+        "context_adjustment": context_adjustment,
     }
 
 
@@ -7005,6 +7145,19 @@ def analysis_worker():
                     result["benign_reduction"].get("reason"),
                     "| fator",
                     result["benign_reduction"].get("factor"),
+                    "|",
+                    title
+                )
+
+            if result.get("context_adjustment"):
+                adjustment = result["context_adjustment"]
+                print(
+                    "💬 Ajuste contextual:",
+                    adjustment.get("reason"),
+                    "| multiplicador",
+                    adjustment.get("multiplier"),
+                    "| acréscimo",
+                    adjustment.get("additive"),
                     "|",
                     title
                 )
