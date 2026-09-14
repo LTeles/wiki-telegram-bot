@@ -10,6 +10,7 @@ import secrets
 
 from datetime import datetime, timezone, timedelta
 from statistics import median
+from collections import Counter, defaultdict
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -21,8 +22,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.17"
-BOT_BUILD = "2.17-r2"
+BOT_VERSION = "2.18"
+BOT_BUILD = "2.18"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -53,6 +54,24 @@ HEADERS = {
         "(https://t.me/ptwiki)"
     )
 }
+
+
+# =========================================================
+# ESCRITA NA WIKIPÉDIA — PREPARADA, MAS DESATIVADA
+# =========================================================
+
+# Trava deliberadamente hardcoded. Nesta versão não existe variável de
+# ambiente capaz de habilitar escrita por acidente.
+WIKI_WRITE_ENABLED = False
+
+# Regra de segurança solicitada: mesmo quando a escrita for liberada numa
+# versão futura, o bot somente poderá editar títulos iniciados exatamente por:
+WIKI_ALLOWED_TITLE_PREFIX = "Usuário:TelesGramBot:"
+
+# Relatórios que serão usados quando a publicação for futuramente ativada.
+WIKI_DAILY_REPORT_PREFIX = "Usuário:TelesGramBot:Relatórios/Diário/"
+WIKI_MONTHLY_REPORT_PREFIX = "Usuário:TelesGramBot:Relatórios/Mensal/"
+
 
 
 # =========================================================
@@ -175,6 +194,17 @@ REVERSIBLE_ACTIONS_FILE = os.environ.get(
 )
 
 
+COMMUNITY_STATS_FILE = os.environ.get(
+    "COMMUNITY_STATS_FILE",
+    "/data/community_stats.json"
+)
+
+WIKI_REPORT_PREVIEW_FILE = os.environ.get(
+    "WIKI_REPORT_PREVIEW_FILE",
+    "/data/wiki_report_preview.txt"
+)
+
+
 # =========================================================
 # ESTADO EM MEMÓRIA
 # =========================================================
@@ -238,6 +268,17 @@ reversible_actions = {}
 reversible_actions_lock = threading.Lock()
 reversible_actions_persist_lock = threading.Lock()
 REVERSIBLE_ACTION_TTL_SECONDS = 48 * 60 * 60
+
+
+# Histórico de ações de manutenção usadas nos relatórios comunitários.
+# Eventos são coletados independentemente da escrita na Wikipédia.
+community_stats = {
+    "events": [],
+    "last_preview_date": None,
+}
+community_stats_lock = threading.Lock()
+community_stats_persist_lock = threading.Lock()
+COMMUNITY_STATS_RETENTION_DAYS = 400
 
 user_cache = {}
 
@@ -346,6 +387,8 @@ def ensure_storage():
         DETECTION_STATS_FILE,
         PENDING_SUMMARY_STATE_FILE,
         REVERSIBLE_ACTIONS_FILE,
+        COMMUNITY_STATS_FILE,
+        WIKI_REPORT_PREVIEW_FILE,
     ]
 
     directories = {
@@ -382,6 +425,8 @@ def ensure_storage():
         print("📁 Estatísticas do detector:", DETECTION_STATS_FILE)
         print("📁 Resumo de pendências:", PENDING_SUMMARY_STATE_FILE)
         print("📁 Ações reversíveis:", REVERSIBLE_ACTIONS_FILE)
+        print("📁 Estatísticas comunitárias:", COMMUNITY_STATS_FILE)
+        print("📁 Prévia de relatório wiki:", WIKI_REPORT_PREVIEW_FILE)
         print("📁 Versão do bot:", BOT_VERSION_FILE)
 
         return True
@@ -725,6 +770,579 @@ def edit_telegram_message_in_chat(chat_id, message_id, text, parse_mode=None, re
         return False
 
 
+
+# =========================================================
+# ESTATÍSTICAS COMUNITÁRIAS E RELATÓRIOS WIKI
+# =========================================================
+
+def save_community_stats():
+    with community_stats_persist_lock:
+        with community_stats_lock:
+            data = {
+                "events": list(community_stats.get("events", [])),
+                "last_preview_date": community_stats.get("last_preview_date"),
+            }
+        atomic_write_json(COMMUNITY_STATS_FILE, data)
+
+
+def cleanup_community_stats(save=True):
+    cutoff = time.time() - COMMUNITY_STATS_RETENTION_DAYS * 86400
+    changed = False
+
+    with community_stats_lock:
+        old = community_stats.get("events", [])
+        kept = []
+        for item in old:
+            try:
+                ts = float(item.get("timestamp", 0))
+            except Exception:
+                continue
+            if ts >= cutoff:
+                kept.append(item)
+
+        if len(kept) != len(old):
+            community_stats["events"] = kept
+            changed = True
+
+    if changed and save:
+        try:
+            save_community_stats()
+        except Exception as e:
+            print("⚠️ Erro ao limpar estatísticas comunitárias:", safe_exception(e))
+
+
+def load_community_stats():
+    global community_stats
+
+    data = load_json(
+        COMMUNITY_STATS_FILE,
+        {"events": [], "last_preview_date": None},
+    )
+
+    loaded = []
+    if isinstance(data, dict):
+        for item in data.get("events", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                item = dict(item)
+                item["timestamp"] = float(item.get("timestamp", 0))
+            except Exception:
+                continue
+            loaded.append(item)
+
+    with community_stats_lock:
+        community_stats = {
+            "events": loaded,
+            "last_preview_date": (
+                data.get("last_preview_date")
+                if isinstance(data, dict)
+                else None
+            ),
+        }
+
+    cleanup_community_stats(save=False)
+    try:
+        save_community_stats()
+    except Exception:
+        pass
+
+    print("✅ Eventos comunitários carregados:", len(loaded))
+
+
+def record_community_event(
+    kind,
+    actor=None,
+    title=None,
+    timestamp=None,
+    revision_id=None,
+    latency=None,
+    categories=None,
+    metadata=None,
+):
+    event = {
+        "kind": str(kind or "").strip(),
+        "actor": str(actor).strip() if actor else None,
+        "title": str(title).strip() if title else None,
+        "timestamp": float(timestamp or time.time()),
+        "revision_id": int(revision_id) if revision_id is not None else None,
+        "latency": float(latency) if latency is not None else None,
+        "categories": [
+            str(value)
+            for value in (categories or [])
+            if value
+        ][:30],
+        "metadata": dict(metadata or {}),
+    }
+
+    # Deduplicação simples para eventos associados a revisão/log.
+    dedupe = (
+        event["kind"],
+        event.get("revision_id"),
+        event.get("actor"),
+        event.get("title"),
+    )
+
+    with community_stats_lock:
+        for old in reversed(community_stats.get("events", [])[-500:]):
+            old_key = (
+                old.get("kind"),
+                old.get("revision_id"),
+                old.get("actor"),
+                old.get("title"),
+            )
+            if event.get("revision_id") is not None and old_key == dedupe:
+                return False
+
+        community_stats.setdefault("events", []).append(event)
+
+    try:
+        save_community_stats()
+    except Exception as e:
+        print("⚠️ Erro ao persistir evento comunitário:", safe_exception(e))
+        return False
+
+    return True
+
+
+def get_page_categories(title):
+    """Categorias atuais da página, usadas apenas após caso confirmado."""
+    if not title:
+        return []
+
+    try:
+        response = wikimedia_session.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "prop": "categories",
+                "titles": title,
+                "cllimit": 50,
+                "clshow": "!hidden",
+            },
+            timeout=18,
+        )
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", [])
+        if not pages:
+            return []
+
+        result = []
+        for item in pages[0].get("categories", []):
+            name = str(item.get("title") or "")
+            if name.startswith("Categoria:"):
+                name = name[len("Categoria:"):]
+            if name:
+                result.append(name)
+        return result[:30]
+
+    except Exception as e:
+        print("⚠️ Não foi possível obter categorias da página:", safe_exception(e))
+        return []
+
+
+def get_patroller_username(title, revision_id):
+    """Identifica o patrulhador pelo log de patrol quando disponível."""
+    try:
+        response = wikimedia_session.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "list": "logevents",
+                "letype": "patrol",
+                "letitle": title,
+                "leprop": "title|user|timestamp|type|details",
+                "lelimit": 20,
+            },
+            timeout=18,
+        )
+        response.raise_for_status()
+
+        for event in response.json().get("query", {}).get("logevents", []):
+            params = event.get("params") or {}
+            try:
+                current_revision = int(
+                    params.get("curid")
+                    or params.get("cur_id")
+                    or 0
+                )
+            except Exception:
+                current_revision = 0
+
+            auto = params.get("auto")
+            if current_revision == int(revision_id) and not auto:
+                return event.get("user") or None
+
+    except Exception as e:
+        print("⚠️ Não foi possível identificar patrulhador:", safe_exception(e))
+
+    return None
+
+
+def wiki_title_is_allowed(title):
+    return (
+        isinstance(title, str)
+        and title.startswith(WIKI_ALLOWED_TITLE_PREFIX)
+        and len(title) > len(WIKI_ALLOWED_TITLE_PREFIX)
+    )
+
+
+def get_wikimedia_csrf_token():
+    if not wikimedia_authenticated:
+        raise RuntimeError("sessão Wikimedia não autenticada")
+
+    response = wikimedia_session.get(
+        WIKIPEDIA_API,
+        params={
+            "action": "query",
+            "meta": "tokens",
+            "type": "csrf",
+            "format": "json",
+            "formatversion": 2,
+        },
+        timeout=25,
+    )
+    response.raise_for_status()
+    token = (
+        response.json()
+        .get("query", {})
+        .get("tokens", {})
+        .get("csrftoken")
+    )
+    if not token:
+        raise RuntimeError("token CSRF não retornado")
+    return token
+
+
+def wiki_edit_page(title, wikitext, summary):
+    """
+    Implementação pronta para uso futuro, mas bloqueada por duas barreiras:
+    1) WIKI_WRITE_ENABLED precisa ser alterado no código;
+    2) o título precisa começar por Usuário:TelesGramBot:
+
+    Nesta versão a primeira barreira é False e nenhuma chamada action=edit
+    é enviada.
+    """
+    if not wiki_title_is_allowed(title):
+        raise PermissionError(
+            f"título fora do prefixo permitido: {title!r}"
+        )
+
+    if not WIKI_WRITE_ENABLED:
+        print(
+            "🔒 Escrita wiki bloqueada; relatório mantido apenas como prévia:",
+            title,
+        )
+        return False
+
+    token = get_wikimedia_csrf_token()
+
+    response = wikimedia_session.post(
+        WIKIPEDIA_API,
+        data={
+            "action": "edit",
+            "format": "json",
+            "formatversion": 2,
+            "title": title,
+            "text": wikitext,
+            "summary": summary,
+            "token": token,
+            "assert": "user",
+            "bot": 1,
+        },
+        timeout=35,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("error"):
+        raise RuntimeError(
+            f"API edit recusou publicação: {data['error']}"
+        )
+
+    return data.get("edit", {}).get("result") == "Success"
+
+
+def community_events_between(start_ts, end_ts):
+    with community_stats_lock:
+        return [
+            dict(item)
+            for item in community_stats.get("events", [])
+            if start_ts <= float(item.get("timestamp", 0)) < end_ts
+        ]
+
+
+def wiki_user_link(username):
+    if not username:
+        return "—"
+    name = str(username).replace("|", "&#124;")
+    return f"[[Usuário:{name}|{name}]]"
+
+
+def wiki_page_link(title):
+    if not title:
+        return "—"
+    value = str(title).replace("|", "&#124;")
+    return f"[[{value}]]"
+
+
+def ranking_counts(events, kind, limit=3):
+    counts = Counter(
+        item.get("actor")
+        for item in events
+        if item.get("kind") == kind and item.get("actor")
+    )
+    return counts.most_common(limit)
+
+
+def ranking_fast_reverters(events, limit=3, minimum=3):
+    values = defaultdict(list)
+    for item in events:
+        if (
+            item.get("kind") == "revert"
+            and item.get("actor")
+            and item.get("latency") is not None
+        ):
+            values[item["actor"]].append(float(item["latency"]))
+
+    ranking = []
+    for actor, times in values.items():
+        if len(times) >= minimum:
+            ranking.append((actor, median(times), len(times)))
+
+    ranking.sort(key=lambda item: (item[1], -item[2], item[0].casefold()))
+    return ranking[:limit]
+
+
+def wikitext_ranking_table(title, ranking, value_label="Ações"):
+    lines = [
+        f"=== {title} ===",
+        '{| class="wikitable sortable"',
+        "! Pos. !! Editor !! " + value_label,
+    ]
+
+    medals = ["🥇", "🥈", "🥉"]
+    if not ranking:
+        lines.append("|-")
+        lines.append("| colspan=\"3\" | ''Sem dados suficientes.''")
+    else:
+        for index, item in enumerate(ranking[:3]):
+            actor = item[0]
+            value = item[1]
+            lines.extend([
+                "|-",
+                f"| {medals[index]} {index + 1} || {wiki_user_link(actor)} || {value}",
+            ])
+
+    lines.append("|}")
+    return "\n".join(lines)
+
+
+def wikitext_fast_reverters_table(ranking):
+    lines = [
+        "=== Reversões mais rápidas ===",
+        "''Mediana do tempo entre o alerta do bot e a detecção da reversão; mínimo de 3 reversões no período.''",
+        '{| class="wikitable sortable"',
+        "! Pos. !! Editor !! Mediana !! Reversões",
+    ]
+
+    medals = ["🥇", "🥈", "🥉"]
+    if not ranking:
+        lines.extend(["|-", "| colspan=\"4\" | ''Sem dados suficientes.''"])
+    else:
+        for index, (actor, seconds, count) in enumerate(ranking[:3]):
+            lines.extend([
+                "|-",
+                f"| {medals[index]} {index + 1} || {wiki_user_link(actor)} || "
+                f"{format_minutes(seconds)} || {count}",
+            ])
+
+    lines.append("|}")
+    return "\n".join(lines)
+
+
+def wikitext_counter_table(title, counter, label, top=10):
+    lines = [
+        f"=== {title} ===",
+        '{| class="wikitable sortable"',
+        f"! Pos. !! {label} !! Casos !! Visual",
+    ]
+
+    values = counter.most_common(top)
+    maximum = values[0][1] if values else 1
+
+    if not values:
+        lines.extend(["|-", "| colspan=\"4\" | ''Sem dados suficientes.''"])
+    else:
+        for index, (name, count) in enumerate(values, 1):
+            bars = max(1, round((count / maximum) * 12))
+            visual = "█" * bars
+            display = (
+                wiki_page_link(name)
+                if label == "Página"
+                else str(name).replace("|", "&#124;")
+            )
+            lines.extend([
+                "|-",
+                f"| {index} || {display} || {count} || <code>{visual}</code>",
+            ])
+
+    lines.append("|}")
+    return "\n".join(lines)
+
+
+def build_wiki_community_report(start_ts, end_ts, period_label):
+    events = community_events_between(start_ts, end_ts)
+
+    reversions = ranking_counts(events, "revert")
+    patrols = ranking_counts(events, "patrol")
+    protections = ranking_counts(events, "protect")
+    blocks = ranking_counts(events, "block")
+    deletions = ranking_counts(events, "delete")
+    fast = ranking_fast_reverters(events)
+
+    vandal_pages = Counter()
+    vandal_categories = Counter()
+
+    # "revert" e "delete" são tratados como desfechos confirmados dos alertas.
+    for item in events:
+        if item.get("kind") not in ("revert", "delete"):
+            continue
+        if item.get("title"):
+            vandal_pages[item["title"]] += 1
+        for category in item.get("categories") or []:
+            vandal_categories[category] += 1
+
+    total_reverts = sum(1 for x in events if x.get("kind") == "revert")
+    total_patrols = sum(1 for x in events if x.get("kind") == "patrol")
+    total_protections = sum(1 for x in events if x.get("kind") == "protect")
+    total_blocks = sum(1 for x in events if x.get("kind") == "block")
+    total_deletions = sum(1 for x in events if x.get("kind") == "delete")
+
+    return "\n\n".join([
+        f"= Relatório de manutenção e combate a vandalismo — {period_label} =",
+        "''Relatório experimental produzido pelo TelesGramBot. "
+        "Os rankings descrevem somente eventos observados pelo bot e não devem "
+        "ser interpretados como avaliação global de mérito dos editores.''",
+        "== Resumo ==",
+        '{| class="wikitable"',
+        "! Indicador !! Total",
+        "|-",
+        f"| Reversões detectadas || {total_reverts}",
+        "|-",
+        f"| Patrulhamentos identificados || {total_patrols}",
+        "|-",
+        f"| Proteções/alterações de proteção || {total_protections}",
+        "|-",
+        f"| Bloqueios/rebloqueios || {total_blocks}",
+        "|-",
+        f"| Eliminações ligadas a alertas || {total_deletions}",
+        "|}",
+        "== Reconhecimento de trabalho de manutenção ==",
+        wikitext_ranking_table("Mais reversões", reversions, "Reversões"),
+        wikitext_fast_reverters_table(fast),
+        wikitext_ranking_table("Mais patrulhamentos", patrols, "Patrulhamentos"),
+        wikitext_ranking_table("Mais proteções", protections, "Proteções"),
+        wikitext_ranking_table("Mais bloqueios", blocks, "Bloqueios"),
+        wikitext_ranking_table("Mais eliminações ligadas a alertas", deletions, "Eliminações"),
+        "== Onde o vandalismo confirmado apareceu ==",
+        wikitext_counter_table(
+            "Páginas com mais ocorrências",
+            vandal_pages,
+            "Página",
+            top=10,
+        ),
+        wikitext_counter_table(
+            "Categorias mais afetadas",
+            vandal_categories,
+            "Categoria",
+            top=10,
+        ),
+        "== Metodologia ==",
+        "* Reversão: alerta acompanhado pelo bot que recebeu confirmação de reversão.",
+        "* Rapidez: mediana do tempo entre publicação do alerta e detecção da reversão; "
+        "exige pelo menos três reversões no período.",
+        "* Patrulhamento: somente quando o bot consegue relacionar o evento ao registro de patrulha e identificar o executor.",
+        "* Proteções, bloqueios e eliminações: baseados nos registros públicos da Wikipédia observados pelo bot.",
+        "* Categorias: capturadas da página quando o caso confirmado é processado; podem não estar disponíveis após eliminação.",
+        "* Os dados começam a ser coletados a partir da implantação desta versão; não há reconstrução histórica automática.",
+    ])
+
+
+def build_wiki_daily_and_monthly_previews(now=None):
+    tz = ZoneInfo(REPORT_TIMEZONE)
+    now = now or datetime.now(tz)
+
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    month_start = day_start.replace(day=1)
+
+    if month_start.month == 12:
+        next_month = month_start.replace(
+            year=month_start.year + 1,
+            month=1,
+        )
+    else:
+        next_month = month_start.replace(month=month_start.month + 1)
+
+    daily_title = WIKI_DAILY_REPORT_PREFIX + day_start.strftime("%Y-%m-%d")
+    monthly_title = WIKI_MONTHLY_REPORT_PREFIX + month_start.strftime("%Y-%m")
+
+    daily_text = build_wiki_community_report(
+        day_start.timestamp(),
+        day_end.timestamp(),
+        day_start.strftime("%d/%m/%Y"),
+    )
+    monthly_text = build_wiki_community_report(
+        month_start.timestamp(),
+        next_month.timestamp(),
+        month_start.strftime("%m/%Y"),
+    )
+
+    preview = (
+        f"<!-- TÍTULO DIÁRIO: {daily_title} -->\n"
+        + daily_text
+        + "\n\n"
+        + f"<!-- TÍTULO MENSAL: {monthly_title} -->\n"
+        + monthly_text
+    )
+
+    directory = os.path.dirname(WIKI_REPORT_PREVIEW_FILE)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    temp = WIKI_REPORT_PREVIEW_FILE + ".tmp"
+    with open(temp, "w", encoding="utf-8") as file:
+        file.write(preview)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temp, WIKI_REPORT_PREVIEW_FILE)
+
+    with community_stats_lock:
+        community_stats["last_preview_date"] = now.date().isoformat()
+    save_community_stats()
+
+    # Chamadas deliberadamente bloqueadas nesta versão. Mantidas aqui para
+    # deixar o fluxo de publicação pronto para uma futura liberação explícita.
+    if WIKI_WRITE_ENABLED:
+        wiki_edit_page(
+            daily_title,
+            daily_text,
+            "Atualizando relatório diário de manutenção e combate a vandalismo",
+        )
+        wiki_edit_page(
+            monthly_title,
+            monthly_text,
+            "Atualizando painel mensal de manutenção e combate a vandalismo",
+        )
+
+    return daily_title, monthly_title
+
+
 # =========================================================
 # VERSIONAMENTO
 # =========================================================
@@ -777,7 +1395,20 @@ def announce_new_version_if_needed():
         )
         return
 
-    if BOT_VERSION == "2.17":
+    if BOT_VERSION == "2.18":
+        message = (
+            "✅ Bot atualizado com sucesso\n\n"
+            f"🤖 Versão {BOT_VERSION}\n\n"
+            "📝 Preparação para relatórios na Wikipédia:\n"
+            "• coleta de estatísticas comunitárias de reversões, rapidez, patrulhamento, proteções, bloqueios e eliminações;\n"
+            "• rankings mensais com 1º, 2º e 3º colocados;\n"
+            "• páginas e categorias mais afetadas por casos confirmados;\n"
+            "• relatórios em wikitext com tabelas e gráficos de barras textuais;\n"
+            "• prévias diária e mensal gravadas apenas no volume do bot;\n"
+            "• escrita na Wikipédia permanece BLOQUEADA nesta versão;\n"
+            "• mesmo numa futura liberação, o código aceita somente títulos iniciados por Usuário:TelesGramBot:."
+        )
+    elif BOT_VERSION == "2.17":
         message = (
             "✅ Bot atualizado com sucesso\n\n"
             f"🤖 Versão {BOT_VERSION}\n\n"
@@ -2944,6 +3575,7 @@ def daily_detection_report_scheduler():
     while True:
         try:
             cleanup_detection_stats()
+            cleanup_community_stats()
 
             now = datetime.now(tz)
 
@@ -3003,6 +3635,22 @@ def daily_detection_report_scheduler():
                         "📊 Relatório diário publicado:",
                         report_date
                     )
+
+                    try:
+                        daily_title, monthly_title = (
+                            build_wiki_daily_and_monthly_previews(now)
+                        )
+                        print(
+                            "📝 Prévia wiki atualizada:",
+                            daily_title,
+                            "|",
+                            monthly_title,
+                        )
+                    except Exception as e:
+                        print(
+                            "⚠️ Erro ao gerar prévia wiki:",
+                            safe_exception(e)
+                        )
                 else:
                     print(
                         "⚠️ Falha ao publicar relatório diário."
@@ -4053,9 +4701,35 @@ def posted_edit_status_monitor():
                         remove_detection_stat(revision_id)
 
                     elif new_status == "reverted":
+                        event_time = time.time()
                         mark_detection_stat_reverted(
                             revision_id,
-                            time.time()
+                            event_time
+                        )
+                        record_community_event(
+                            "revert",
+                            actor=reverter,
+                            title=record.get("title"),
+                            timestamp=event_time,
+                            revision_id=revision_id,
+                            latency=max(
+                                0,
+                                event_time - float(record.get("posted_at", event_time))
+                            ),
+                            categories=get_page_categories(record.get("title")),
+                        )
+
+                    elif new_status == "patrolled":
+                        patroller = get_patroller_username(
+                            record.get("title") or "",
+                            revision_id,
+                        )
+                        record_community_event(
+                            "patrol",
+                            actor=patroller,
+                            title=record.get("title"),
+                            timestamp=time.time(),
+                            revision_id=revision_id,
                         )
 
                     print(
@@ -4171,6 +4845,16 @@ def mark_pending_title_deleted(title, deleter=None, deleted_at=None):
                 "⚠️ Erro ao salvar status de página eliminada:",
                 safe_exception(e)
             )
+
+        record_community_event(
+            "delete",
+            actor=deleter,
+            title=title,
+            timestamp=deleted_at,
+            revision_id=matches[0].get("revision_id") if matches else None,
+            categories=[],
+            metadata={"alerts_resolved": resolved},
+        )
 
     return resolved
 
@@ -5902,6 +6586,15 @@ def block_worker():
 
             details["_post_block_observation_scheduled"] = scheduled
 
+            record_community_event(
+                "block",
+                actor=details.get("user"),
+                title=target,
+                timestamp=parse_mediawiki_timestamp(details.get("timestamp")) or time.time(),
+                revision_id=details.get("logid") or log_id,
+                metadata={"action": action},
+            )
+
             telegram_queue.put(
                 {
                     "message": format_block_message(
@@ -6238,6 +6931,15 @@ def protection_worker():
             # e "modify" altera uma proteção que continua ativa.
             if action not in ("protect", "modify"):
                 continue
+
+            record_community_event(
+                "protect",
+                actor=details.get("user"),
+                title=details.get("title") or change.get("title"),
+                timestamp=parse_mediawiki_timestamp(details.get("timestamp")) or time.time(),
+                revision_id=details.get("logid") or log_id,
+                metadata={"action": action},
+            )
 
             telegram_queue.put({
                 "message": format_protection_message(details, change),
@@ -8834,6 +9536,7 @@ def main():
     load_detection_stats()
     load_pending_summary_state()
     load_reversible_actions()
+    load_community_stats()
 
     cleanup_expired_observations()
     activate_due_post_block_observations()
@@ -8841,6 +9544,7 @@ def main():
     cleanup_expired_ignored_users()
     cleanup_posted_edits()
     cleanup_detection_stats()
+    cleanup_community_stats()
 
     print(
         "🔎 Revert Risk mínimo:",
@@ -8898,6 +9602,13 @@ def main():
     print(
         "🧹 Reconciliação de pendências: a cada 30 minutos, "
         "com confirmação de páginas eliminadas"
+    )
+    print(
+        "📝 Relatórios wiki: coleta ativa, escrita DESATIVADA"
+    )
+    print(
+        "🔒 Prefixo permitido para futura escrita:",
+        WIKI_ALLOWED_TITLE_PREFIX
     )
 
     threads = [
