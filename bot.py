@@ -22,8 +22,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.20"
-BOT_BUILD = "2.20"
+BOT_VERSION = "2.21"
+BOT_BUILD = "2.21"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -199,6 +199,11 @@ COMMUNITY_STATS_FILE = os.environ.get(
     "/data/community_stats.json"
 )
 
+FALSE_POSITIVES_FILE = os.environ.get(
+    "FALSE_POSITIVES_FILE",
+    "/data/false_positives.json"
+)
+
 WIKI_REPORT_PREVIEW_FILE = os.environ.get(
     "WIKI_REPORT_PREVIEW_FILE",
     "/data/wiki_report_preview.txt"
@@ -279,6 +284,15 @@ community_stats = {
 community_stats_lock = threading.Lock()
 community_stats_persist_lock = threading.Lock()
 COMMUNITY_STATS_RETENTION_DAYS = 400
+
+# Casos marcados manualmente como falsos positivos.
+# Ficam fora das estatísticas do detector/canal e permanecem nesta fila
+# até que um administrador confirme que o ajuste correspondente no bot
+# foi concluído.
+false_positives = {}
+false_positives_lock = threading.Lock()
+false_positives_persist_lock = threading.Lock()
+FALSE_POSITIVE_PAGE_SIZE = 10
 
 user_cache = {}
 
@@ -388,6 +402,7 @@ def ensure_storage():
         PENDING_SUMMARY_STATE_FILE,
         REVERSIBLE_ACTIONS_FILE,
         COMMUNITY_STATS_FILE,
+        FALSE_POSITIVES_FILE,
         WIKI_REPORT_PREVIEW_FILE,
     ]
 
@@ -426,6 +441,7 @@ def ensure_storage():
         print("📁 Resumo de pendências:", PENDING_SUMMARY_STATE_FILE)
         print("📁 Ações reversíveis:", REVERSIBLE_ACTIONS_FILE)
         print("📁 Estatísticas comunitárias:", COMMUNITY_STATS_FILE)
+        print("📁 Falsos positivos:", FALSE_POSITIVES_FILE)
         print("📁 Prévia de relatório wiki:", WIKI_REPORT_PREVIEW_FILE)
         print("📁 Versão do bot:", BOT_VERSION_FILE)
 
@@ -809,6 +825,309 @@ def cleanup_community_stats(save=True):
             save_community_stats()
         except Exception as e:
             print("⚠️ Erro ao limpar estatísticas comunitárias:", safe_exception(e))
+
+
+def save_false_positives():
+    with false_positives_persist_lock:
+        with false_positives_lock:
+            data = {
+                "items": list(false_positives.values())
+            }
+        atomic_write_json(FALSE_POSITIVES_FILE, data)
+
+
+def load_false_positives():
+    global false_positives
+
+    data = load_json(FALSE_POSITIVES_FILE, {"items": []})
+    loaded = {}
+
+    items = data.get("items", []) if isinstance(data, dict) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            revision_id = int(item.get("revision_id"))
+        except Exception:
+            continue
+
+        normalized = dict(item)
+        normalized["revision_id"] = revision_id
+        loaded[str(revision_id)] = normalized
+
+    with false_positives_lock:
+        false_positives = loaded
+
+    print(
+        "✅ Falsos positivos carregados:",
+        len(loaded),
+        "| pendentes de ajuste:",
+        sum(1 for item in loaded.values() if not item.get("resolved_at"))
+    )
+
+
+def unresolved_false_positives():
+    with false_positives_lock:
+        items = [
+            dict(item)
+            for item in false_positives.values()
+            if not item.get("resolved_at")
+        ]
+
+    items.sort(key=lambda item: float(item.get("marked_at", 0)))
+    return items
+
+
+def false_positive_revision_ids():
+    with false_positives_lock:
+        return {
+            int(item.get("revision_id"))
+            for item in false_positives.values()
+            if item.get("revision_id") is not None
+        }
+
+
+def register_false_positive(record, actor):
+    revision_id = int(record["revision_id"])
+    now = time.time()
+
+    item = {
+        "revision_id": revision_id,
+        "title": record.get("title"),
+        "username": record.get("username"),
+        "edit_comment": record.get("edit_comment"),
+        "diff_url": record.get("diff_url"),
+        "revert_risk": record.get("revert_risk"),
+        "final_score": record.get("final_score"),
+        "telegram_message_id": record.get("message_id"),
+        "alert_kind": record.get("alert_kind"),
+        "posted_at": record.get("posted_at"),
+        "marked_at": now,
+        "marked_by": actor,
+        "resolved_at": None,
+        "resolved_by": None,
+    }
+
+    with false_positives_lock:
+        false_positives[str(revision_id)] = item
+
+    save_false_positives()
+    return item
+
+
+def mark_false_positive_fixed(revision_id, actor):
+    key = str(int(revision_id))
+    now = time.time()
+
+    with false_positives_lock:
+        item = false_positives.get(key)
+        if not item:
+            return None, "not_found"
+        if item.get("resolved_at"):
+            return dict(item), "already_resolved"
+
+        item["resolved_at"] = now
+        item["resolved_by"] = actor
+        result = dict(item)
+
+    save_false_positives()
+    return result, "resolved"
+
+
+def false_positive_message(item, fixed=False):
+    title = html.escape(str(item.get("title") or "Sem título"))
+    username = user_contributions_link_html(
+        item.get("username") or "Desconhecido"
+    )
+    comment = html.escape(
+        str(item.get("edit_comment") or "Sem resumo")
+    )
+    diff_url = item.get("diff_url") or ""
+    edit_link = edit_link_html(diff_url)
+
+    risk_line = ""
+    if item.get("revert_risk") is not None:
+        try:
+            risk_line = (
+                f"\n🤖 Risco de reversão: "
+                f"{round(float(item['revert_risk']) * 100)}%\n"
+            )
+        except Exception:
+            pass
+
+    if fixed:
+        actor = html.escape(
+            str(item.get("resolved_by") or "administrador do canal")
+        )
+        return (
+            "✅ Falso positivo revisado — ajuste no bot marcado como concluído\n\n"
+            f"📝 {title}\n"
+            f"👤 {username}\n"
+            f"💬 {comment}\n"
+            f"{risk_line}\n"
+            f"{edit_link}\n"
+            f"🛠 Concluído por: {actor}"
+        )
+
+    actor = html.escape(
+        str(item.get("marked_by") or "administrador do canal")
+    )
+    return (
+        "⚠️ Possível vandalismo marcado como falso positivo\n"
+        "Edição será revista para ajustes no bot.\n\n"
+        f"📝 {title}\n"
+        f"👤 {username}\n"
+        f"💬 {comment}\n"
+        f"{risk_line}\n"
+        f"{edit_link}\n"
+        f"🏷 Marcado por: {actor}"
+    )
+
+
+def false_positive_management_metrics(start_ts, end_ts):
+    with false_positives_lock:
+        items = [dict(item) for item in false_positives.values()]
+
+    reported = [
+        item for item in items
+        if start_ts <= float(item.get("marked_at", 0) or 0) < end_ts
+    ]
+    adjusted = [
+        item for item in items
+        if item.get("resolved_at") is not None
+        and start_ts <= float(item.get("resolved_at", 0) or 0) < end_ts
+    ]
+    backlog_at_end = [
+        item for item in items
+        if float(item.get("marked_at", 0) or 0) < end_ts
+        and (
+            item.get("resolved_at") is None
+            or float(item.get("resolved_at", 0) or 0) >= end_ts
+        )
+    ]
+    closed_from_reported = [
+        item for item in reported
+        if item.get("resolved_at") is not None
+        and float(item.get("resolved_at", 0) or 0) < end_ts
+    ]
+    close_rate = (
+        len(closed_from_reported) / len(reported) * 100
+        if reported else 0.0
+    )
+
+    adjustment_times = []
+    for item in adjusted:
+        try:
+            marked_at = float(item.get("marked_at", 0) or 0)
+            resolved_at = float(item.get("resolved_at", 0) or 0)
+        except Exception:
+            continue
+        if marked_at and resolved_at >= marked_at:
+            adjustment_times.append(resolved_at - marked_at)
+
+    reporter_counts = Counter(
+        str(item.get("marked_by") or "administrador não identificado")
+        for item in reported
+    )
+
+    return {
+        "reported": len(reported),
+        "adjusted": len(adjusted),
+        "backlog": len(backlog_at_end),
+        "close_rate": close_rate,
+        "median_adjustment_seconds": median(adjustment_times) if adjustment_times else None,
+        "reporter_counts": reporter_counts,
+    }
+
+
+def wikitext_false_positive_reporters(counter, top=5):
+    rows = counter.most_common(top)
+    if not rows:
+        return "''Nenhum falso positivo foi reportado no período.''"
+
+    lines = [
+        '{| class="wikitable sortable"',
+        "! Posição !! Editor/administrador !! Falsos positivos reportados",
+    ]
+    medals = ["🥇", "🥈", "🥉"]
+
+    for index, (actor, count) in enumerate(rows, start=1):
+        medal = medals[index - 1] if index <= 3 else str(index)
+        lines.extend([
+            "|-",
+            f"| {medal} || {actor} || {count}",
+        ])
+
+    lines.append("|}")
+    return "\n".join(lines)
+
+
+def false_positive_list_message(page=0):
+    items = unresolved_false_positives()
+    total = len(items)
+
+    now = time.time()
+    tz = ZoneInfo(REPORT_TIMEZONE)
+    now_dt = datetime.fromtimestamp(now, tz)
+    month_start = now_dt.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    metrics = false_positive_management_metrics(
+        month_start.timestamp(),
+        now,
+    )
+
+    summary = (
+        "📊 <b>Gestão no mês atual</b>\n"
+        f"🏷 Reportados: {metrics['reported']}\n"
+        f"🛠 Ajustados: {metrics['adjusted']}\n"
+        f"📥 Backlog atual: {total}\n\n"
+    )
+
+    if total == 0:
+        return (
+            "🏷 <b>Falsos positivos pendentes de ajuste</b>\n\n"
+            + summary
+            + "✅ Nenhum falso positivo aguardando correção no bot."
+        )
+
+    pages = max(1, math.ceil(total / FALSE_POSITIVE_PAGE_SIZE))
+    page = max(0, min(int(page), pages - 1))
+    start = page * FALSE_POSITIVE_PAGE_SIZE
+    visible = items[start:start + FALSE_POSITIVE_PAGE_SIZE]
+
+    blocks = []
+    for number, item in enumerate(visible, start=start + 1):
+        revision_id = int(item["revision_id"])
+        title = html.escape(str(item.get("title") or "Sem título"))
+        username = html.escape(str(item.get("username") or "Desconhecido"))
+        marked_by = html.escape(
+            str(item.get("marked_by") or "administrador")
+        )
+        link = telegram_post_url(item.get("telegram_message_id"))
+        link_line = (
+            f'\n🔗 <a href="{html.escape(link, quote=True)}">Ver aviso</a>'
+            if link else ""
+        )
+
+        blocks.append(
+            f"{number}. <b>{title}</b> — {username}\n"
+            f"🆔 Revisão: <code>{revision_id}</code>\n"
+            f"🏷 Marcado por: {marked_by}"
+            f"{link_line}\n"
+            f"✅ Após ajustar o bot: <code>/resolverfalso {revision_id}</code>"
+        )
+
+    return (
+        "🏷 <b>Falsos positivos pendentes de ajuste</b>\n\n"
+        + summary
+        + "\n\n".join(blocks)
+        + f"\n\n📄 Página {page + 1}/{pages} · {total} pendentes"
+        + (
+            "\nUse <code>/falsospositivos N</code> para outra página."
+            if pages > 1 else ""
+        )
+    )
 
 
 def load_community_stats():
@@ -1262,10 +1581,13 @@ def channel_response_metrics(start_ts, end_ts):
         elif kind == "self_revert":
             self_reverts.add(revision_id)
 
+    false_positive_ids = false_positive_revision_ids()
+
     eligible_ids = [
         revision_id
         for revision_id in alerts
         if revision_id not in self_reverts
+        and revision_id not in false_positive_ids
     ]
 
     handled_ids = [
@@ -1367,6 +1689,7 @@ def format_channel_response_summary(metrics):
 def build_wiki_community_report(start_ts, end_ts, period_label):
     events = community_events_between(start_ts, end_ts)
     response_metrics = channel_response_metrics(start_ts, end_ts)
+    false_positive_metrics = false_positive_management_metrics(start_ts, end_ts)
 
     reversions = ranking_counts(events, "revert")
     patrols = ranking_counts(events, "patrol")
@@ -1426,6 +1749,12 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         f"| Nível de checagem || {response_metrics['check_level']}",
         "|-",
         f"| Capacidade observada || {response_metrics['capacity_level']}",
+        "|-",
+        f"| Falsos positivos reportados || {false_positive_metrics['reported']}",
+        "|-",
+        f"| Falsos positivos com ajuste concluído || {false_positive_metrics['adjusted']}",
+        "|-",
+        f"| Falsos positivos aguardando ajuste ao fim do período || {false_positive_metrics['backlog']}",
         "|}",
         "== Capacidade de resposta do canal ==",
         '{| class="wikitable"',
@@ -1454,6 +1783,27 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         "''O Telegram não fornece ao bot uma lista de quem leu cada post. "
         "Por isso, o nível de checagem é uma estimativa baseada em ações "
         "observáveis na Wikipédia, não uma taxa literal de visualização.''",
+        "== Gestão de falsos positivos e melhoria do detector ==",
+        '{| class="wikitable"',
+        "! Indicador !! Resultado",
+        "|-",
+        f"| Reportados no período || {false_positive_metrics['reported']}",
+        "|-",
+        f"| Ajustes concluídos no período || {false_positive_metrics['adjusted']}",
+        "|-",
+        f"| Aguardando ajuste ao fim do período || {false_positive_metrics['backlog']}",
+        "|-",
+        f"| Taxa de fechamento dos reportados no período || {format_percent(false_positive_metrics['close_rate'])}",
+        "|-",
+        f"| Mediana entre reporte e ajuste || {format_minutes(false_positive_metrics['median_adjustment_seconds'])}",
+        "|}",
+        "'''Quem ajudou a calibrar o detector'''",
+        wikitext_false_positive_reporters(
+            false_positive_metrics["reporter_counts"],
+            top=5,
+        ),
+        "''Cada falso positivo confirmado alimenta um ciclo de melhoria do detector. "
+        "Isso significa revisão e ajuste das regras do bot; não há retreinamento automático do modelo.''",
         "== Reconhecimento de trabalho de manutenção ==",
         wikitext_ranking_table("Mais reversões", reversions, "Reversões"),
         wikitext_fast_reverters_table(fast),
@@ -1484,6 +1834,8 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         "* Nível de checagem: percentual dos alertas elegíveis que receberam reversão por terceiro, patrulhamento, eliminação ou resolução manual sem ação necessária.",
         "* Patrulhamento: desfecho próprio e separado, indicando que a edição foi marcada como patrulhada na Wikipédia.",
         "* Resolução sem ação necessária: confirmação manual por administrador do canal de que a edição foi vista e não exige intervenção; não é tratada como patrulhamento.",
+        "* Falso positivo: alerta retirado da fila operacional por um administrador por não representar vandalismo e enviado à fila de melhoria do detector.",
+        "* Ajuste concluído: confirmação administrativa de que o caso de falso positivo já foi tratado no código/regras do bot; isso não implica retreinamento automático do modelo.",
         "* Faixas de checagem: muito alto ≥85%; alto 70–84%; moderado 50–69%; baixo 30–49%; muito baixo <30%.",
         "* Capacidade observada: folga quando ≥85% e backlog muito pequeno; adequada ≥70%; pressionada 50–69%; sobrecarregada <50%.",
         "* Autorreversões são retiradas da demanda comunitária e não melhoram artificialmente o índice.",
@@ -1606,19 +1958,18 @@ def announce_new_version_if_needed():
     message = (
         "✅ Bot atualizado com sucesso\n\n"
         f"🤖 Versão {BOT_VERSION}\n\n"
-        "✅ Nova resolução manual de pendências:\n"
-        "• botão Resolver à direita do primeiro botão de cada alerta;\n"
-        "• uso restrito a administradores do canal;\n"
-        "• marca a edição como vista e sem necessidade de intervenção;\n"
-        "• remove imediatamente o alerta de /pendentes;\n"
-        "• atualiza a mensagem original;\n"
-        "• conta estatisticamente como edição vista pelos editores.\n\n"
-        "📊 Desfechos agora são separados nas estatísticas:\n"
-        "• reversão;\n"
-        "• patrulhamento;\n"
-        "• resolução manual sem ação necessária;\n"
-        "• eliminação;\n"
-        "• pendência ainda sem desfecho."
+        "📊 Gestão de falsos positivos aprimorada:\n"
+        "• reportes e ajustes concluídos passam a aparecer nas estatísticas;\n"
+        "• o relatório mensal mostra quantidade reportada, quantidade ajustada, "
+        "backlog, taxa de fechamento e tempo mediano até ajuste;\n"
+        "• os administradores que reportam falsos positivos recebem reconhecimento "
+        "na avaliação mensal;\n"
+        "• ao marcar um falso positivo, o canal recebe confirmação de que o caso "
+        "entrou na fila de melhoria do detector;\n"
+        "• ao concluir o ajuste, o canal recebe retorno com quem reportou e quem "
+        "marcou a correção como concluída.\n\n"
+        "ℹ️ O bot não se retreina automaticamente: os falsos positivos orientam "
+        "ajustes progressivos nas regras e critérios do detector."
     )
 
     sent = send_telegram_message(message)
@@ -3623,6 +3974,10 @@ def build_daily_detection_report(
         start_timestamp,
         end_timestamp
     )
+    false_positive_metrics = false_positive_management_metrics(
+        start_timestamp,
+        end_timestamp
+    )
 
     period_text = (
         start_dt.strftime(
@@ -3658,6 +4013,10 @@ def build_daily_detection_report(
         f"{format_minutes(median_reversal)}\n\n"
         "👥 Resposta da comunidade aos posts do canal:\n"
         f"{format_channel_response_summary(response_metrics)}\n\n"
+        "🏷 Gestão de falsos positivos:\n"
+        f"• Reportados: {false_positive_metrics['reported']}\n"
+        f"• Ajustes concluídos: {false_positive_metrics['adjusted']}\n"
+        f"• Backlog ao fim do período: {false_positive_metrics['backlog']}\n\n"
         "📈 Por faixa de score:\n"
         +
         "\n".join(band_lines)
@@ -4659,6 +5018,17 @@ def message_with_status(record, status, reverter=None, deleter=None):
             f"{edit_link}"
         )
 
+    if status == "false_positive":
+        false_item = {
+            "title": record.get("title"),
+            "username": record.get("username"),
+            "edit_comment": record.get("edit_comment"),
+            "diff_url": record.get("diff_url"),
+            "revert_risk": record.get("revert_risk"),
+            "marked_by": record.get("false_positive_by"),
+        }
+        return false_positive_message(false_item, fixed=False)
+
     if status == "resolved_no_action":
         resolver = record.get("resolved_by")
         resolver_line = (
@@ -4718,7 +5088,7 @@ def posted_edit_status_monitor():
         active = [
             record
             for record in snapshot
-            if record.get("status") not in ("reverted", "self_reverted", "deleted", "resolved_no_action")
+            if record.get("status") not in ("reverted", "self_reverted", "deleted", "resolved_no_action", "false_positive")
         ]
 
         if not active:
@@ -7732,62 +8102,98 @@ def edit_link_html(url):
     return f"🔗 Ver edição — {safe_url}"
 
 
-def tracked_edit_reply_markup(revision_id, alert_kind="normal", include_resolve=True):
-    # O Telegram não oferece rowspan, largura fixa ou alinhamento à direita
-    # para InlineKeyboardButton. A aproximação nativa mais limpa é usar
-    # o botão principal (mais largo) à esquerda e "Resolver" (curto) à direita
-    # na primeira linha, ficando visualmente perto de 1/3 da largura.
-    resolve_button = {
-        "text": "✅ Resolver",
-        "callback_data": f"resolve:{revision_id}",
-    }
-
-    def first_row(primary):
-        row = [primary]
-        if include_resolve:
-            row.append(resolve_button)
-        return row
+def tracked_edit_reply_markup(
+    revision_id,
+    alert_kind="normal",
+    include_resolution_buttons=True
+):
+    resolution_row = []
+    if include_resolution_buttons:
+        resolution_row = [
+            {
+                "text": "✅ Resolver",
+                "callback_data": f"resolve:{revision_id}",
+            },
+            {
+                "text": "⚠️ Falso +",
+                "callback_data": f"falsepos:{revision_id}",
+            },
+        ]
 
     if alert_kind == "observed":
         rows = [
-            first_row({
+            [{
                 "text": "⛔ Desobservar",
                 "callback_data": f"unobserve:{revision_id}",
-            }),
+            }],
             [{
                 "text": "👁 Vigiar página (6h)",
                 "callback_data": f"watch:{revision_id}",
             }],
         ]
-        return {"inline_keyboard": rows}
-
-    if alert_kind == "watched":
+    elif alert_kind == "watched":
         rows = [
-            first_row({
+            [{
                 "text": "🔎 Observar conta (6h)",
                 "callback_data": f"observe:{revision_id}",
-            }),
+            }],
             [{
                 "text": "🙈 Desvigiar",
                 "callback_data": f"unwatch:{revision_id}",
             }],
         ]
-        return {"inline_keyboard": rows}
+    else:
+        rows = [
+            [{
+                "text": "🔎 Observar conta (6h)",
+                "callback_data": f"observe:{revision_id}",
+            }],
+            [{
+                "text": "👁 Vigiar página (6h)",
+                "callback_data": f"watch:{revision_id}",
+            }],
+        ]
 
-    rows = [
-        first_row({
-            "text": "🔎 Observar conta (6h)",
-            "callback_data": f"observe:{revision_id}",
-        }),
-        [{
-            "text": "👁 Vigiar página (6h)",
-            "callback_data": f"watch:{revision_id}",
-        }],
-    ]
+    if resolution_row:
+        rows.append(resolution_row)
+
     return {"inline_keyboard": rows}
 
 
-def reply_markup_without_resolve(reply_markup, revision_id):
+def reply_markup_without_resolution_buttons(reply_markup, revision_id):
+    """Remove Resolver e Falso +, preservando os dois botões superiores."""
+    if not isinstance(reply_markup, dict):
+        return tracked_edit_reply_markup(
+            revision_id,
+            include_resolution_buttons=False
+        )
+
+    blocked = {
+        f"resolve:{revision_id}",
+        f"falsepos:{revision_id}",
+    }
+    rows = []
+
+    for row in reply_markup.get("inline_keyboard", []):
+        if not isinstance(row, list):
+            continue
+
+        cleaned = [
+            button
+            for button in row
+            if not (
+                isinstance(button, dict)
+                and button.get("callback_data") in blocked
+            )
+        ]
+        if cleaned:
+            rows.append(cleaned)
+
+    return {"inline_keyboard": rows} if rows else None
+
+
+
+def reply_markup_without_resolution_buttons(reply_markup, revision_id):
     if not isinstance(reply_markup, dict):
         return tracked_edit_reply_markup(
             revision_id,
@@ -8102,6 +8508,7 @@ def commands_message():
         "📌 Consulta e acompanhamento\n"
         "👤 /conta Usuário — consulta uma conta.\n"
         "🕒 /pendentes — mostra alertas ainda pendentes.\n"
+        "🏷 /falsospositivos [página] — lista casos aguardando ajuste no bot.\n"
         "📡 /status — mostra o estado do bot.\n\n"
         "👁 Vigilância de páginas\n"
         "👁 /vigiar Página — vigia uma página permanentemente.\n"
@@ -8120,7 +8527,8 @@ def commands_message():
         "🛑 /desvigiarfiltro ID — encerra a vigilância do filtro.\n"
         "📋 /filtros — lista filtros vigiados.\n\n"
         "🧹 Manutenção\n"
-        "🧹 /revisarpendentes — revisa imediatamente os alertas pendentes.\n\n"
+        "🧹 /revisarpendentes — revisa imediatamente os alertas pendentes.\n"
+        "✅ /resolverfalso ID — marca como concluído o ajuste de um falso positivo.\n\n"
         "ℹ️ /start — apresentação do bot.\n"
         "📖 /comandos — mostra esta lista.\n\n"
         "🔐 Comandos que alteram o estado do bot e /revisarpendentes "
@@ -8202,6 +8610,7 @@ def process_telegram_command(message, from_channel=False):
         "/vigiarfiltro",
         "/desvigiarfiltro",
         "/revisarpendentes",
+        "/resolverfalso",
     }
 
     if command in mutating_commands and (
@@ -8239,6 +8648,100 @@ def process_telegram_command(message, from_channel=False):
             chat_id=chat_id,
             parse_mode="HTML",
             reply_markup=pending_markup,
+        )
+        return
+
+    if command == "/falsospositivos":
+        try:
+            page = max(0, int(argument or "1") - 1)
+        except Exception:
+            send_telegram_message(
+                "Uso: /falsospositivos [página]",
+                chat_id=chat_id
+            )
+            return
+
+        send_telegram_message(
+            false_positive_list_message(page),
+            chat_id=chat_id,
+            parse_mode="HTML"
+        )
+        return
+
+    if command == "/resolverfalso":
+        if not argument:
+            send_telegram_message(
+                "Uso: /resolverfalso ID_DA_REVISÃO",
+                chat_id=chat_id
+            )
+            return
+
+        try:
+            revision_id = int(argument.strip())
+        except Exception:
+            send_telegram_message(
+                "❌ ID de revisão inválido.",
+                chat_id=chat_id
+            )
+            return
+
+        actor = (
+            observation_actor_from_channel_post(message)
+            or "administrador do canal"
+        )
+        item, result = mark_false_positive_fixed(
+            revision_id,
+            actor
+        )
+
+        if result == "not_found":
+            send_telegram_message(
+                f"❌ Falso positivo não encontrado: {revision_id}",
+                chat_id=chat_id
+            )
+            return
+
+        if result == "already_resolved":
+            send_telegram_message(
+                f"ℹ️ O falso positivo {revision_id} já estava marcado como resolvido.",
+                chat_id=chat_id
+            )
+            return
+
+        # Tenta também atualizar o post original. A resolução da fila permanece
+        # válida mesmo se o Telegram não permitir editar uma mensagem antiga.
+        message_id = item.get("telegram_message_id")
+        updated = False
+        if message_id:
+            updated = bool(
+                edit_telegram_message(
+                    message_id,
+                    false_positive_message(item, fixed=True),
+                    parse_mode="HTML",
+                    reply_markup=None
+                )
+            )
+
+        reporter = str(
+            item.get("marked_by")
+            or "administrador não identificado"
+        )
+
+        send_telegram_message(
+            (
+                "✅ Falso positivo revisado — ajuste concluído\n\n"
+                f"🆔 Revisão: {revision_id}\n"
+                f"🏷 Reportado por: {reporter}\n"
+                f"🛠 Ajuste concluído por: {actor}\n\n"
+                "Obrigado pelo reporte. Este caso foi incorporado ao ciclo "
+                "de melhoria do detector e saiu da fila de ajustes pendentes."
+                + (
+                    "\n✏️ O aviso original também foi atualizado."
+                    if updated
+                    else "\nℹ️ Não foi possível atualizar o aviso original, mas a fila foi corrigida."
+                )
+            ),
+            chat_id=chat_id
         )
         return
 
@@ -8299,6 +8802,10 @@ def process_telegram_command(message, from_channel=False):
                 for item in posted_edits.values()
                 if not item.get("status")
             )
+
+        false_positive_pending_count = len(
+            unresolved_false_positives()
+        )
 
         with detection_stats_lock:
             stats_count = len(
@@ -8394,6 +8901,8 @@ def process_telegram_command(message, from_channel=False):
                 f"{tracked_count}\n"
                 f"🕒 Alertas pendentes: "
                 f"{pending_count}\n"
+                f"🏷 Falsos positivos aguardando ajuste: "
+                f"{false_positive_pending_count}\n"
                 f"📌 Resumo prioritário: a cada 2h "
                 f"(top 10, 48h)\n"
                 f"🧹 Reconciliação de pendências: a cada 30 min\n"
@@ -9265,7 +9774,7 @@ def process_edit_action_callback(callback):
         return
 
     action, revision_text = data.split(":", 1)
-    if action not in ("observe", "watch", "unobserve", "unwatch", "resolve"):
+    if action not in ("observe", "watch", "unobserve", "unwatch", "resolve", "falsepos"):
         answer_callback_query(callback_id)
         return
 
@@ -9293,6 +9802,87 @@ def process_edit_action_callback(callback):
     actor = telegram_person_display_name(clicker)
     actor_html = html.escape(actor) if actor else None
 
+    if action == "falsepos":
+        revision_id = int(record.get("revision_id") or revision_text)
+
+        if record.get("status"):
+            answer_callback_query(
+                callback_id,
+                "Este alerta já foi resolvido."
+            )
+            return
+
+        marker_name = actor or "administrador do canal"
+
+        with posted_edits_lock:
+            live = posted_edits.get(str(revision_text))
+            if not live or live.get("status"):
+                answer_callback_query(
+                    callback_id,
+                    "Este alerta já foi resolvido."
+                )
+                return
+
+            live["status"] = "false_positive"
+            live["false_positive_at"] = time.time()
+            live["false_positive_by"] = marker_name
+            live["reply_markup"] = reply_markup_without_resolution_buttons(
+                live.get("reply_markup"),
+                revision_id
+            )
+            record = dict(live)
+
+        try:
+            save_posted_edits()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao persistir falso positivo em posted_edits:",
+                safe_exception(e)
+            )
+
+        fp_item = register_false_positive(record, marker_name)
+
+        # Falso positivo não entra nas estatísticas de desempenho do detector.
+        remove_detection_stat(revision_id)
+
+        success = edit_telegram_message(
+            record["message_id"],
+            false_positive_message(fp_item, fixed=False),
+            parse_mode="HTML",
+            reply_markup=record.get("reply_markup")
+        )
+
+        answer_callback_query(
+            callback_id,
+            "Falso positivo registrado. Obrigado — o caso entrou na fila de melhoria do detector."
+        )
+
+        send_telegram_message(
+            (
+                "🏷 Feedback registrado para melhoria do detector\n\n"
+                f"📝 {html.escape(str(record.get('title') or 'Sem título'))}\n"
+                f"🆔 Revisão: {revision_id}\n"
+                f"👤 Reportado por: {html.escape(marker_name)}\n\n"
+                "O caso foi retirado das pendências e entrou na fila de "
+                "ajustes do bot. Quando o ajuste for concluído, o aviso "
+                "será atualizado e o caso deixará a fila de falsos positivos.\n\n"
+                "ℹ️ O bot não se retreina automaticamente: esses relatos "
+                "orientam ajustes sucessivos nas regras e critérios do detector."
+            ),
+            chat_id=TELEGRAM_CHANNEL,
+            parse_mode="HTML"
+        )
+
+        print(
+            "🏷 Falso positivo registrado:",
+            revision_id,
+            "| por:",
+            marker_name,
+            "| mensagem atualizada:",
+            bool(success)
+        )
+        return
+
     if action == "resolve":
         revision_id = int(record.get("revision_id") or revision_text)
 
@@ -9312,7 +9902,7 @@ def process_edit_action_callback(callback):
             live["status"] = "resolved_no_action"
             live["resolved_at"] = resolved_at
             live["resolved_by"] = resolver_name
-            live["reply_markup"] = reply_markup_without_resolve(
+            live["reply_markup"] = reply_markup_without_resolution_buttons(
                 live.get("reply_markup"),
                 revision_id
             )
@@ -9801,6 +10391,7 @@ def main():
     load_pending_summary_state()
     load_reversible_actions()
     load_community_stats()
+    load_false_positives()
 
     cleanup_expired_observations()
     activate_due_post_block_observations()
