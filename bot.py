@@ -22,8 +22,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.19"
-BOT_BUILD = "2.19-r2"
+BOT_VERSION = "2.20"
+BOT_BUILD = "2.20"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1252,7 +1252,7 @@ def channel_response_metrics(start_ts, end_ts):
         if kind == "alert":
             alerts[revision_id] = item
 
-        elif kind in ("revert", "patrol", "delete"):
+        elif kind in ("revert", "patrol", "delete", "resolved_no_action"):
             # Uma revisão conta uma única vez como respondida, mesmo que tenha
             # mais de uma ação posterior.
             previous = actions.get(revision_id)
@@ -1292,6 +1292,27 @@ def channel_response_metrics(start_ts, end_ts):
     pending = len(pending_ids)
     self_reverted = len(self_reverts.intersection(alerts.keys()))
 
+    reversed_count = sum(
+        1
+        for revision_id in handled_ids
+        if actions[revision_id].get("kind") == "revert"
+    )
+    patrolled_count = sum(
+        1
+        for revision_id in handled_ids
+        if actions[revision_id].get("kind") == "patrol"
+    )
+    deleted_count = sum(
+        1
+        for revision_id in handled_ids
+        if actions[revision_id].get("kind") == "delete"
+    )
+    resolved_no_action = sum(
+        1
+        for revision_id in handled_ids
+        if actions[revision_id].get("kind") == "resolved_no_action"
+    )
+
     handled_pct = handled / eligible * 100 if eligible else 0.0
     pending_pct = pending / eligible * 100 if eligible else 0.0
     median_action = median(action_times) if action_times else None
@@ -1308,6 +1329,10 @@ def channel_response_metrics(start_ts, end_ts):
         "pending": pending,
         "pending_pct": pending_pct,
         "self_reverted": self_reverted,
+        "reversed": reversed_count,
+        "patrolled": patrolled_count,
+        "deleted": deleted_count,
+        "resolved_no_action": resolved_no_action,
         "median_action_seconds": median_action,
         "alerts_per_hour": alerts_per_hour,
         "actions_per_hour": actions_per_hour,
@@ -1318,20 +1343,25 @@ def channel_response_metrics(start_ts, end_ts):
 
 def format_channel_response_summary(metrics):
     return (
-        f"👀 Posts com ação comunitária detectada: "
+        f"👀 Posts vistos com desfecho: "
         f"{metrics['handled']}/{metrics['eligible']} "
-        f"({format_percent(metrics['handled_pct'])})\\n"
-        f"📥 Sem ação detectada: {metrics['pending']} "
-        f"({format_percent(metrics['pending_pct'])})\\n"
+        f"({format_percent(metrics['handled_pct'])})\n"
+        f"↩️ Revertidos: {metrics['reversed']}\n"
+        f"🛡️ Patrulhados: {metrics['patrolled']}\n"
+        f"✅ Vistos sem ação necessária: {metrics['resolved_no_action']}\n"
+        f"🗑️ Eliminados: {metrics['deleted']}\n"
+        f"📥 Ainda sem desfecho: {metrics['pending']} "
+        f"({format_percent(metrics['pending_pct'])})\n"
         f"↩️ Autorrevertidos: {metrics['self_reverted']} "
-        f"(não contam como resposta comunitária)\\n"
-        f"🔎 Nível de checagem: {metrics['check_level']}\\n"
+        f"(não contam como resposta comunitária)\n"
+        f"🔎 Nível de checagem: {metrics['check_level']}\n"
         f"⚙️ Capacidade observada: {metrics['capacity_level']} "
         f"({metrics['actions_per_hour']:.1f} respostas/h para "
-        f"{metrics['alerts_per_hour']:.1f} alertas/h)\\n"
-        f"⏱ Mediana até primeira ação: "
+        f"{metrics['alerts_per_hour']:.1f} alertas/h)\n"
+        f"⏱ Mediana até primeiro desfecho: "
         f"{format_minutes(metrics['median_action_seconds'])}"
     )
+
 
 
 def build_wiki_community_report(start_ts, end_ts, period_label):
@@ -1362,6 +1392,9 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
     total_protections = sum(1 for x in events if x.get("kind") == "protect")
     total_blocks = sum(1 for x in events if x.get("kind") == "block")
     total_deletions = sum(1 for x in events if x.get("kind") == "delete")
+    total_resolved_no_action = sum(
+        1 for x in events if x.get("kind") == "resolved_no_action"
+    )
 
     return "\n\n".join([
         f"= Relatório de manutenção e combate a vandalismo — {period_label} =",
@@ -1382,6 +1415,8 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         "|-",
         f"| Eliminações ligadas a alertas || {total_deletions}",
         "|-",
+        f"| Vistos sem ação necessária || {total_resolved_no_action}",
+        "|-",
         f"| Posts acompanhados pelo canal || {response_metrics['posts']}",
         "|-",
         f"| Posts elegíveis para resposta comunitária || {response_metrics['eligible']}",
@@ -1396,9 +1431,17 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         '{| class="wikitable"',
         "! Indicador !! Resultado",
         "|-",
-        f"| Ações detectadas || {response_metrics['handled']} de {response_metrics['eligible']} ({format_percent(response_metrics['handled_pct'])})",
+        f"| Posts vistos com desfecho || {response_metrics['handled']} de {response_metrics['eligible']} ({format_percent(response_metrics['handled_pct'])})",
         "|-",
-        f"| Sem ação detectada || {response_metrics['pending']} ({format_percent(response_metrics['pending_pct'])})",
+        f"| Revertidos || {response_metrics['reversed']}",
+        "|-",
+        f"| Patrulhados || {response_metrics['patrolled']}",
+        "|-",
+        f"| Vistos sem ação necessária || {response_metrics['resolved_no_action']}",
+        "|-",
+        f"| Eliminados || {response_metrics['deleted']}",
+        "|-",
+        f"| Ainda sem desfecho || {response_metrics['pending']} ({format_percent(response_metrics['pending_pct'])})",
         "|-",
         f"| Autorreversões || {response_metrics['self_reverted']}",
         "|-",
@@ -1438,7 +1481,9 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         "* Patrulhamento: somente quando o bot consegue relacionar o evento ao registro de patrulha e identificar o executor.",
         "* Proteções, bloqueios e eliminações: baseados nos registros públicos da Wikipédia observados pelo bot.",
         "* Categorias: capturadas da página quando o caso confirmado é processado; podem não estar disponíveis após eliminação.",
-        "* Nível de checagem: percentual dos alertas elegíveis que receberam reversão por terceiro, patrulhamento ou eliminação.",
+        "* Nível de checagem: percentual dos alertas elegíveis que receberam reversão por terceiro, patrulhamento, eliminação ou resolução manual sem ação necessária.",
+        "* Patrulhamento: desfecho próprio e separado, indicando que a edição foi marcada como patrulhada na Wikipédia.",
+        "* Resolução sem ação necessária: confirmação manual por administrador do canal de que a edição foi vista e não exige intervenção; não é tratada como patrulhamento.",
         "* Faixas de checagem: muito alto ≥85%; alto 70–84%; moderado 50–69%; baixo 30–49%; muito baixo <30%.",
         "* Capacidade observada: folga quando ≥85% e backlog muito pequeno; adequada ≥70%; pressionada 50–69%; sobrecarregada <50%.",
         "* Autorreversões são retiradas da demanda comunitária e não melhoram artificialmente o índice.",
@@ -1555,25 +1600,25 @@ def announce_new_version_if_needed():
     announced_build = load_saved_bot_version()
 
     if announced_build == BOT_BUILD:
-        print(
-            "ℹ️ Versão já anunciada. "
-            "Nenhuma mensagem enviada."
-        )
+        print("ℹ️ Versão já anunciada. Nenhuma mensagem enviada.")
         return
 
     message = (
         "✅ Bot atualizado com sucesso\n\n"
         f"🤖 Versão {BOT_VERSION}\n\n"
-        "📊 Novas métricas de resposta do canal:\n"
-        "• quantidade e percentual de posts com alguma ação comunitária detectada;\n"
-        "• nível de checagem baseado na proporção de alertas que receberam ação;\n"
-        "• capacidade observada comparando volume de alertas e respostas;\n"
-        "• mediana até a primeira ação comunitária;\n"
-        "• autorreversões são separadas para não inflar artificialmente o índice;\n"
-        "• relatórios wiki passam a incluir essas métricas.\n\n"
-        "ℹ️ O bot não consegue saber quem apenas visualizou um post no Telegram; "
-        "a checagem é inferida por ações observáveis na Wikipédia.\n\n"
-        "🧹 O histórico textual de anúncios de versões antigas foi removido do código."
+        "✅ Nova resolução manual de pendências:\n"
+        "• botão Resolver à direita do primeiro botão de cada alerta;\n"
+        "• uso restrito a administradores do canal;\n"
+        "• marca a edição como vista e sem necessidade de intervenção;\n"
+        "• remove imediatamente o alerta de /pendentes;\n"
+        "• atualiza a mensagem original;\n"
+        "• conta estatisticamente como edição vista pelos editores.\n\n"
+        "📊 Desfechos agora são separados nas estatísticas:\n"
+        "• reversão;\n"
+        "• patrulhamento;\n"
+        "• resolução manual sem ação necessária;\n"
+        "• eliminação;\n"
+        "• pendência ainda sem desfecho."
     )
 
     sent = send_telegram_message(message)
@@ -1587,8 +1632,7 @@ def announce_new_version_if_needed():
         print("✅ Nova versão anunciada e registrada.")
     except Exception as e:
         print(
-            "⚠️ Mensagem enviada, mas houve erro "
-            "ao registrar a versão:",
+            "⚠️ Mensagem enviada, mas houve erro ao registrar a versão:",
             safe_exception(e)
         )
 
@@ -3184,6 +3228,8 @@ def register_detection_stat(
             "score": float(score),
             "revert_risk": float(revert_risk),
             "reverted_at": None,
+            "patrolled_at": None,
+            "resolved_no_action_at": None,
         }
     except Exception:
         return
@@ -3332,6 +3378,48 @@ def format_minutes(seconds):
     return f"{hours}h"
 
 
+def mark_detection_stat_patrolled(revision_id, patrolled_at):
+    changed = False
+
+    with detection_stats_lock:
+        for item in detection_stats.get("records", []):
+            if int(item.get("revision_id", 0)) == int(revision_id):
+                if item.get("patrolled_at") is None:
+                    item["patrolled_at"] = float(patrolled_at)
+                    changed = True
+                break
+
+    if changed:
+        try:
+            save_detection_stats()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao salvar patrulhamento estatístico:",
+                safe_exception(e)
+            )
+
+
+def mark_detection_stat_resolved_no_action(revision_id, resolved_at):
+    changed = False
+
+    with detection_stats_lock:
+        for item in detection_stats.get("records", []):
+            if int(item.get("revision_id", 0)) == int(revision_id):
+                if item.get("resolved_no_action_at") is None:
+                    item["resolved_no_action_at"] = float(resolved_at)
+                    changed = True
+                break
+
+    if changed:
+        try:
+            save_detection_stats()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao salvar resolução estatística:",
+                safe_exception(e)
+            )
+
+
 def score_band_summary(records, minimum, maximum):
     items = [
         item
@@ -3390,10 +3478,43 @@ def build_daily_detection_report(
     ]
 
     reverted = len(reverted_records)
-    pending = total - reverted
+
+    patrolled_records = [
+        item
+        for item in records
+        if item.get("patrolled_at") is not None
+        and item.get("reverted_at") is None
+    ]
+    patrolled = len(patrolled_records)
+
+    resolved_no_action_records = [
+        item
+        for item in records
+        if item.get("resolved_no_action_at") is not None
+        and item.get("reverted_at") is None
+        and item.get("patrolled_at") is None
+    ]
+    resolved_no_action = len(resolved_no_action_records)
+
+    pending = max(
+        0,
+        total - reverted - patrolled - resolved_no_action
+    )
 
     reverted_pct = (
         reverted / total * 100
+        if total
+        else 0.0
+    )
+
+    patrolled_pct = (
+        patrolled / total * 100
+        if total
+        else 0.0
+    )
+
+    resolved_no_action_pct = (
+        resolved_no_action / total * 100
         if total
         else 0.0
     )
@@ -3523,7 +3644,11 @@ def build_daily_detection_report(
         f"🚨 Alertas de possível vandalismo: {total}\n"
         f"↩️ Edições revertidas: "
         f"{reverted} ({format_percent(reverted_pct)})\n"
-        f"⏳ Ainda não revertidas: "
+        f"🛡️ Edições patrulhadas: "
+        f"{patrolled} ({format_percent(patrolled_pct)})\n"
+        f"✅ Resolvidas sem ação necessária: "
+        f"{resolved_no_action} ({format_percent(resolved_no_action_pct)})\n"
+        f"⏳ Ainda pendentes: "
         f"{pending} ({format_percent(pending_pct)})\n\n"
         f"🤖 Revert Risk médio: "
         f"{format_percent(avg_risk)}\n"
@@ -4534,6 +4659,23 @@ def message_with_status(record, status, reverter=None, deleter=None):
             f"{edit_link}"
         )
 
+    if status == "resolved_no_action":
+        resolver = record.get("resolved_by")
+        resolver_line = (
+            f"\nVisto por: {html.escape(str(resolver))}"
+            if resolver
+            else ""
+        )
+        return (
+            "✅ Edição vista — nenhuma ação necessária\n\n"
+            f"📝 {title}\n"
+            f"👤 {username}\n"
+            f"💬 {comment}\n"
+            f"{risk_line}\n"
+            f"{edit_link}"
+            f"{resolver_line}"
+        )
+
     if status == "deleted":
         deleter_line = (
             f"\nEliminada por: {html.escape(str(deleter))}" if deleter else ""
@@ -4576,7 +4718,7 @@ def posted_edit_status_monitor():
         active = [
             record
             for record in snapshot
-            if record.get("status") not in ("reverted", "self_reverted", "deleted")
+            if record.get("status") not in ("reverted", "self_reverted", "deleted", "resolved_no_action")
         ]
 
         if not active:
@@ -4723,16 +4865,27 @@ def posted_edit_status_monitor():
                         )
 
                     elif new_status == "patrolled":
+                        event_time = time.time()
                         patroller = get_patroller_username(
                             record.get("title") or "",
                             revision_id,
+                        )
+                        mark_detection_stat_patrolled(
+                            revision_id,
+                            event_time
                         )
                         record_community_event(
                             "patrol",
                             actor=patroller,
                             title=record.get("title"),
-                            timestamp=time.time(),
+                            timestamp=event_time,
                             revision_id=revision_id,
+                            latency=max(
+                                0,
+                                event_time - float(
+                                    record.get("posted_at", event_time)
+                                )
+                            ),
                         )
 
                     print(
@@ -7579,15 +7732,28 @@ def edit_link_html(url):
     return f"🔗 Ver edição — {safe_url}"
 
 
-def tracked_edit_reply_markup(revision_id, alert_kind="normal"):
-    # Em alertas gerados por uma conta já observada, não faz sentido
-    # oferecer simultaneamente "Observar" e "Desobservar".
+def tracked_edit_reply_markup(revision_id, alert_kind="normal", include_resolve=True):
+    # O Telegram não oferece rowspan, largura fixa ou alinhamento à direita
+    # para InlineKeyboardButton. A aproximação nativa mais limpa é usar
+    # o botão principal (mais largo) à esquerda e "Resolver" (curto) à direita
+    # na primeira linha, ficando visualmente perto de 1/3 da largura.
+    resolve_button = {
+        "text": "✅ Resolver",
+        "callback_data": f"resolve:{revision_id}",
+    }
+
+    def first_row(primary):
+        row = [primary]
+        if include_resolve:
+            row.append(resolve_button)
+        return row
+
     if alert_kind == "observed":
         rows = [
-            [{
+            first_row({
                 "text": "⛔ Desobservar",
                 "callback_data": f"unobserve:{revision_id}",
-            }],
+            }),
             [{
                 "text": "👁 Vigiar página (6h)",
                 "callback_data": f"watch:{revision_id}",
@@ -7595,14 +7761,12 @@ def tracked_edit_reply_markup(revision_id, alert_kind="normal"):
         ]
         return {"inline_keyboard": rows}
 
-    # Em alertas de uma página já vigiada, não oferecemos "Vigiar página"
-    # novamente. Mantemos a possibilidade de observar a conta e desvigiar.
     if alert_kind == "watched":
         rows = [
-            [{
+            first_row({
                 "text": "🔎 Observar conta (6h)",
                 "callback_data": f"observe:{revision_id}",
-            }],
+            }),
             [{
                 "text": "🙈 Desvigiar",
                 "callback_data": f"unwatch:{revision_id}",
@@ -7611,17 +7775,44 @@ def tracked_edit_reply_markup(revision_id, alert_kind="normal"):
         return {"inline_keyboard": rows}
 
     rows = [
-        [{
+        first_row({
             "text": "🔎 Observar conta (6h)",
             "callback_data": f"observe:{revision_id}",
-        }],
+        }),
         [{
             "text": "👁 Vigiar página (6h)",
             "callback_data": f"watch:{revision_id}",
         }],
     ]
-
     return {"inline_keyboard": rows}
+
+
+def reply_markup_without_resolve(reply_markup, revision_id):
+    if not isinstance(reply_markup, dict):
+        return tracked_edit_reply_markup(
+            revision_id,
+            include_resolve=False
+        )
+
+    target = f"resolve:{revision_id}"
+    rows = []
+
+    for row in reply_markup.get("inline_keyboard", []):
+        if not isinstance(row, list):
+            continue
+        cleaned = [
+            button
+            for button in row
+            if not (
+                isinstance(button, dict)
+                and button.get("callback_data") == target
+            )
+        ]
+        if cleaned:
+            rows.append(cleaned)
+
+    return {"inline_keyboard": rows} if rows else None
+
 
 
 def tracked_queue_item(
@@ -7908,37 +8099,34 @@ def analysis_worker():
 def commands_message():
     return (
         "🤖 Comandos disponíveis\n\n"
-        "👁 /vigiar Página\n"
-        "Vigia uma página.\n\n"
-        "🙈 /desvigiar Página\n"
-        "Remove uma página da vigilância.\n\n"
-        "📋 /vigiadas\n"
-        "Lista páginas vigiadas.\n\n"
-        "🔎 /observar Usuário\n"
-        "Observa uma conta durante 6 horas.\n\n"
-        "⛔ /desobservar Usuário\n"
-        "Encerra a observação de uma conta.\n\n"
-        "📋 /observadas\n"
-        "Lista contas atualmente observadas.\n\n"
-        "🙈 /ignorar Usuário\n"
-        "Ignora uma conta durante 6 horas no detector normal.\n\n"
-        "👀 /designorar Usuário\n"
-        "Encerra a exclusão temporária de uma conta.\n\n"
-        "📋 /ignoradas\n"
-        "Lista contas temporariamente ignoradas.\n\n"
-        "🛡 /vigiarfiltro ID\n"
-        "Vigia um filtro de abusos.\n\n"
-        "🛑 /desvigiarfiltro ID\n"
-        "Remove um filtro da vigilância.\n\n"
-        "📋 /filtros\n"
-        "Lista filtros de abuso vigiados.\n\n"
-        "👤 /conta Usuário\n"
-        "Consulta uma conta.\n\n"
-        "📡 /status\n"
-        "Mostra o estado do bot.\n\n"
-        "📖 /comandos\n"
-        "Mostra esta lista."
+        "📌 Consulta e acompanhamento\n"
+        "👤 /conta Usuário — consulta uma conta.\n"
+        "🕒 /pendentes — mostra alertas ainda pendentes.\n"
+        "📡 /status — mostra o estado do bot.\n\n"
+        "👁 Vigilância de páginas\n"
+        "👁 /vigiar Página — vigia uma página permanentemente.\n"
+        "🙈 /desvigiar Página — encerra a vigilância.\n"
+        "📋 /vigiadas — lista páginas vigiadas, inclusive temporárias.\n\n"
+        "🔎 Observação de contas\n"
+        "🔎 /observar Usuário — observa uma conta por 6 horas.\n"
+        "⛔ /desobservar Usuário — encerra a observação.\n"
+        "📋 /observadas — lista contas observadas.\n\n"
+        "🙈 Exclusão temporária do detector\n"
+        "🙈 /ignorar Usuário — ignora a conta por 6 horas no detector normal.\n"
+        "👀 /designorar Usuário — volta a considerar a conta.\n"
+        "📋 /ignoradas — lista contas temporariamente ignoradas.\n\n"
+        "🛡 Filtros de abuso\n"
+        "🛡 /vigiarfiltro ID — vigia um filtro.\n"
+        "🛑 /desvigiarfiltro ID — encerra a vigilância do filtro.\n"
+        "📋 /filtros — lista filtros vigiados.\n\n"
+        "🧹 Manutenção\n"
+        "🧹 /revisarpendentes — revisa imediatamente os alertas pendentes.\n\n"
+        "ℹ️ /start — apresentação do bot.\n"
+        "📖 /comandos — mostra esta lista.\n\n"
+        "🔐 Comandos que alteram o estado do bot e /revisarpendentes "
+        "devem ser publicados diretamente no canal configurado."
     )
+
 
 
 def telegram_person_display_name(user):
@@ -9077,7 +9265,7 @@ def process_edit_action_callback(callback):
         return
 
     action, revision_text = data.split(":", 1)
-    if action not in ("observe", "watch", "unobserve", "unwatch"):
+    if action not in ("observe", "watch", "unobserve", "unwatch", "resolve"):
         answer_callback_query(callback_id)
         return
 
@@ -9090,7 +9278,7 @@ def process_edit_action_callback(callback):
     clicker = callback.get("from") or {}
     clicker_id = clicker.get("id")
     if not clicker_id or not telegram_user_is_channel_admin(clicker_id):
-        answer_callback_query(callback_id, "Apenas administradores do canal podem alterar observações e vigilâncias.")
+        answer_callback_query(callback_id, "Apenas administradores do canal podem usar este botão.")
         return
 
     with posted_edits_lock:
@@ -9104,6 +9292,79 @@ def process_edit_action_callback(callback):
     title = str(record.get("title") or "").strip()
     actor = telegram_person_display_name(clicker)
     actor_html = html.escape(actor) if actor else None
+
+    if action == "resolve":
+        revision_id = int(record.get("revision_id") or revision_text)
+
+        if record.get("status"):
+            answer_callback_query(callback_id, "Este alerta já foi resolvido.")
+            return
+
+        resolved_at = time.time()
+        resolver_name = actor or "administrador do canal"
+
+        with posted_edits_lock:
+            live = posted_edits.get(str(revision_text))
+            if not live or live.get("status"):
+                answer_callback_query(callback_id, "Este alerta já foi resolvido.")
+                return
+
+            live["status"] = "resolved_no_action"
+            live["resolved_at"] = resolved_at
+            live["resolved_by"] = resolver_name
+            live["reply_markup"] = reply_markup_without_resolve(
+                live.get("reply_markup"),
+                revision_id
+            )
+            record = dict(live)
+
+        try:
+            save_posted_edits()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao persistir resolução manual:",
+                safe_exception(e)
+            )
+
+        success = edit_telegram_message(
+            record["message_id"],
+            message_with_status(record, "resolved_no_action"),
+            parse_mode="HTML",
+            reply_markup=record.get("reply_markup")
+        )
+
+        mark_detection_stat_resolved_no_action(
+            revision_id,
+            resolved_at
+        )
+
+        record_community_event(
+            "resolved_no_action",
+            actor=resolver_name,
+            title=record.get("title"),
+            timestamp=resolved_at,
+            revision_id=revision_id,
+            latency=max(
+                0,
+                resolved_at - float(record.get("posted_at", resolved_at))
+            ),
+            metadata={
+                "telegram_message_updated": bool(success),
+                "resolution": "seen_no_action_required",
+            },
+        )
+
+        answer_callback_query(
+            callback_id,
+            "Pendência resolvida: nenhuma ação necessária."
+        )
+        print(
+            "✅ Alerta resolvido manualmente sem ação necessária:",
+            revision_id,
+            "| por:",
+            resolver_name
+        )
+        return
 
     if action == "observe":
         if not username:
