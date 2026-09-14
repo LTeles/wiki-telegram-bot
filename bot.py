@@ -8114,11 +8114,16 @@ def tracked_edit_reply_markup(
                 "text": "✅ Resolver",
                 "callback_data": f"resolve:{revision_id}",
             },
-            {
+        ]
+
+        # "Falso +" só se aplica aos alertas produzidos pelo detector normal.
+        # Edições publicadas apenas por observação de conta ou vigilância de
+        # página não são classificações positivas do detector.
+        if alert_kind == "normal":
+            resolution_row.append({
                 "text": "⚠️ Falso +",
                 "callback_data": f"falsepos:{revision_id}",
-            },
-        ]
+            })
 
     if alert_kind == "observed":
         rows = [
@@ -9804,6 +9809,13 @@ def process_edit_action_callback(callback):
 
     if action == "falsepos":
         revision_id = int(record.get("revision_id") or revision_text)
+
+        if record.get("alert_kind", "normal") != "normal":
+            answer_callback_query(
+                callback_id,
+                "Falso positivo só pode ser marcado em alertas do detector."
+            )
+            return
 
         if record.get("status"):
             answer_callback_query(
