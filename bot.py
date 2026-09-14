@@ -4,6 +4,8 @@ import time
 import queue
 import threading
 import re
+import difflib
+import unicodedata
 import html
 import ipaddress
 import secrets
@@ -11,7 +13,7 @@ import secrets
 from datetime import datetime, timezone, timedelta
 from statistics import median
 from collections import Counter, defaultdict
-from urllib.parse import quote
+from urllib.parse import quote, parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -22,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.21"
-BOT_BUILD = "2.21"
+BOT_VERSION = "2.22"
+BOT_BUILD = "2.22"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -204,6 +206,11 @@ FALSE_POSITIVES_FILE = os.environ.get(
     "/data/false_positives.json"
 )
 
+FALSE_NEGATIVES_FILE = os.environ.get(
+    "FALSE_NEGATIVES_FILE",
+    "/data/false_negatives.json"
+)
+
 WIKI_REPORT_PREVIEW_FILE = os.environ.get(
     "WIKI_REPORT_PREVIEW_FILE",
     "/data/wiki_report_preview.txt"
@@ -290,6 +297,9 @@ COMMUNITY_STATS_RETENTION_DAYS = 400
 # até que um administrador confirme que o ajuste correspondente no bot
 # foi concluído.
 false_positives = {}
+false_negatives = {}
+false_negatives_lock = threading.Lock()
+false_negatives_persist_lock = threading.Lock()
 false_positives_lock = threading.Lock()
 false_positives_persist_lock = threading.Lock()
 FALSE_POSITIVE_PAGE_SIZE = 10
@@ -403,6 +413,7 @@ def ensure_storage():
         REVERSIBLE_ACTIONS_FILE,
         COMMUNITY_STATS_FILE,
         FALSE_POSITIVES_FILE,
+        FALSE_NEGATIVES_FILE,
         WIKI_REPORT_PREVIEW_FILE,
     ]
 
@@ -864,6 +875,112 @@ def load_false_positives():
         "| pendentes de ajuste:",
         sum(1 for item in loaded.values() if not item.get("resolved_at"))
     )
+
+
+def save_false_negatives():
+    with false_negatives_persist_lock:
+        with false_negatives_lock:
+            data = {"items": list(false_negatives.values())}
+        atomic_write_json(FALSE_NEGATIVES_FILE, data)
+
+
+def load_false_negatives():
+    global false_negatives
+    data = load_json(FALSE_NEGATIVES_FILE, {"items": []})
+    loaded = {}
+    for item in data.get("items", []) if isinstance(data, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            rid = int(item.get("revision_id"))
+        except Exception:
+            continue
+        item = dict(item)
+        item["revision_id"] = rid
+        loaded[str(rid)] = item
+    with false_negatives_lock:
+        false_negatives = loaded
+    print("✅ Falsos negativos carregados:", len(loaded), "| aguardando ajuste:", sum(1 for x in loaded.values() if not x.get("resolved_at")))
+
+
+def normalize_similarity_name(value):
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def strong_title_creator_similarity(title, username):
+    a = normalize_similarity_name(str(title or "").split(":", 1)[-1])
+    b = normalize_similarity_name(username)
+    if min(len(a), len(b)) < 5:
+        return False, 0.0
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    containment = min(len(a), len(b)) / max(len(a), len(b)) if (a in b or b in a) else 0.0
+    similarity = max(ratio, containment)
+    return similarity >= 0.86, similarity
+
+
+def new_page_promotional_signals(change, diff):
+    if change.get("type") != "new":
+        return {"bonus": 0.0, "signals": []}
+    added = str(diff.get("added", "") or "").casefold()
+    if not added:
+        return {"bonus": 0.0, "signals": []}
+    signals, bonus = [], 0.0
+    has_ref = any(x in added for x in ("<ref", "{{citar ", "{{cite ", "== referências ==", "== referencias =="))
+    if not has_ref and len(added) >= 180:
+        signals.append("página nova sem referências aparentes")
+        bonus += 0.05
+    terms = ("empresa", "agência", "agencia", "marketing", "marca", "serviços", "servicos", "clientes", "fundada", "fundado", "sede", "startup", "negócio", "negocio", "empreendimento", "loja", "consultoria", "grupo empresarial")
+    hits = sum(1 for term in terms if term in added)
+    if hits >= 2:
+        signals.append("múltiplos sinais de texto institucional/promocional")
+        bonus += min(0.10, 0.04 + 0.02 * hits)
+    close, similarity = strong_title_creator_similarity(change.get("title"), change.get("user"))
+    if close:
+        signals.append(f"forte semelhança título↔criador ({similarity:.0%})")
+        bonus += 0.08
+    # Um único indício nunca recebe bônus forte. O ganho relevante exige combinação contextual.
+    if len(signals) < 2:
+        bonus = min(bonus, 0.04)
+    return {"bonus": min(0.20, bonus), "signals": signals}
+
+
+def fetch_revision_for_calibration(revision_id):
+    response = requests.get(WIKIPEDIA_API, params={"action":"query","format":"json","formatversion":2,"prop":"revisions","revids":int(revision_id),"rvprop":"ids|timestamp|user|comment|content","rvslots":"main"}, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    pages = response.json().get("query", {}).get("pages", [])
+    if not pages or pages[0].get("missing"):
+        raise ValueError("revisão não encontrada")
+    page=pages[0]; revs=page.get("revisions", [])
+    if not revs: raise ValueError("revisão não encontrada")
+    rev=revs[0]
+    response = requests.get(WIKIPEDIA_API, params={"action":"query","format":"json","formatversion":2,"prop":"revisions","pageids":page.get("pageid"),"rvdir":"newer","rvlimit":1,"rvprop":"ids"}, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    fp=response.json().get("query",{}).get("pages",[])
+    fr=(fp[0].get("revisions",[]) if fp else [])
+    is_new=bool(fr and int(fr[0].get("revid") or 0)==int(revision_id))
+    content=((rev.get("slots") or {}).get("main") or {}).get("content", "") or ""
+    return page, rev, is_new, {"added":content[:MAX_DIFF_CHARS], "removed":""}
+
+
+def register_false_negative(revision_id, actor):
+    rid=int(revision_id)
+    page, rev, is_new, diff = fetch_revision_for_calibration(rid)
+    rr=get_revert_risk(rid)
+    change={"type":"new" if is_new else "edit", "title":page.get("title") or "", "user":rev.get("user") or ""}
+    promo=new_page_promotional_signals(change,diff)
+    item={"revision_id":rid,"title":change["title"],"username":change["user"],"edit_comment":rev.get("comment") or "","revision_timestamp":rev.get("timestamp"),"is_new_page":is_new,"revert_risk":rr,"promotional_bonus":promo["bonus"],"promotional_signals":promo["signals"],"reported_at":time.time(),"reported_by":actor,"resolved_at":None,"resolved_by":None}
+    with false_negatives_lock:
+        false_negatives[str(rid)]=item
+    save_false_negatives()
+    return item
+
+
+def false_negative_metrics():
+    with false_negatives_lock:
+        items=list(false_negatives.values())
+    return {"total":len(items),"resolved":sum(bool(x.get("resolved_at")) for x in items),"unresolved":sum(not x.get("resolved_at") for x in items)}
 
 
 def unresolved_false_positives():
@@ -1958,18 +2075,12 @@ def announce_new_version_if_needed():
     message = (
         "✅ Bot atualizado com sucesso\n\n"
         f"🤖 Versão {BOT_VERSION}\n\n"
-        "📊 Gestão de falsos positivos aprimorada:\n"
-        "• reportes e ajustes concluídos passam a aparecer nas estatísticas;\n"
-        "• o relatório mensal mostra quantidade reportada, quantidade ajustada, "
-        "backlog, taxa de fechamento e tempo mediano até ajuste;\n"
-        "• os administradores que reportam falsos positivos recebem reconhecimento "
-        "na avaliação mensal;\n"
-        "• ao marcar um falso positivo, o canal recebe confirmação de que o caso "
-        "entrou na fila de melhoria do detector;\n"
-        "• ao concluir o ajuste, o canal recebe retorno com quem reportou e quem "
-        "marcou a correção como concluída.\n\n"
-        "ℹ️ O bot não se retreina automaticamente: os falsos positivos orientam "
-        "ajustes progressivos nas regras e critérios do detector."
+        "🧪 Nova base de calibração de falsos negativos:\n"
+        "• /falsonegativo aceita ID ou link e registra uma revisão que o detector deixou passar;\n"
+        "• /falsosnegativos mostra os casos aguardando ajuste;\n"
+        "• /resolverfalsonegativo confirma que o caso foi contemplado;\n"
+        "• páginas novas passam a combinar ausência de referências, múltiplos sinais institucionais/promocionais e, apenas quando muito forte, semelhança entre título e criador.\n\n"
+        "ℹ️ Nenhuma palavra isolada determina propaganda, e a semelhança título↔criador só pontua a partir de 86%. A base serve para calibração e não representa acurácia global do detector."
     )
 
     sent = send_telegram_message(message)
@@ -7995,6 +8106,10 @@ def analyze_vandalism(change, diff, revert_risk):
         score *= float(context_adjustment.get("multiplier", 1.0))
         score += float(context_adjustment.get("additive", 0.0))
 
+    promotional_adjustment = new_page_promotional_signals(change, diff)
+    if promotional_adjustment["bonus"] > 0:
+        score += promotional_adjustment["bonus"]
+
     score = min(max(score, 0.0), 1.0)
 
     reasons = []
@@ -8041,6 +8156,8 @@ def analyze_vandalism(change, diff, revert_risk):
             )
         )
 
+    reasons.extend(promotional_adjustment.get("signals", []))
+
     if not reasons:
         reasons.append("edição suspeita")
 
@@ -8050,6 +8167,7 @@ def analyze_vandalism(change, diff, revert_risk):
         "reason": ", ".join(reasons),
         "benign_reduction": benign,
         "context_adjustment": context_adjustment,
+        "promotional_adjustment": promotional_adjustment,
     }
 
 
@@ -8514,6 +8632,8 @@ def commands_message():
         "👤 /conta Usuário — consulta uma conta.\n"
         "🕒 /pendentes — mostra alertas ainda pendentes.\n"
         "🏷 /falsospositivos [página] — lista casos aguardando ajuste no bot.\n"
+        "🔎 /falsonegativo ID ou LINK — registra uma revisão que o detector deixou passar.\n"
+        "🧪 /falsosnegativos — mostra a base de calibração de falsos negativos.\n"
         "📡 /status — mostra o estado do bot.\n\n"
         "👁 Vigilância de páginas\n"
         "👁 /vigiar Página — vigia uma página permanentemente.\n"
@@ -8533,7 +8653,8 @@ def commands_message():
         "📋 /filtros — lista filtros vigiados.\n\n"
         "🧹 Manutenção\n"
         "🧹 /revisarpendentes — revisa imediatamente os alertas pendentes.\n"
-        "✅ /resolverfalso ID — marca como concluído o ajuste de um falso positivo.\n\n"
+        "✅ /resolverfalso ID — marca como concluído o ajuste de um falso positivo.\n"
+        "✅ /resolverfalsonegativo ID — marca como concluído o ajuste de um falso negativo.\n\n"
         "ℹ️ /start — apresentação do bot.\n"
         "📖 /comandos — mostra esta lista.\n\n"
         "🔐 Comandos que alteram o estado do bot e /revisarpendentes "
@@ -8572,6 +8693,42 @@ def observation_actor_from_channel_post(message):
         return signature
 
     return None
+
+
+def parse_revision_reference(value):
+    """Accept a revision ID or a pt.wikipedia edit/revision URL."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("informe o ID ou o link da revisão")
+
+    if raw.isdigit():
+        return int(raw)
+
+    # Accept only Portuguese Wikipedia links when a URL is supplied.
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        parsed = None
+
+    if parsed and parsed.scheme in ("http", "https"):
+        host = (parsed.hostname or "").casefold()
+        if host not in ("pt.wikipedia.org", "www.pt.wikipedia.org"):
+            raise ValueError("o link deve ser da Wikipédia em português")
+
+        qs = parse_qs(parsed.query)
+        for key in ("diff", "oldid"):
+            values = qs.get(key) or []
+            if values:
+                candidate = str(values[0]).strip()
+                if candidate.isdigit():
+                    return int(candidate)
+
+        # Also accept /wiki/Special:Diff/123 and localized variants that end in /123.
+        m = re.search(r"/(?:Special:Diff|Especial:Diff|Especial:Diferenças?)/([0-9]+)(?:/|$)", parsed.path, re.I)
+        if m:
+            return int(m.group(1))
+
+    raise ValueError("não consegui identificar o ID da revisão; use um número ou um link com oldid=/diff=")
 
 
 def process_telegram_command(message, from_channel=False):
@@ -8616,6 +8773,8 @@ def process_telegram_command(message, from_channel=False):
         "/desvigiarfiltro",
         "/revisarpendentes",
         "/resolverfalso",
+        "/falsonegativo",
+        "/resolverfalsonegativo",
     }
 
     if command in mutating_commands and (
@@ -8654,6 +8813,53 @@ def process_telegram_command(message, from_channel=False):
             parse_mode="HTML",
             reply_markup=pending_markup,
         )
+        return
+
+    if command == "/falsonegativo":
+        if not argument:
+            send_telegram_message("Uso: /falsonegativo ID_OU_LINK_DA_REVISÃO", chat_id=chat_id)
+            return
+        try:
+            rid = parse_revision_reference(argument)
+            actor = observation_actor_from_channel_post(message) or "administrador do canal"
+            item = register_false_negative(rid, actor)
+            rr = item.get("revert_risk")
+            rr_text = f"{rr:.0%}" if isinstance(rr, (int, float)) else "indisponível"
+            signals = item.get("promotional_signals") or []
+            signal_text = "\n".join("• " + html.escape(x) for x in signals) if signals else "• Nenhum novo sinal contextual ativado"
+            send_telegram_message("🔎 <b>Falso negativo registrado para calibração</b>\n\n" + f"📝 {html.escape(item['title'])}\n👤 {html.escape(item['username'])}\n🆔 Revisão: {rid}\n🆕 Página nova: {'sim' if item.get('is_new_page') else 'não'}\n🤖 Revert Risk: {rr_text}\n\nSinais atuais:\n{signal_text}\n\nO caso foi salvo para testar ajustes futuros do detector.", chat_id=chat_id, parse_mode="HTML")
+        except Exception as e:
+            send_telegram_message("❌ Não foi possível registrar o falso negativo: " + html.escape(safe_exception(e)), chat_id=chat_id, parse_mode="HTML")
+        return
+
+    if command == "/falsosnegativos":
+        with false_negatives_lock:
+            pending=sorted((dict(x) for x in false_negatives.values() if not x.get("resolved_at")), key=lambda x: float(x.get("reported_at",0)))
+        m=false_negative_metrics()
+        lines=["🔎 <b>Base de falsos negativos</b>","",f"Total registrado: {m['total']}",f"Ajustados: {m['resolved']}",f"Aguardando ajuste: {m['unresolved']}"]
+        for x in pending[:20]:
+            lines += ["", f"• {html.escape(x.get('title') or '')} — revisão {x.get('revision_id')}", f"  /resolverfalsonegativo {x.get('revision_id')}"]
+        send_telegram_message("\n".join(lines), chat_id=chat_id, parse_mode="HTML")
+        return
+
+    if command == "/resolverfalsonegativo":
+        if not argument:
+            send_telegram_message("Uso: /resolverfalsonegativo ID_DA_REVISÃO", chat_id=chat_id); return
+        try: key=str(int(argument.strip()))
+        except Exception:
+            send_telegram_message("❌ ID de revisão inválido.", chat_id=chat_id); return
+        with false_negatives_lock:
+            item=false_negatives.get(key)
+            if item and not item.get("resolved_at"):
+                actor=observation_actor_from_channel_post(message) or "administrador do canal"
+                item["resolved_at"]=time.time(); item["resolved_by"]=actor
+            else: actor=None
+        if not item:
+            send_telegram_message("❌ Falso negativo não encontrado.", chat_id=chat_id); return
+        if actor is None:
+            send_telegram_message("ℹ️ Este falso negativo já foi marcado como ajustado.", chat_id=chat_id); return
+        save_false_negatives()
+        send_telegram_message("✅ <b>Falso negativo revisado</b>\n\n" + f"📝 {html.escape(item.get('title') or '')}\n🆔 Revisão: {item.get('revision_id')}\n🛠 Ajuste concluído por: {html.escape(actor)}\n\nO caso permanece na base histórica de calibração.", chat_id=chat_id, parse_mode="HTML")
         return
 
     if command == "/falsospositivos":
@@ -10404,6 +10610,7 @@ def main():
     load_reversible_actions()
     load_community_stats()
     load_false_positives()
+    load_false_negatives()
 
     cleanup_expired_observations()
     activate_due_post_block_observations()
