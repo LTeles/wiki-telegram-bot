@@ -22,7 +22,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.17"
-BOT_BUILD = "2.17"
+BOT_BUILD = "2.17-r2"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -90,7 +90,7 @@ REVISION_STATUS_INTERVAL_SECONDS = 30
 POSTED_EDIT_TRACK_SECONDS = 48 * 60 * 60
 
 # Resumo periódico dos alertas ainda pendentes no canal.
-PENDING_SUMMARY_INTERVAL_SECONDS = 60 * 60
+PENDING_SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60
 PENDING_SUMMARY_MAX_ITEMS = 10
 PENDING_COMMAND_PAGE_SIZE = 5
 PENDING_RECONCILE_INTERVAL_SECONDS = 30 * 60
@@ -4636,7 +4636,7 @@ def build_pending_summary_message(items):
 
 
 def pending_alerts_summary_scheduler():
-    print("✅ Resumo de pendências: a cada 1 hora, top 10 por prioridade, janela de 48h.")
+    print("✅ Resumo de pendências: a cada 2 horas, top 10 por prioridade, janela de 48h.")
     with pending_summary_lock:
         never_sent = not pending_summary_state.get("last_sent_at")
     if never_sent:
@@ -7501,7 +7501,7 @@ def process_telegram_command(message, from_channel=False):
                 f"{tracked_count}\n"
                 f"🕒 Alertas pendentes: "
                 f"{pending_count}\n"
-                f"📌 Resumo prioritário: a cada 1h "
+                f"📌 Resumo prioritário: a cada 2h "
                 f"(top 10, 48h)\n"
                 f"🧹 Reconciliação de pendências: a cada 30 min\n"
                 f"📊 Registros estatísticos (90d): "
@@ -8892,7 +8892,7 @@ def main():
         "🗃 Histórico estatístico: 90 dias"
     )
     print(
-        "🕒 Resumo prioritário: a cada 1 hora, "
+        "🕒 Resumo prioritário: a cada 2 horas, "
         "top 10 por risco, janela de 48h"
     )
     print(
