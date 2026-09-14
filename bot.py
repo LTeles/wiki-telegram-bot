@@ -23,7 +23,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.19"
-BOT_BUILD = "2.19"
+BOT_BUILD = "2.19-r2"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1552,11 +1552,9 @@ def save_bot_version(version, build=None):
 
 
 def announce_new_version_if_needed():
-    state = load_bot_version_state()
-    announced_version = str(state.get("version", "") or "")
-    announced_build = str(state.get("build", "") or "")
+    announced_build = load_saved_bot_version()
 
-    if announced_version == BOT_VERSION and announced_build == BOT_BUILD:
+    if announced_build == BOT_BUILD:
         print(
             "ℹ️ Versão já anunciada. "
             "Nenhuma mensagem enviada."
