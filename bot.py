@@ -22,8 +22,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.18"
-BOT_BUILD = "2.18"
+BOT_VERSION = "2.19"
+BOT_BUILD = "2.19"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1195,8 +1195,148 @@ def wikitext_counter_table(title, counter, label, top=10):
     return "\n".join(lines)
 
 
+def channel_check_level(percent):
+    """
+    Classificação simples e transparente da cobertura de resposta observada.
+    Não representa visualização do Telegram; mede ações detectadas na Wikipédia.
+    """
+    if percent >= 85:
+        return "Muito alto"
+    if percent >= 70:
+        return "Alto"
+    if percent >= 50:
+        return "Moderado"
+    if percent >= 30:
+        return "Baixo"
+    return "Muito baixo"
+
+
+def channel_capacity_level(percent, pending_count):
+    """
+    Capacidade observada de absorver a demanda de alertas.
+    Usa a fração de alertas elegíveis que recebeu resposta comunitária.
+    """
+    if percent >= 85 and pending_count <= 3:
+        return "Folga"
+    if percent >= 70:
+        return "Adequada"
+    if percent >= 50:
+        return "Pressionada"
+    return "Sobrecarregada"
+
+
+def channel_response_metrics(start_ts, end_ts):
+    """
+    Calcula resposta aos posts realmente publicados pelo bot.
+
+    - alerta: post acompanhado enviado ao Telegram;
+    - ação comunitária: revertido por outro editor, patrulhado ou eliminado;
+    - autorreversão: resolvida pelo próprio autor, portanto sai da demanda
+      comunitária e não melhora artificialmente o índice do canal.
+    """
+    events = community_events_between(start_ts, end_ts)
+
+    alerts = {}
+    actions = {}
+    self_reverts = set()
+    action_times = []
+
+    for item in events:
+        try:
+            revision_id = int(item.get("revision_id"))
+        except Exception:
+            continue
+
+        kind = item.get("kind")
+
+        if kind == "alert":
+            alerts[revision_id] = item
+
+        elif kind in ("revert", "patrol", "delete"):
+            # Uma revisão conta uma única vez como respondida, mesmo que tenha
+            # mais de uma ação posterior.
+            previous = actions.get(revision_id)
+            if previous is None or float(item.get("timestamp", 0)) < float(previous.get("timestamp", 0)):
+                actions[revision_id] = item
+
+        elif kind == "self_revert":
+            self_reverts.add(revision_id)
+
+    eligible_ids = [
+        revision_id
+        for revision_id in alerts
+        if revision_id not in self_reverts
+    ]
+
+    handled_ids = [
+        revision_id
+        for revision_id in eligible_ids
+        if revision_id in actions
+    ]
+
+    pending_ids = [
+        revision_id
+        for revision_id in eligible_ids
+        if revision_id not in actions
+    ]
+
+    for revision_id in handled_ids:
+        alert_ts = float(alerts[revision_id].get("timestamp", 0))
+        action_ts = float(actions[revision_id].get("timestamp", 0))
+        if alert_ts and action_ts >= alert_ts:
+            action_times.append(action_ts - alert_ts)
+
+    total = len(alerts)
+    eligible = len(eligible_ids)
+    handled = len(handled_ids)
+    pending = len(pending_ids)
+    self_reverted = len(self_reverts.intersection(alerts.keys()))
+
+    handled_pct = handled / eligible * 100 if eligible else 0.0
+    pending_pct = pending / eligible * 100 if eligible else 0.0
+    median_action = median(action_times) if action_times else None
+
+    period_hours = max((end_ts - start_ts) / 3600.0, 0.001)
+    alerts_per_hour = total / period_hours
+    actions_per_hour = handled / period_hours
+
+    return {
+        "posts": total,
+        "eligible": eligible,
+        "handled": handled,
+        "handled_pct": handled_pct,
+        "pending": pending,
+        "pending_pct": pending_pct,
+        "self_reverted": self_reverted,
+        "median_action_seconds": median_action,
+        "alerts_per_hour": alerts_per_hour,
+        "actions_per_hour": actions_per_hour,
+        "check_level": channel_check_level(handled_pct),
+        "capacity_level": channel_capacity_level(handled_pct, pending),
+    }
+
+
+def format_channel_response_summary(metrics):
+    return (
+        f"👀 Posts com ação comunitária detectada: "
+        f"{metrics['handled']}/{metrics['eligible']} "
+        f"({format_percent(metrics['handled_pct'])})\\n"
+        f"📥 Sem ação detectada: {metrics['pending']} "
+        f"({format_percent(metrics['pending_pct'])})\\n"
+        f"↩️ Autorrevertidos: {metrics['self_reverted']} "
+        f"(não contam como resposta comunitária)\\n"
+        f"🔎 Nível de checagem: {metrics['check_level']}\\n"
+        f"⚙️ Capacidade observada: {metrics['capacity_level']} "
+        f"({metrics['actions_per_hour']:.1f} respostas/h para "
+        f"{metrics['alerts_per_hour']:.1f} alertas/h)\\n"
+        f"⏱ Mediana até primeira ação: "
+        f"{format_minutes(metrics['median_action_seconds'])}"
+    )
+
+
 def build_wiki_community_report(start_ts, end_ts, period_label):
     events = community_events_between(start_ts, end_ts)
+    response_metrics = channel_response_metrics(start_ts, end_ts)
 
     reversions = ranking_counts(events, "revert")
     patrols = ranking_counts(events, "patrol")
@@ -1241,7 +1381,36 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         f"| Bloqueios/rebloqueios || {total_blocks}",
         "|-",
         f"| Eliminações ligadas a alertas || {total_deletions}",
+        "|-",
+        f"| Posts acompanhados pelo canal || {response_metrics['posts']}",
+        "|-",
+        f"| Posts elegíveis para resposta comunitária || {response_metrics['eligible']}",
+        "|-",
+        f"| Posts com ação detectada || {response_metrics['handled']} ({format_percent(response_metrics['handled_pct'])})",
+        "|-",
+        f"| Nível de checagem || {response_metrics['check_level']}",
+        "|-",
+        f"| Capacidade observada || {response_metrics['capacity_level']}",
         "|}",
+        "== Capacidade de resposta do canal ==",
+        '{| class="wikitable"',
+        "! Indicador !! Resultado",
+        "|-",
+        f"| Ações detectadas || {response_metrics['handled']} de {response_metrics['eligible']} ({format_percent(response_metrics['handled_pct'])})",
+        "|-",
+        f"| Sem ação detectada || {response_metrics['pending']} ({format_percent(response_metrics['pending_pct'])})",
+        "|-",
+        f"| Autorreversões || {response_metrics['self_reverted']}",
+        "|-",
+        f"| Alertas por hora || {response_metrics['alerts_per_hour']:.1f}",
+        "|-",
+        f"| Respostas por hora || {response_metrics['actions_per_hour']:.1f}",
+        "|-",
+        f"| Mediana até primeira ação || {format_minutes(response_metrics['median_action_seconds'])}",
+        "|}",
+        "''O Telegram não fornece ao bot uma lista de quem leu cada post. "
+        "Por isso, o nível de checagem é uma estimativa baseada em ações "
+        "observáveis na Wikipédia, não uma taxa literal de visualização.''",
         "== Reconhecimento de trabalho de manutenção ==",
         wikitext_ranking_table("Mais reversões", reversions, "Reversões"),
         wikitext_fast_reverters_table(fast),
@@ -1269,6 +1438,10 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         "* Patrulhamento: somente quando o bot consegue relacionar o evento ao registro de patrulha e identificar o executor.",
         "* Proteções, bloqueios e eliminações: baseados nos registros públicos da Wikipédia observados pelo bot.",
         "* Categorias: capturadas da página quando o caso confirmado é processado; podem não estar disponíveis após eliminação.",
+        "* Nível de checagem: percentual dos alertas elegíveis que receberam reversão por terceiro, patrulhamento ou eliminação.",
+        "* Faixas de checagem: muito alto ≥85%; alto 70–84%; moderado 50–69%; baixo 30–49%; muito baixo <30%.",
+        "* Capacidade observada: folga quando ≥85% e backlog muito pequeno; adequada ≥70%; pressionada 50–69%; sobrecarregada <50%.",
+        "* Autorreversões são retiradas da demanda comunitária e não melhoram artificialmente o índice.",
         "* Os dados começam a ser coletados a partir da implantação desta versão; não há reconstrução histórica automática.",
     ])
 
@@ -1379,227 +1552,31 @@ def save_bot_version(version, build=None):
 
 
 def announce_new_version_if_needed():
-    saved_version = load_saved_bot_version()
+    state = load_bot_version_state()
+    announced_version = str(state.get("version", "") or "")
+    announced_build = str(state.get("build", "") or "")
 
-    print(
-        "📦 Versão registrada anteriormente:",
-        saved_version or "nenhuma"
-    )
-    print("🤖 Versão atual:", BOT_VERSION)
-    print("🔧 Build atual:", BOT_BUILD)
-
-    if saved_version == BOT_BUILD:
+    if announced_version == BOT_VERSION and announced_build == BOT_BUILD:
         print(
             "ℹ️ Versão já anunciada. "
             "Nenhuma mensagem enviada."
         )
         return
 
-    if BOT_VERSION == "2.18":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "📝 Preparação para relatórios na Wikipédia:\n"
-            "• coleta de estatísticas comunitárias de reversões, rapidez, patrulhamento, proteções, bloqueios e eliminações;\n"
-            "• rankings mensais com 1º, 2º e 3º colocados;\n"
-            "• páginas e categorias mais afetadas por casos confirmados;\n"
-            "• relatórios em wikitext com tabelas e gráficos de barras textuais;\n"
-            "• prévias diária e mensal gravadas apenas no volume do bot;\n"
-            "• escrita na Wikipédia permanece BLOQUEADA nesta versão;\n"
-            "• mesmo numa futura liberação, o código aceita somente títulos iniciados por Usuário:TelesGramBot:."
-        )
-    elif BOT_VERSION == "2.17":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "💬 Ajuste contextual por namespace:\n"
-            "• mensagens assinadas em páginas de discussão passam a receber risco menor quando não há sinais fortes de vandalismo;\n"
-            "• links externos nessas mensagens ainda acrescentam risco, preservando sensibilidade a spam;\n"
-            "• o mesmo formato de mensagem/assinatura fora de páginas de discussão recebe acréscimo de risco;\n"
-            "• sinais fortes de vandalismo continuam prevalecendo e não são neutralizados pelo contexto de discussão."
-        )
-    elif BOT_VERSION == "2.16":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🧩 Redução de falsos positivos:\n"
-            "• alterações técnicas mínimas passam a receber um redutor conservador no score final;\n"
-            "• mudanças isoladas e plausíveis de dimensão de imagem, como 250px → 270px, recebem redutor forte;\n"
-            "• pequenas alterações numéricas em parâmetros técnicos também podem receber redutor;\n"
-            "• o benefício não é aplicado quando há linguagem ofensiva, repetição anormal, remoção destrutiva ou texto sem sentido;\n"
-            "• os limiares globais de 25% para triagem e 45% para publicação permanecem inalterados."
-        )
-    elif BOT_VERSION == "2.15":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🧹 Reconciliação de avisos pendentes:\n"
-            "• o bot passa a revisar periodicamente páginas associadas a avisos ainda pendentes;\n"
-            "• títulos inexistentes só são marcados como eliminados quando há confirmação no registro de eliminações da Wikipédia;\n"
-            "• eliminações perdidas durante reinicializações ou redeploys passam a ser recuperadas automaticamente;\n"
-            "• uma página eliminada deixa de constar como pendente mesmo se a mensagem antiga não puder ser editada no Telegram;\n"
-            "• novo comando /revisarpendentes permite disparar a revisão manualmente."
-        )
-    elif BOT_VERSION == "2.14":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🕒 Gestão de avisos pendentes:\n"
-            "• novo comando /pendentes, com paginação de 10 itens e ordem do mais antigo para o mais recente;\n"
-            "• a navegação edita a mesma mensagem, evitando poluição do canal;\n"
-            "• o resumo automático passa a ser horário e mostra apenas os 10 pendentes de maior prioridade;\n"
-            "• a prioridade usa score final e risco de reversão quando disponíveis, com o mais antigo como desempate;\n"
-            "• alertas de contas observadas e páginas vigiadas continuam visíveis em /pendentes, mas não recebem prioridade artificial sem avaliação de risco."
-        )
-    elif BOT_VERSION == "2.13":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "↩️ Ações reversíveis:\n"
-            "• mensagens de confirmação de observar, desobservar, ignorar, designorar, vigiar, desvigiar e vigiar/desvigiar filtros passam a oferecer um botão para executar a ação oposta;\n"
-            "• confirmações geradas por botões também oferecem a opção inversa, permitindo desfazer e refazer;\n"
-            "• os botões são restritos a administradores do canal e persistem por até 48 horas."
-        )
-    elif BOT_VERSION == "2.12":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🔎 Observação automática pós-bloqueio:\n"
-            "• contas registradas bloqueadas temporariamente entram automaticamente em observação por 6 horas após o fim do bloqueio;\n"
-            "• desbloqueio antecipado inicia a observação imediatamente;\n"
-            "• rebloqueio atualiza o horário programado;\n"
-            "• IPs/faixas e bloqueios indefinidos ficam fora da automação;\n"
-            "• agendamentos são persistidos em /data."
-        )
-    elif BOT_VERSION == "2.11":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🔗 Links de contribuições:\n"
-            "• o nome da conta passa a ser clicável nos alertas de novas edições, levando diretamente às contribuições;\n"
-            "• respostas e listagens de comandos que exibem contas também usam o nome como link para as contribuições."
-        )
-    elif BOT_VERSION == "2.10":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🔐 Auditoria de segurança:\n"
-            "• campos externos usados em HTML foram revisados e links passam por escape consistente;\n"
-            "• comandos que alteram estado ganharam uma barreira central de autorização;\n"
-            "• logs externos são sanitizados, truncados e têm credenciais ocultadas;\n"
-            "• confirmações de botões são limitadas para evitar erros com títulos muito longos."
-        )
-    elif BOT_VERSION == "2.9":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🆕 Ajuste nos alertas de contas observadas:\n"
-            "• quando uma edição de conta observada é revertida, o post passa a indicar explicitamente esse contexto;\n"
-            "• o post informa também quanto tempo resta para o fim da observação."
-        )
-    elif BOT_VERSION == "2.8":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🆕 Ajuste no acompanhamento de reversões:\n"
-            "• quando o próprio editor reverte a edição publicada, o alerta passa a ser marcado como ‘Edição autorrevertida’;\n"
-            "• autorreversões não entram nas estatísticas do detector nem no resumo de alertas pendentes."
-        )
-    elif BOT_VERSION == "2.7":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🔧 Ajuste de interface:\n"
-            "• alertas de contas já observadas mostram apenas o botão ‘Desobservar’ para a conta;\n"
-            "• o botão ‘Vigiar página (6h)’ permanece disponível normalmente."
-        )
-    elif BOT_VERSION == "2.6":
-        if BOT_BUILD == "2.6-r4":
-            message = (
-                "✅ Bot atualizado com sucesso\n\n"
-                f"🤖 Versão {BOT_VERSION}\n\n"
-                "🔧 Ajuste de interface:\n"
-                "• os botões ‘Observar conta (6h)’ e ‘Vigiar página (6h)’ agora aparecem em linhas separadas para melhor visualização no Telegram."
-            )
-        elif BOT_BUILD == "2.6-r2":
-            message = (
-                "✅ Bot atualizado com sucesso\n\n"
-                f"🤖 Versão {BOT_VERSION}\n\n"
-                "🔧 Ajustes:\n"
-                "• adicionado botão ‘Vigiar página (6h)’ aos alertas de edição;\n"
-                "• edições de contas observadas oferecem botão ‘Desobservar’;\n"
-                "• edições de páginas vigiadas oferecem botão ‘Desvigiar’;\n"
-                "• confirmações informam o administrador do Telegram responsável pela vigilância, desobservação ou desvigilância."
-            )
-        else:
-            message = (
-                "✅ Bot atualizado com sucesso\n\n"
-                f"🤖 Versão {BOT_VERSION}\n\n"
-                "🆕 Novidades da versão 2.6:\n"
-                "• ao colocar uma conta em observação pelo botão, o alerta informa o nome do administrador do Telegram que realizou a ação;\n"
-                "• comandos /observar publicados no canal também exibem o responsável quando o Telegram fornece a identidade ou assinatura do autor."
-            )
-    elif BOT_VERSION == "2.5":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🆕 Novidades da versão 2.5:\n"
-            "• os alertas de edições exibem ‘Ver edição’ apenas como texto, seguido do link bruto do diff;\n"
-            "• o único link clicável é o endereço exposto ao lado, inclusive após reversão, patrulhamento ou eliminação da página."
-        )
-    elif BOT_VERSION == "2.4":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n"
-            f"🔧 Build {BOT_BUILD}\n\n"
-            "🔧 Ajustes do build 2.4-r2:\n"
-            "• links de edições agora aparecem resumidos como ‘Ver edição’;\n"
-            "• avisos de bloqueio passam a usar o título ‘Bloqueio aplicado’;\n"
-            "• confirmações de observação exibem o nome da conta com link direto para suas contribuições."
-        )
-    elif BOT_VERSION == "2.3":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🆕 Novidades da versão 2.3:\n"
-            "• corrigido o link dos registros de bloqueio quando o alvo vem como Usuário(a):Nome;\n"
-            "• o prefixo do namespace agora é normalizado antes de gerar o link e exibir o alvo, evitando duplicação de Usuário:."
-        )
-    elif BOT_VERSION == "2.2":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🆕 Novidades da versão 2.2:\n"
-            "• consultas do AbuseFilter agora reutilizam explicitamente a sessão autenticada do TelesGramBot;\n"
-            "• filtros e registros restritos passam a aproveitar os direitos efetivos da conta;\n"
-            "• se a sessão expirar, o bot tenta renovar o login automaticamente;\n"
-            "• /status agora informa o grupo confirmed e os principais direitos relacionados ao AbuseFilter."
-        )
-    elif BOT_VERSION == "2.1":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🆕 Novidades da versão 2.1:\n"
-            "• adicionado monitoramento dos registros de proteção de páginas;\n"
-            "• desproteções não geram mensagens;\n"
-            "• o alerta informa página, administrador, motivo, nível e duração da proteção;\n"
-            "• proteções são alertas independentes e não alteram o status de posts de edições acompanhadas."
-        )
-    elif BOT_VERSION == "2.0":
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}\n\n"
-            "🆕 Novidades da versão 2.0:\n"
-            "• o detector agora também analisa páginas recém-criadas;\n"
-            "• novas páginas usam os mesmos filtros, Revert Risk e limiares do detector;\n"
-            "• alertas de criação passam a ser acompanhados para reversão, patrulhamento e eliminação;\n"
-            "• páginas novas também entram no acompanhamento de pendências e nas estatísticas."
-        )
-    else:
-        message = (
-            "✅ Bot atualizado com sucesso\n\n"
-            f"🤖 Versão {BOT_VERSION}"
-        )
+    message = (
+        "✅ Bot atualizado com sucesso\n\n"
+        f"🤖 Versão {BOT_VERSION}\n\n"
+        "📊 Novas métricas de resposta do canal:\n"
+        "• quantidade e percentual de posts com alguma ação comunitária detectada;\n"
+        "• nível de checagem baseado na proporção de alertas que receberam ação;\n"
+        "• capacidade observada comparando volume de alertas e respostas;\n"
+        "• mediana até a primeira ação comunitária;\n"
+        "• autorreversões são separadas para não inflar artificialmente o índice;\n"
+        "• relatórios wiki passam a incluir essas métricas.\n\n"
+        "ℹ️ O bot não consegue saber quem apenas visualizou um post no Telegram; "
+        "a checagem é inferida por ações observáveis na Wikipédia.\n\n"
+        "🧹 O histórico textual de anúncios de versões antigas foi removido do código."
+    )
 
     sent = send_telegram_message(message)
 
@@ -3523,6 +3500,11 @@ def build_daily_detection_report(
         tz
     )
 
+    response_metrics = channel_response_metrics(
+        start_timestamp,
+        end_timestamp
+    )
+
     period_text = (
         start_dt.strftime(
             "%d/%m %H:%M"
@@ -3551,14 +3533,19 @@ def build_daily_detection_report(
         f"{format_percent(avg_score)}\n"
         f"⏱ Mediana até detecção da reversão: "
         f"{format_minutes(median_reversal)}\n\n"
+        "👥 Resposta da comunidade aos posts do canal:\n"
+        f"{format_channel_response_summary(response_metrics)}\n\n"
         "📈 Por faixa de score:\n"
         +
         "\n".join(band_lines)
         +
         "\n\n"
-        "ℹ️ Considera apenas alertas do detector normal. "
-        "“Ainda não revertida” pode mudar durante as "
-        "48 horas de acompanhamento."
+        "ℹ️ As métricas do detector consideram apenas alertas normais. "
+        "A seção de resposta do canal considera todos os posts acompanhados "
+        "(detector, contas observadas e páginas vigiadas). "
+        "O bot não sabe quem visualizou uma mensagem no Telegram; "
+        "‘checagem’ é uma estimativa baseada em ações detectadas na Wikipédia. "
+        "Os estados podem mudar durante as 48 horas de acompanhamento."
     )
 
 
@@ -3822,6 +3809,18 @@ def register_posted_edit(item, telegram_message):
             revision_id,
             "→ Telegram",
             message_id
+        )
+
+        record_community_event(
+            "alert",
+            actor=None,
+            title=item.get("page_title"),
+            timestamp=posted_at,
+            revision_id=revision_id,
+            metadata={
+                "alert_kind": item.get("alert_kind", "normal"),
+                "telegram_message_id": message_id,
+            },
         )
 
     except Exception as e:
@@ -4694,11 +4693,17 @@ def posted_edit_status_monitor():
                     changed_any = True
 
                     if new_status == "self_reverted":
-                        # Uma autorreversão não conta como acerto nem erro do
-                        # detector. Removemos a revisão das estatísticas; como
-                        # ela agora possui status, também deixa imediatamente
-                        # de aparecer no resumo de alertas pendentes.
+                        # Uma autorreversão não conta como resposta da comunidade.
+                        # Ela é registrada separadamente para não inflar a
+                        # capacidade de checagem do canal.
                         remove_detection_stat(revision_id)
+                        record_community_event(
+                            "self_revert",
+                            actor=record.get("username"),
+                            title=record.get("title"),
+                            timestamp=time.time(),
+                            revision_id=revision_id,
+                        )
 
                     elif new_status == "reverted":
                         event_time = time.time()
