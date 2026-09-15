@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.23"
-BOT_BUILD = "2.23"
+BOT_VERSION = "2.24"
+BOT_BUILD = "2.24"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2080,12 +2080,11 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.23</b>\n\n"
-        "🛠 <b>Correção em /falsospositivos</b>\n"
-        "• O comando agora responde mesmo quando não há casos pendentes.\n"
-        "• Registros antigos com timestamps ausentes ou inválidos não interrompem mais a montagem da lista.\n"
-        "• Se ocorrer um erro inesperado ao gerar a lista, o bot informa o problema no canal em vez de ficar silencioso.\n\n"
-        "ℹ️ Esta versão é uma correção operacional da 2.22; não altera os critérios de detecção de vandalismo."
+        "🤖 <b>TelesGramBot 2.24</b>\n\n"
+        "🔗 <b>Links nos falsos positivos</b>\n"
+        "• O ID da revisão agora é clicável na confirmação de Falso + e em /falsospositivos.\n"
+        "• O link abre diretamente a edição correspondente na Wikipédia."
+
 
     )
 
@@ -8903,7 +8902,7 @@ def process_telegram_command(message, from_channel=False):
                     lines.extend([
                         "",
                         f"• <b>{title}</b>",
-                        f"  🆔 <code>{revision_id}</code>",
+                        f'  🆔 <a href="https://pt.wikipedia.org/w/index.php?diff={revision_id}">{revision_id}</a>',
                         f"  Após o ajuste: <code>/resolverfalso {revision_id}</code>",
                     ])
                 if len(items) > 20:
@@ -10127,8 +10126,12 @@ def process_edit_action_callback(callback):
         )
 
         send_telegram_message(
-                "🏷 Falso positivo encaminhado para verificação.",
-                chat_id=TELEGRAM_CHANNEL
+                (
+                    "🏷 Falso positivo encaminhado para verificação.\n"
+                    f'🆔 <a href="https://pt.wikipedia.org/w/index.php?diff={revision_id}">{revision_id}</a>'
+                ),
+                chat_id=TELEGRAM_CHANNEL,
+                parse_mode="HTML"
             )
 
         print(
