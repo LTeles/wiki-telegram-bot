@@ -8637,7 +8637,7 @@ def commands_message():
         "📌 Consulta e acompanhamento\n"
         "👤 /conta Usuário — consulta uma conta.\n"
         "🕒 /pendentes — mostra alertas ainda pendentes.\n"
-        "🏷 /falsospositivos — lista os falsos positivos aguardando ajuste (sem ID)"
+        "🏷 /falsospositivos — lista os falsos positivos aguardando ajuste; não exige ID.\n"
         "🔎 /falsonegativo ID ou LINK — registra uma revisão que o detector deixou passar.\n"
         "🧪 /falsosnegativos — mostra a base de calibração de falsos negativos.\n"
         "📡 /status — mostra o estado do bot.\n\n"
@@ -8869,32 +8869,63 @@ def process_telegram_command(message, from_channel=False):
         return
 
     if command == "/falsospositivos":
-        # Este comando NÃO exige ID nem qualquer outro argumento.
-        # Ele lista os falsos positivos ainda aguardando ajuste.
+        # Consulta simples: NÃO exige ID, página ou qualquer complemento.
         try:
-            message_text = false_positive_list_message(0)
-            if not message_text or not str(message_text).strip():
-                message_text = "🏷 <b>Falsos positivos</b>\n\nNenhum falso positivo aguardando ajuste."
+            with false_positives_lock:
+                items = [
+                    dict(item)
+                    for item in false_positives.values()
+                    if not item.get("resolved_at")
+                ]
 
-            result = send_telegram_message(
-                message_text,
+            def _fp_time(item):
+                try:
+                    return float(item.get("marked_at") or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            items.sort(key=_fp_time)
+
+            if not items:
+                response_text = (
+                    "🏷 <b>Falsos positivos</b>\n\n"
+                    "✅ Nenhum falso positivo aguardando ajuste."
+                )
+            else:
+                lines = [
+                    "🏷 <b>Falsos positivos aguardando ajuste</b>",
+                    "",
+                    f"Total: {len(items)}",
+                ]
+                for item in items[:20]:
+                    revision_id = item.get("revision_id")
+                    title = html.escape(str(item.get("title") or "Sem título"))
+                    lines.extend([
+                        "",
+                        f"• <b>{title}</b>",
+                        f"  🆔 <code>{revision_id}</code>",
+                        f"  Após o ajuste: <code>/resolverfalso {revision_id}</code>",
+                    ])
+                if len(items) > 20:
+                    lines.extend(["", f"… e mais {len(items) - 20} caso(s)."])
+                response_text = "\n".join(lines)
+
+            sent = send_telegram_message(
+                response_text,
                 chat_id=chat_id,
                 parse_mode="HTML"
             )
-
-            # Se o envio formatado falhar, tenta uma resposta mínima sem HTML.
-            if result is None:
+            if sent is None:
+                # Segunda tentativa sem HTML, para que erro de formatação
+                # também não deixe o comando sem resposta.
                 send_telegram_message(
-                    "🏷 Falsos positivos\n\n"
-                    "Não foi possível exibir a lista formatada. "
-                    "O erro foi registrado no log do bot.",
+                    f"Falsos positivos aguardando ajuste: {len(items)}",
                     chat_id=chat_id
                 )
         except Exception as exc:
-            safe_log(f"Falha em /falsospositivos: {exc}")
+            safe_log(f"Falha direta em /falsospositivos: {exc}")
             send_telegram_message(
-                "⚠️ Erro ao consultar falsos positivos. "
-                "O detalhe foi registrado no log do bot.",
+                "⚠️ Falha ao consultar falsos positivos. Verifique o log do Railway.",
                 chat_id=chat_id
             )
         return
