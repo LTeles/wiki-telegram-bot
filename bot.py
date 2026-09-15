@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.25"
-BOT_BUILD = "2.25"
+BOT_VERSION = "2.26"
+BOT_BUILD = "2.26"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2100,12 +2100,12 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.25</b>\n\n"
-        "🏷 <b>Melhorias no fluxo de falsos positivos</b>\n"
-        "• A confirmação identifica quem marcou o caso e fica vinculada ao alerta original quando possível.\n"
-        "• Falsos positivos podem ser desmarcados pelos administradores.\n"
-        "• Ao concluir a revisão, o bot pode mencionar quem havia sinalizado o caso.\n"
-        "• Links das revisões e formatação das mensagens foram aprimorados."
+        "🤖 <b>TelesGramBot 2.26</b>\n\n"
+        "✅ <b>Sincronização dos alertas concluídos</b>\n"
+        "• Alertas revertidos, eliminados ou patrulhados deixam de mostrar Resolver e Falso +.\n"
+        "• Os controles de observação de conta e vigilância de página permanecem disponíveis.\n"
+        "• Mensagens antigas que ainda exibam ações incompatíveis são sincronizadas ao serem acionadas."
+
 
 
 
@@ -5315,10 +5315,13 @@ def posted_edit_status_monitor():
                     reverter=reverter if new_status == "reverted" else None
                 )
 
-                # Mantém os botões já associados ao tipo original do alerta.
-                status_reply_markup = record.get("reply_markup")
-                if not status_reply_markup:
-                    status_reply_markup = tracked_edit_reply_markup(revision_id)
+                # Após um desfecho, Resolver/Falso + deixam de ser aplicáveis.
+                # Mantém apenas os controles de conta/página.
+                status_reply_markup = tracked_edit_reply_markup(
+                    revision_id,
+                    record.get("alert_kind", "normal"),
+                    include_resolution_buttons=False
+                )
 
                 success = edit_telegram_message(
                     record["message_id"],
@@ -5466,9 +5469,11 @@ def mark_pending_title_deleted(title, deleter=None, deleted_at=None):
                 resolved += 1
 
         # Depois tenta refletir o estado na mensagem original.
-        status_reply_markup = record.get("reply_markup")
-        if not status_reply_markup:
-            status_reply_markup = tracked_edit_reply_markup(revision_id)
+        status_reply_markup = tracked_edit_reply_markup(
+            revision_id,
+            record.get("alert_kind", "normal"),
+            include_resolution_buttons=False
+        )
 
         new_text = message_with_status(
             record,
@@ -10150,9 +10155,28 @@ def process_edit_action_callback(callback):
             return
 
         if record.get("status"):
+            current_status = record.get("status")
+            try:
+                terminal_text = message_with_status(
+                    record,
+                    current_status,
+                    reverter=record.get("reverted_by") if current_status == "reverted" else None
+                )
+                edit_telegram_message(
+                    record.get("message_id"),
+                    terminal_text,
+                    parse_mode="HTML",
+                    reply_markup=tracked_edit_reply_markup(
+                        revision_id,
+                        record.get("alert_kind", "normal"),
+                        include_resolution_buttons=False
+                    )
+                )
+            except Exception as exc:
+                safe_log(f"Falha ao sincronizar alerta terminal {revision_id}: {exc}")
             answer_callback_query(
                 callback_id,
-                "Este alerta já foi resolvido."
+                "Este alerta já foi resolvido; o post foi sincronizado."
             )
             return
 
