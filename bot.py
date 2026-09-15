@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.24"
-BOT_BUILD = "2.24"
+BOT_VERSION = "2.25"
+BOT_BUILD = "2.25"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -633,7 +633,7 @@ def check_telegram_webhook():
         print("⚠️ Erro ao verificar webhook:", safe_exception(e))
 
 
-def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None):
+def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None, reply_to_message_id=None):
     """
     Retorna o objeto Message do Telegram quando o envio é confirmado.
     Retorna None em erro permanente.
@@ -655,6 +655,12 @@ def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None
 
             if reply_markup:
                 payload["reply_markup"] = reply_markup
+
+            if reply_to_message_id:
+                payload["reply_parameters"] = {
+                    "message_id": int(reply_to_message_id),
+                    "allow_sending_without_reply": True,
+                }
 
             response = requests.post(
                 f"{TELEGRAM_API}/sendMessage",
@@ -983,6 +989,18 @@ def false_negative_metrics():
     return {"total":len(items),"resolved":sum(bool(x.get("resolved_at")) for x in items),"unresolved":sum(not x.get("resolved_at") for x in items)}
 
 
+def telegram_actor_mention(record):
+    """Return an HTML mention for the original false-positive reporter when possible."""
+    username = str(record.get("marked_by_username") or "").strip().lstrip("@")
+    if username:
+        return f'@{html.escape(username)}'
+    user_id = record.get("marked_by_user_id")
+    label = html.escape(str(record.get("marked_by") or "administrador"))
+    if user_id:
+        return f'<a href="tg://user?id={int(user_id)}">{label}</a>'
+    return label
+
+
 def unresolved_false_positives():
     with false_positives_lock:
         items = [
@@ -1027,6 +1045,8 @@ def register_false_positive(record, actor):
         "posted_at": record.get("posted_at"),
         "marked_at": now,
         "marked_by": actor,
+        "marked_by_user_id": reporter_user_id,
+        "marked_by_username": reporter_username,
         "resolved_at": None,
         "resolved_by": None,
     }
@@ -1083,7 +1103,7 @@ def false_positive_message(item, fixed=False):
             str(item.get("resolved_by") or "administrador do canal")
         )
         return (
-            "✅ Falso positivo revisado — ajuste no bot marcado como concluído\n\n"
+            "✅ Falso positivo revisado\n\n"
             f"📝 {title}\n"
             f"👤 {username}\n"
             f"💬 {comment}\n"
@@ -2080,15 +2100,19 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.24</b>\n\n"
-        "🔗 <b>Links nos falsos positivos</b>\n"
-        "• O ID da revisão agora é clicável na confirmação de Falso + e em /falsospositivos.\n"
-        "• O link abre diretamente a edição correspondente na Wikipédia."
+        "🤖 <b>TelesGramBot 2.25</b>\n\n"
+        "🏷 <b>Melhorias no fluxo de falsos positivos</b>\n"
+        "• A confirmação identifica quem marcou o caso e fica vinculada ao alerta original quando possível.\n"
+        "• Falsos positivos podem ser desmarcados pelos administradores.\n"
+        "• Ao concluir a revisão, o bot pode mencionar quem havia sinalizado o caso.\n"
+        "• Links das revisões e formatação das mensagens foram aprimorados."
+
+
 
 
     )
 
-    sent = send_telegram_message(message)
+    sent = send_telegram_message(message, parse_mode="HTML")
 
     if not sent:
         print("⚠️ Não foi possível anunciar a nova versão.")
@@ -8864,7 +8888,7 @@ def process_telegram_command(message, from_channel=False):
         if actor is None:
             send_telegram_message("ℹ️ Este falso negativo já foi marcado como ajustado.", chat_id=chat_id); return
         save_false_negatives()
-        send_telegram_message("✅ <b>Falso negativo revisado</b>\n\n" + f"📝 {html.escape(item.get('title') or '')}\n🆔 Revisão: {item.get('revision_id')}\n🛠 Ajuste concluído por: {html.escape(actor)}\n\nO caso permanece na base histórica de calibração.", chat_id=chat_id, parse_mode="HTML")
+        send_telegram_message("✅ <b>Falso negativo revisado</b>\n\n" + f"📝 {html.escape(item.get('title') or '')}\n🆔 Revisão: {item.get('revision_id')}\n🛠 Revisão concluída por: {html.escape(actor)}\n\nO caso permanece na base histórica de calibração.", chat_id=chat_id, parse_mode="HTML")
         return
 
     if command == "/falsospositivos":
@@ -8993,7 +9017,7 @@ def process_telegram_command(message, from_channel=False):
                 "✅ Falso positivo revisado — ajuste concluído\n\n"
                 f"🆔 Revisão: {revision_id}\n"
                 f"🏷 Reportado por: {reporter}\n"
-                f"🛠 Ajuste concluído por: {actor}\n\n"
+                f"🛠 Revisão concluída por: {actor}\n\n"
                 "Obrigado pelo reporte. Este caso foi incorporado ao ciclo "
                 "de melhoria do detector e saiu da fila de ajustes pendentes."
                 + (
@@ -10035,7 +10059,7 @@ def process_edit_action_callback(callback):
         return
 
     action, revision_text = data.split(":", 1)
-    if action not in ("observe", "watch", "unobserve", "unwatch", "resolve", "falsepos"):
+    if action not in ("observe", "watch", "unobserve", "unwatch", "resolve", "falsepos", "unfalsepos"):
         answer_callback_query(callback_id)
         return
 
@@ -10063,6 +10087,58 @@ def process_edit_action_callback(callback):
     actor = telegram_person_display_name(clicker)
     actor_html = html.escape(actor) if actor else None
 
+    if action == "unfalsepos":
+        revision_id = int(record.get("revision_id") or revision_text)
+        fp = false_positives.get(str(revision_id))
+        if not fp or fp.get("resolved_at"):
+            answer_callback_query(callback_id, "Este falso positivo não pode mais ser desmarcado.")
+            return
+    
+        # Restore the alert to pending state and detector statistics.
+        record["status"] = None
+        record.pop("false_positive_at", None)
+        record.pop("false_positive_by", None)
+        save_posted_edits()
+    
+        with false_positives_lock:
+            false_positives.pop(str(revision_id), None)
+            save_false_positives()
+    
+        try:
+            register_detection_stat(
+                revision_id,
+                record.get("revert_risk"),
+                record.get("final_score"),
+                record.get("posted_at")
+            )
+        except Exception as exc:
+            safe_log(f"Falha ao restaurar estatística após desmarcar falso positivo {revision_id}: {exc}")
+    
+        try:
+            edit_telegram_message(
+                record.get("message_id"),
+                record.get("base_message"),
+                parse_mode=record.get("parse_mode") or "HTML",
+                reply_markup=tracked_edit_reply_markup(
+                    revision_id,
+                    record.get("alert_kind", "normal"),
+                    include_resolution_buttons=True
+                )
+            )
+        except Exception as exc:
+            safe_log(f"Falha ao restaurar post após desmarcar falso positivo {revision_id}: {exc}")
+    
+        answer_callback_query(callback_id, "Marcação de falso positivo desfeita.")
+        try:
+            edit_telegram_message(
+                callback.get("message", {}).get("message_id"),
+                "↩️ Marcação de falso positivo desfeita.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+    
     if action == "falsepos":
         revision_id = int(record.get("revision_id") or revision_text)
 
@@ -10127,11 +10203,21 @@ def process_edit_action_callback(callback):
 
         send_telegram_message(
                 (
-                    "🏷 Falso positivo encaminhado para verificação.\n"
-                    f'🆔 <a href="https://pt.wikipedia.org/w/index.php?diff={revision_id}">{revision_id}</a>'
+                    "🏷 <b>Falso positivo encaminhado para verificação.</b>\n"
+                    f"🆔 <a href=\"https://pt.wikipedia.org/w/index.php?diff={revision_id}\">{revision_id}</a>\n"
+                    f"👤 Marcado por: {html.escape(actor)}"
                 ),
                 chat_id=TELEGRAM_CHANNEL,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_to_message_id=record.get("message_id"),
+                reply_markup={
+                    "inline_keyboard": [[
+                        {
+                            "text": "↩️ Desmarcar falso positivo",
+                            "callback_data": f"unfalsepos:{revision_id}"
+                        }
+                    ]]
+                }
             )
 
         print(
