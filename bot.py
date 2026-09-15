@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.26"
-BOT_BUILD = "2.26"
+BOT_VERSION = "2.27"
+BOT_BUILD = "2.27"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1028,7 +1028,7 @@ def false_positive_revision_ids():
         }
 
 
-def register_false_positive(record, actor):
+def register_false_positive(record, actor, reporter_user_id=None, reporter_username=None):
     revision_id = int(record["revision_id"])
     now = time.time()
 
@@ -1117,7 +1117,7 @@ def false_positive_message(item, fixed=False):
     )
     return (
         "⚠️ Possível vandalismo marcado como falso positivo\n"
-        "Edição será revista para ajustes no bot.\n\n"
+        "Edição encaminhada para verificação.\n\n"
         f"📝 {title}\n"
         f"👤 {username}\n"
         f"💬 {comment}\n"
@@ -2100,11 +2100,12 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.26</b>\n\n"
-        "✅ <b>Sincronização dos alertas concluídos</b>\n"
-        "• Alertas revertidos, eliminados ou patrulhados deixam de mostrar Resolver e Falso +.\n"
-        "• Os controles de observação de conta e vigilância de página permanecem disponíveis.\n"
-        "• Mensagens antigas que ainda exibam ações incompatíveis são sincronizadas ao serem acionadas."
+        "🤖 <b>TelesGramBot 2.27</b>\n\n"
+        "🏷 <b>Correção no registro de falsos positivos</b>\n"
+        "• Corrigido um problema que podia atualizar o alerta sem concluir seu registro na fila de verificação.\n"
+        "• Casos afetados podem ser recuperados automaticamente ao acionar novamente Falso +.\n"
+        "• As confirmações e o estado exibido no canal ficaram mais consistentes."
+
 
 
 
@@ -10156,6 +10157,59 @@ def process_edit_action_callback(callback):
 
         if record.get("status"):
             current_status = record.get("status")
+
+            # Recupera automaticamente registros órfãos de falso positivo
+            # que possam ter sido criados antes da gravação na fila.
+            if current_status == "false_positive":
+                with false_positives_lock:
+                    existing_fp = false_positives.get(str(revision_id))
+
+                if not existing_fp:
+                    marker_name = record.get("false_positive_by") or actor or "administrador do canal"
+                    callback_from = callback.get("from") or {}
+                    reporter_user_id = callback_from.get("id")
+                    reporter_username = callback_from.get("username")
+                    fp_item = register_false_positive(
+                        record, marker_name, reporter_user_id, reporter_username
+                    )
+                    remove_detection_stat(revision_id)
+
+                    edit_telegram_message(
+                        record.get("message_id"),
+                        false_positive_message(fp_item, fixed=False),
+                        parse_mode="HTML",
+                        reply_markup=reply_markup_without_resolution_buttons(
+                            record.get("reply_markup"), revision_id
+                        )
+                    )
+                    send_telegram_message(
+                        (
+                            "🏷 <b>Falso positivo encaminhado para verificação.</b>\n"
+                            f'🆔 <a href="https://pt.wikipedia.org/w/index.php?diff={revision_id}">{revision_id}</a>\n'
+                            f"👤 Marcado por: {html.escape(str(marker_name))}"
+                        ),
+                        chat_id=TELEGRAM_CHANNEL,
+                        parse_mode="HTML",
+                        reply_to_message_id=record.get("message_id"),
+                        reply_markup={
+                            "inline_keyboard": [[{
+                                "text": "↩️ Desmarcar falso positivo",
+                                "callback_data": f"unfalsepos:{revision_id}"
+                            }]]
+                        }
+                    )
+                    answer_callback_query(
+                        callback_id,
+                        "Falso positivo recuperado e encaminhado para verificação."
+                    )
+                    return
+
+                answer_callback_query(
+                    callback_id,
+                    "Este alerta já está marcado como falso positivo."
+                )
+                return
+
             try:
                 terminal_text = message_with_status(
                     record,
@@ -10181,6 +10235,9 @@ def process_edit_action_callback(callback):
             return
 
         marker_name = actor or "administrador do canal"
+        callback_from = callback.get("from") or {}
+        reporter_user_id = callback_from.get("id")
+        reporter_username = callback_from.get("username")
 
         with posted_edits_lock:
             live = posted_edits.get(str(revision_text))
@@ -10208,7 +10265,9 @@ def process_edit_action_callback(callback):
                 safe_exception(e)
             )
 
-        fp_item = register_false_positive(record, marker_name)
+        fp_item = register_false_positive(
+            record, marker_name, reporter_user_id, reporter_username
+        )
 
         # Falso positivo não entra nas estatísticas de desempenho do detector.
         remove_detection_stat(revision_id)
