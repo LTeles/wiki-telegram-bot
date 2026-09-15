@@ -10144,16 +10144,37 @@ def process_edit_action_callback(callback):
     if action == "unfalsepos":
         revision_id = int(record.get("revision_id") or revision_text)
 
+        # Registros antigos podem ter sido marcados como falso positivo numa
+        # versão em que o post era atualizado antes de false_positives.json.
+        # Se depois houve reversão, o status terminal substitui "false_positive",
+        # mas os metadados false_positive_* permanecem. Aceitar esses metadados
+        # como prova da marcação permite corrigir também alertas legados.
+        fp = None
         with false_positives_lock:
             fp = false_positives.get(str(revision_id))
-            if not fp or fp.get("resolved_at"):
+
+            legacy_marked = bool(
+                record.get("false_positive_at")
+                or record.get("false_positive_by")
+            )
+
+            if fp and fp.get("resolved_at"):
                 answer_callback_query(
                     callback_id,
-                    "Este falso positivo não pode mais ser desmarcado."
+                    "Este falso positivo já foi encerrado e não pode ser desmarcado."
                 )
                 return
-            false_positives.pop(str(revision_id), None)
-            save_false_positives()
+
+            if not fp and not legacy_marked:
+                answer_callback_query(
+                    callback_id,
+                    "Este alerta não possui marcação de falso positivo ativa."
+                )
+                return
+
+            if fp:
+                false_positives.pop(str(revision_id), None)
+                save_false_positives()
 
         # Pode haver uma corrida: o alerta é marcado Falso + e, quase ao
         # mesmo tempo, a Wikipédia confirma reversão/patrulhamento/exclusão.
