@@ -10174,7 +10174,9 @@ def process_edit_action_callback(callback):
 
             if fp:
                 false_positives.pop(str(revision_id), None)
-                save_false_positives()
+
+        if fp:
+            save_false_positives()
 
         # Pode haver uma corrida: o alerta é marcado Falso + e, quase ao
         # mesmo tempo, a Wikipédia confirma reversão/patrulhamento/exclusão.
