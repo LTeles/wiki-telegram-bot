@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.22"
-BOT_BUILD = "2.22"
+BOT_VERSION = "2.23"
+BOT_BUILD = "2.23"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -991,7 +991,13 @@ def unresolved_false_positives():
             if not item.get("resolved_at")
         ]
 
-    items.sort(key=lambda item: float(item.get("marked_at", 0)))
+    def safe_marked_at(item):
+        try:
+            return float(item.get("marked_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    items.sort(key=safe_marked_at)
     return items
 
 
@@ -1105,27 +1111,32 @@ def false_positive_management_metrics(start_ts, end_ts):
     with false_positives_lock:
         items = [dict(item) for item in false_positives.values()]
 
+    def ts(item, field):
+        try:
+            return float(item.get(field) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     reported = [
         item for item in items
-        if start_ts <= float(item.get("marked_at", 0) or 0) < end_ts
+        if start_ts <= ts(item, "marked_at") < end_ts
     ]
     adjusted = [
         item for item in items
-        if item.get("resolved_at") is not None
-        and start_ts <= float(item.get("resolved_at", 0) or 0) < end_ts
+        if ts(item, "resolved_at") > 0
+        and start_ts <= ts(item, "resolved_at") < end_ts
     ]
     backlog_at_end = [
         item for item in items
-        if float(item.get("marked_at", 0) or 0) < end_ts
+        if ts(item, "marked_at") < end_ts
         and (
-            item.get("resolved_at") is None
-            or float(item.get("resolved_at", 0) or 0) >= end_ts
+            ts(item, "resolved_at") == 0
+            or ts(item, "resolved_at") >= end_ts
         )
     ]
     closed_from_reported = [
         item for item in reported
-        if item.get("resolved_at") is not None
-        and float(item.get("resolved_at", 0) or 0) < end_ts
+        if 0 < ts(item, "resolved_at") < end_ts
     ]
     close_rate = (
         len(closed_from_reported) / len(reported) * 100
@@ -1134,11 +1145,8 @@ def false_positive_management_metrics(start_ts, end_ts):
 
     adjustment_times = []
     for item in adjusted:
-        try:
-            marked_at = float(item.get("marked_at", 0) or 0)
-            resolved_at = float(item.get("resolved_at", 0) or 0)
-        except Exception:
-            continue
+        marked_at = ts(item, "marked_at")
+        resolved_at = ts(item, "resolved_at")
         if marked_at and resolved_at >= marked_at:
             adjustment_times.append(resolved_at - marked_at)
 
@@ -1155,7 +1163,6 @@ def false_positive_management_metrics(start_ts, end_ts):
         "median_adjustment_seconds": median(adjustment_times) if adjustment_times else None,
         "reporter_counts": reporter_counts,
     }
-
 
 def wikitext_false_positive_reporters(counter, top=5):
     rows = counter.most_common(top)
@@ -8865,18 +8872,35 @@ def process_telegram_command(message, from_channel=False):
     if command == "/falsospositivos":
         try:
             page = max(0, int(argument or "1") - 1)
-        except Exception:
+        except (TypeError, ValueError):
             send_telegram_message(
                 "Uso: /falsospositivos [página]",
                 chat_id=chat_id
             )
             return
 
-        send_telegram_message(
-            false_positive_list_message(page),
-            chat_id=chat_id,
-            parse_mode="HTML"
-        )
+        try:
+            message_text = false_positive_list_message(page)
+            sent = send_telegram_message(
+                message_text,
+                chat_id=chat_id,
+                parse_mode="HTML"
+            )
+            if sent is None:
+                # Fallback sem HTML: o comando nunca deve ficar silencioso.
+                send_telegram_message(
+                    "🏷 Falsos positivos\n\n"
+                    "Não foi possível formatar a lista. "
+                    "Consulte os logs do bot para o detalhe do erro.",
+                    chat_id=chat_id
+                )
+        except Exception as exc:
+            safe_log(f"Falha em /falsospositivos: {exc}")
+            send_telegram_message(
+                "⚠️ Não foi possível montar a lista de falsos positivos. "
+                "O erro foi registrado no log do bot.",
+                chat_id=chat_id
+            )
         return
 
     if command == "/resolverfalso":
