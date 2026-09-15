@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.27"
-BOT_BUILD = "2.27"
+BOT_VERSION = "2.28"
+BOT_BUILD = "2.28"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -68,11 +68,13 @@ WIKI_WRITE_ENABLED = False
 
 # Regra de segurança solicitada: mesmo quando a escrita for liberada numa
 # versão futura, o bot somente poderá editar títulos iniciados exatamente por:
-WIKI_ALLOWED_TITLE_PREFIX = "Usuário:TelesGramBot:"
+WIKI_ALLOWED_TITLE_PREFIX = "Usuário:TelesGramBot/"
+WIKI_STATUS_TITLE = "Usuário:TelesGramBot/Status"
+WIKI_CREATE_ENABLED = False
 
 # Relatórios que serão usados quando a publicação for futuramente ativada.
-WIKI_DAILY_REPORT_PREFIX = "Usuário:TelesGramBot:Relatórios/Diário/"
-WIKI_MONTHLY_REPORT_PREFIX = "Usuário:TelesGramBot:Relatórios/Mensal/"
+WIKI_DAILY_REPORT_PREFIX = "Usuário:TelesGramBot/Relatórios/Diário/"
+WIKI_MONTHLY_REPORT_PREFIX = "Usuário:TelesGramBot/Relatórios/Mensal/"
 
 
 
@@ -1481,11 +1483,17 @@ def get_wikimedia_csrf_token():
     return token
 
 
+def wiki_page_exists(title):
+    data = wikimedia_authenticated_request({"action":"query","format":"json","formatversion":2,"titles":title})
+    pages = ((data or {}).get("query") or {}).get("pages") or []
+    return bool(pages and not pages[0].get("missing"))
+
+
 def wiki_edit_page(title, wikitext, summary):
     """
     Implementação pronta para uso futuro, mas bloqueada por duas barreiras:
     1) WIKI_WRITE_ENABLED precisa ser alterado no código;
-    2) o título precisa começar por Usuário:TelesGramBot:
+    2) o título precisa começar por Usuário:TelesGramBot/;\n    3) a página precisa existir; criação automática é proibida.
 
     Nesta versão a primeira barreira é False e nenhuma chamada action=edit
     é enviada.
@@ -1502,12 +1510,17 @@ def wiki_edit_page(title, wikitext, summary):
         )
         return False
 
+    if not wiki_page_exists(title):
+        print("📄 Página wiki ausente; criação automática proibida:", title)
+        return False
+
     token = get_wikimedia_csrf_token()
 
     response = wikimedia_session.post(
         WIKIPEDIA_API,
         data={
             "action": "edit",
+            "nocreate": 1,
             "format": "json",
             "formatversion": 2,
             "title": title,
@@ -1987,6 +2000,17 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
     ])
 
 
+def build_wiki_status_wikitext():
+    return (
+        "== Status do TelesGramBot ==\n"
+        f"* Versão: {BOT_VERSION}\n"
+        f"* Escrita na Wikipédia: {'habilitada' if WIKI_WRITE_ENABLED else 'desabilitada'}\n"
+        "* Criação automática de páginas: proibida\n\n"
+        "=== Projetos e dependências ===\n"
+        "* Projetos impedidos por páginas inexistentes devem indicar aqui a página que precisa ser criada manualmente.\n"
+    )
+
+
 def build_wiki_daily_and_monthly_previews(now=None):
     tz = ZoneInfo(REPORT_TIMEZONE)
     now = now or datetime.now(tz)
@@ -2100,11 +2124,14 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.27</b>\n\n"
-        "🏷 <b>Correção no registro de falsos positivos</b>\n"
-        "• Corrigido um problema que podia atualizar o alerta sem concluir seu registro na fila de verificação.\n"
-        "• Casos afetados podem ser recuperados automaticamente ao acionar novamente Falso +.\n"
-        "• As confirmações e o estado exibido no canal ficaram mais consistentes."
+        "🤖 <b>TelesGramBot 2.28</b>\n\n"
+        "📚 <b>Política de páginas e Status</b>\n"
+        "• O bot foi preparado para editar somente subpáginas existentes da própria conta.\n"
+        "• A criação automática de páginas fica explicitamente proibida.\n"
+        "• A página /Status foi preparada para informar estado, projetos interrompidos e dependências pendentes.\n"
+        "• A escrita na Wikipédia continua desativada."
+
+
 
 
 
@@ -5061,16 +5088,37 @@ def get_reverter_username(title, revision_id):
                 if rid == int(revision_id):
                     continue
 
-                tags = set(rev.get("tags") or [])
+                # MediaWiki pode devolver tanto tags internas (mw-*) quanto
+                # nomes/variações localizadas. Normalizamos para reconhecer
+                # também reversões manuais, que são comuns em autorreversões.
+                tags = {
+                    str(tag).strip().casefold()
+                    for tag in (rev.get("tags") or [])
+                }
                 comment = (rev.get("comment") or "").casefold()
+
                 explicit_tag = bool(tags.intersection({
-                    "mw-rollback", "mw-undo", "mw-manual-revert"
-                }))
+                    "mw-rollback",
+                    "mw-undo",
+                    "mw-manual-revert",
+                    "manual revert",
+                    "reversão manual",
+                    "reversao manual",
+                })) or any(
+                    ("manual" in tag and ("revert" in tag or "revers" in tag))
+                    for tag in tags
+                )
+
                 explicit_comment = any(x in comment for x in (
                     "reverteu", "revertida", "revertido", "desfeita",
-                    "desfeito", "desfazer", "rollback"
+                    "desfeito", "desfazer", "rollback",
+                    "reversão manual", "reversao manual",
                 ))
+
                 if explicit_tag or explicit_comment:
+                    # Retorna o autor da revisão que efetivamente realizou a
+                    # reversão. O monitor já compara este nome ao autor da
+                    # revisão alertada; se forem iguais, registra self_reverted.
                     return rev.get("user") or None
     except Exception as e:
         print("⚠️ Não foi possível identificar quem reverteu:", safe_exception(e))
@@ -10095,21 +10143,42 @@ def process_edit_action_callback(callback):
 
     if action == "unfalsepos":
         revision_id = int(record.get("revision_id") or revision_text)
-        fp = false_positives.get(str(revision_id))
-        if not fp or fp.get("resolved_at"):
-            answer_callback_query(callback_id, "Este falso positivo não pode mais ser desmarcado.")
-            return
-    
-        # Restore the alert to pending state and detector statistics.
-        record["status"] = None
-        record.pop("false_positive_at", None)
-        record.pop("false_positive_by", None)
-        save_posted_edits()
-    
+
         with false_positives_lock:
+            fp = false_positives.get(str(revision_id))
+            if not fp or fp.get("resolved_at"):
+                answer_callback_query(
+                    callback_id,
+                    "Este falso positivo não pode mais ser desmarcado."
+                )
+                return
             false_positives.pop(str(revision_id), None)
             save_false_positives()
-    
+
+        # Pode haver uma corrida: o alerta é marcado Falso + e, quase ao
+        # mesmo tempo, a Wikipédia confirma reversão/patrulhamento/exclusão.
+        # Desmarcar o falso positivo não deve apagar esse desfecho real.
+        terminal_statuses = {
+            "reverted", "self_reverted", "deleted",
+            "patrolled", "resolved_no_action"
+        }
+
+        with posted_edits_lock:
+            live = posted_edits.get(str(revision_id))
+            if live:
+                current_status = live.get("status")
+                live.pop("false_positive_at", None)
+                live.pop("false_positive_by", None)
+                if current_status == "false_positive":
+                    live["status"] = None
+                record = dict(live)
+            else:
+                current_status = record.get("status")
+
+        save_posted_edits()
+
+        # Restaurar a participação nas estatísticas sem perder um resultado
+        # terminal que já tenha sido observado.
         try:
             register_detection_stat(
                 revision_id,
@@ -10117,23 +10186,62 @@ def process_edit_action_callback(callback):
                 record.get("final_score"),
                 record.get("posted_at")
             )
+            if current_status == "reverted":
+                mark_detection_stat_reverted(
+                    revision_id,
+                    record.get("reverted_at") or time.time()
+                )
+            elif current_status == "patrolled":
+                mark_detection_stat_patrolled(
+                    revision_id,
+                    record.get("patrolled_at") or time.time()
+                )
+            elif current_status == "resolved_no_action":
+                mark_detection_stat_resolved_no_action(
+                    revision_id,
+                    record.get("resolved_at") or time.time()
+                )
+            elif current_status == "self_reverted":
+                remove_detection_stat(revision_id)
         except Exception as exc:
-            safe_log(f"Falha ao restaurar estatística após desmarcar falso positivo {revision_id}: {exc}")
-    
+            safe_log(
+                f"Falha ao restaurar estatística após desmarcar falso positivo "
+                f"{revision_id}: {exc}"
+            )
+
         try:
-            edit_telegram_message(
-                record.get("message_id"),
-                record.get("base_message"),
-                parse_mode=record.get("parse_mode") or "HTML",
-                reply_markup=tracked_edit_reply_markup(
+            if current_status in terminal_statuses:
+                restored_text = message_with_status(
+                    record,
+                    current_status,
+                    reverter=record.get("reverted_by")
+                    if current_status == "reverted" else None
+                )
+                restored_markup = tracked_edit_reply_markup(
+                    revision_id,
+                    record.get("alert_kind", "normal"),
+                    include_resolution_buttons=False
+                )
+            else:
+                restored_text = record.get("base_message")
+                restored_markup = tracked_edit_reply_markup(
                     revision_id,
                     record.get("alert_kind", "normal"),
                     include_resolution_buttons=True
                 )
+
+            edit_telegram_message(
+                record.get("message_id"),
+                restored_text,
+                parse_mode=record.get("parse_mode") or "HTML",
+                reply_markup=restored_markup
             )
         except Exception as exc:
-            safe_log(f"Falha ao restaurar post após desmarcar falso positivo {revision_id}: {exc}")
-    
+            safe_log(
+                f"Falha ao restaurar post após desmarcar falso positivo "
+                f"{revision_id}: {exc}"
+            )
+
         answer_callback_query(callback_id, "Marcação de falso positivo desfeita.")
         try:
             edit_telegram_message(
@@ -10144,7 +10252,7 @@ def process_edit_action_callback(callback):
         except Exception:
             pass
         return
-    
+
     if action == "falsepos":
         revision_id = int(record.get("revision_id") or revision_text)
 
