@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.28"
-BOT_BUILD = "2.28"
+BOT_VERSION = "2.29"
+BOT_BUILD = "2.29"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2124,12 +2124,12 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.28</b>\n\n"
-        "📚 <b>Política de páginas e Status</b>\n"
-        "• O bot foi preparado para editar somente subpáginas existentes da própria conta.\n"
-        "• A criação automática de páginas fica explicitamente proibida.\n"
-        "• A página /Status foi preparada para informar estado, projetos interrompidos e dependências pendentes.\n"
-        "• A escrita na Wikipédia continua desativada."
+        "🤖 <b>TelesGramBot 2.29</b>\n\n"
+        "👁 <b>Páginas vigiadas</b>\n"
+        "• Edições humanas em páginas explicitamente vigiadas agora são avisadas inclusive quando feitas por administradores.\n"
+        "• Edições identificadas como bot continuam excluídas.\n"
+        "• Correções recentes de autorreversão e falsos positivos foram preservadas."
+
 
 
 
@@ -8560,9 +8560,8 @@ def analysis_worker():
 
             # 2. Página vigiada
             if is_watched_page(title):
-                if is_wikipedia_admin(username):
-                    continue
-
+                # Vigilância explícita prevalece sobre o filtro de administradores.
+                # Edições bot já são descartadas antes deste ponto.
                 message = format_watched_message(
                     change
                 )
