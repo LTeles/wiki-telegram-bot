@@ -2080,14 +2080,13 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "✅ Bot atualizado com sucesso\n\n"
-        f"🤖 Versão {BOT_VERSION}\n\n"
-        "🧪 Nova base de calibração de falsos negativos:\n"
-        "• /falsonegativo aceita ID ou link e registra uma revisão que o detector deixou passar;\n"
-        "• /falsosnegativos mostra os casos aguardando ajuste;\n"
-        "• /resolverfalsonegativo confirma que o caso foi contemplado;\n"
-        "• páginas novas passam a combinar ausência de referências, múltiplos sinais institucionais/promocionais e, apenas quando muito forte, semelhança entre título e criador.\n\n"
-        "ℹ️ Nenhuma palavra isolada determina propaganda, e a semelhança título↔criador só pontua a partir de 86%. A base serve para calibração e não representa acurácia global do detector."
+        "🤖 <b>TelesGramBot 2.23</b>\n\n"
+        "🛠 <b>Correção em /falsospositivos</b>\n"
+        "• O comando agora responde mesmo quando não há casos pendentes.\n"
+        "• Registros antigos com timestamps ausentes ou inválidos não interrompem mais a montagem da lista.\n"
+        "• Se ocorrer um erro inesperado ao gerar a lista, o bot informa o problema no canal em vez de ficar silencioso.\n\n"
+        "ℹ️ Esta versão é uma correção operacional da 2.22; não altera os critérios de detecção de vandalismo."
+
     )
 
     sent = send_telegram_message(message)
@@ -8638,7 +8637,7 @@ def commands_message():
         "📌 Consulta e acompanhamento\n"
         "👤 /conta Usuário — consulta uma conta.\n"
         "🕒 /pendentes — mostra alertas ainda pendentes.\n"
-        "🏷 /falsospositivos [página] — lista casos aguardando ajuste no bot.\n"
+        "🏷 /falsospositivos — lista os falsos positivos aguardando ajuste (sem ID)"
         "🔎 /falsonegativo ID ou LINK — registra uma revisão que o detector deixou passar.\n"
         "🧪 /falsosnegativos — mostra a base de calibração de falsos negativos.\n"
         "📡 /status — mostra o estado do bot.\n\n"
@@ -8870,35 +8869,32 @@ def process_telegram_command(message, from_channel=False):
         return
 
     if command == "/falsospositivos":
+        # Este comando NÃO exige ID nem qualquer outro argumento.
+        # Ele lista os falsos positivos ainda aguardando ajuste.
         try:
-            page = max(0, int(argument or "1") - 1)
-        except (TypeError, ValueError):
-            send_telegram_message(
-                "Uso: /falsospositivos [página]",
-                chat_id=chat_id
-            )
-            return
+            message_text = false_positive_list_message(0)
+            if not message_text or not str(message_text).strip():
+                message_text = "🏷 <b>Falsos positivos</b>\n\nNenhum falso positivo aguardando ajuste."
 
-        try:
-            message_text = false_positive_list_message(page)
-            sent = send_telegram_message(
+            result = send_telegram_message(
                 message_text,
                 chat_id=chat_id,
                 parse_mode="HTML"
             )
-            if sent is None:
-                # Fallback sem HTML: o comando nunca deve ficar silencioso.
+
+            # Se o envio formatado falhar, tenta uma resposta mínima sem HTML.
+            if result is None:
                 send_telegram_message(
                     "🏷 Falsos positivos\n\n"
-                    "Não foi possível formatar a lista. "
-                    "Consulte os logs do bot para o detalhe do erro.",
+                    "Não foi possível exibir a lista formatada. "
+                    "O erro foi registrado no log do bot.",
                     chat_id=chat_id
                 )
         except Exception as exc:
             safe_log(f"Falha em /falsospositivos: {exc}")
             send_telegram_message(
-                "⚠️ Não foi possível montar a lista de falsos positivos. "
-                "O erro foi registrado no log do bot.",
+                "⚠️ Erro ao consultar falsos positivos. "
+                "O detalhe foi registrado no log do bot.",
                 chat_id=chat_id
             )
         return
@@ -10100,20 +10096,9 @@ def process_edit_action_callback(callback):
         )
 
         send_telegram_message(
-            (
-                "🏷 Feedback registrado para melhoria do detector\n\n"
-                f"📝 {html.escape(str(record.get('title') or 'Sem título'))}\n"
-                f"🆔 Revisão: {revision_id}\n"
-                f"👤 Reportado por: {html.escape(marker_name)}\n\n"
-                "O caso foi retirado das pendências e entrou na fila de "
-                "ajustes do bot. Quando o ajuste for concluído, o aviso "
-                "será atualizado e o caso deixará a fila de falsos positivos.\n\n"
-                "ℹ️ O bot não se retreina automaticamente: esses relatos "
-                "orientam ajustes sucessivos nas regras e critérios do detector."
-            ),
-            chat_id=TELEGRAM_CHANNEL,
-            parse_mode="HTML"
-        )
+                "🏷 Falso positivo encaminhado para verificação.",
+                chat_id=TELEGRAM_CHANNEL
+            )
 
         print(
             "🏷 Falso positivo registrado:",
