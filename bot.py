@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.35"
-BOT_BUILD = "2.35"
+BOT_VERSION = "2.36"
+BOT_BUILD = "2.36"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1058,12 +1058,15 @@ def false_negative_metrics():
 def telegram_actor_mention(record):
     """Return an HTML mention for the original false-positive reporter when possible."""
     username = str(record.get("marked_by_username") or "").strip().lstrip("@")
-    if username:
-        return f'@{html.escape(username)}'
     user_id = record.get("marked_by_user_id")
     label = html.escape(str(record.get("marked_by") or "administrador"))
     if user_id:
-        return f'<a href="tg://user?id={int(user_id)}">{label}</a>'
+        try:
+            return f'<a href="tg://user?id={int(user_id)}">{label}</a>'
+        except (ValueError, TypeError):
+            pass
+    if username and all(c.isalnum() or c == "_" for c in username):
+        return f'<a href="https://t.me/{html.escape(username)}">@{html.escape(username)}</a>'
     return label
 
 
@@ -2239,10 +2242,9 @@ def announce_new_version_if_needed():
 
     message = (
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n\n"
-        "🛠 <b>Calibração de mensagens em discussão</b>\n"
-        "• Redutor contextual somente para acréscimos assinados sem sinais fortes.\n"
-        "• Assinatura excluída da análise textual; remoções, insultos e links externos preservam a cautela.\n"
-        "• Mantidos controle HTTP 429, /conta e links; escrita na Wikipédia desativada."
+        "🔗 <b>Link no aviso de resolução de falso positivo</b>\n"
+        "• O número da revisão na confirmação de /resolverfalso abre o diff correspondente.\n"
+        "• Preservadas calibração 2.35 e proteções de requisições; escrita na Wikipédia desativada."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -9261,9 +9263,9 @@ def process_telegram_command(message, from_channel=False):
         send_telegram_message(
             (
                 "✅ Falso positivo revisado — ajuste concluído\n\n"
-                f"🆔 Revisão: {revision_id}\n"
-                f"🏷 Reportado por: {reporter}\n"
-                f"🛠 Revisão concluída por: {actor}\n\n"
+                f'🆔 Revisão: <a href="https://pt.wikipedia.org/w/index.php?diff={revision_id}">{revision_id}</a>\n'
+                f"🏷 Reportado por: {telegram_actor_mention(item)}\n"
+                f"🛠 Revisão concluída por: {html.escape(str(actor))}\n\n"
                 "Obrigado pelo reporte. Este caso foi incorporado ao ciclo "
                 "de melhoria do detector e saiu da fila de ajustes pendentes."
                 + (
@@ -9272,7 +9274,8 @@ def process_telegram_command(message, from_channel=False):
                     else "\nℹ️ Não foi possível atualizar o aviso original, mas a fila foi corrigida."
                 )
             ),
-            chat_id=chat_id
+            chat_id=chat_id,
+            parse_mode="HTML"
         )
         return
 
