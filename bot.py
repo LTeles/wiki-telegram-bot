@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.32"
-BOT_BUILD = "2.32"
+BOT_VERSION = "2.33"
+BOT_BUILD = "2.33"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2177,11 +2177,11 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.32</b>\n\n"
-        "🔗 <b>Correção dos links do /conta</b>\n"
-        "• Corrigida a codificação dupla de nomes com acentos no link da página de usuário.\n"
-        "• Links de contribuições, edições e demais comandos permanecem inalterados.\n"
-        "• Preservadas as correções de pendências da versão 2.31."
+        "🤖 <b>TelesGramBot 2.33</b>\n\n"
+        "👤 <b>Correção de falhas no /conta</b>\n"
+        "• Falhas da API não são mais apresentadas como conta inexistente.\n"
+        "• Erros durante a montagem da resposta geram aviso em vez de silêncio.\n"
+        "• Preservada a correção de links da versão 2.32."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -6647,7 +6647,7 @@ def normalize_page_title(title):
         return None
 
 
-def get_user_info(username, use_cache=True):
+def get_user_info(username, use_cache=True, raise_on_error=False):
     now = time.time()
 
     if use_cache:
@@ -6682,14 +6682,13 @@ def get_user_info(username, use_cache=True):
 
         response.raise_for_status()
 
-        users = (
-            response.json()
-            .get("query", {})
-            .get("users", [])
-        )
+        data = response.json()
+        if data.get("error") or "query" not in data:
+            raise ValueError("Resposta inesperada da API de usuários: " + str(data.get("error", "sem query")))
+        users = data["query"].get("users", [])
 
         if not users:
-            return None
+            raise ValueError("API não retornou a lista de usuários")
 
         user = users[0]
 
@@ -6714,6 +6713,8 @@ def get_user_info(username, use_cache=True):
             username,
             safe_exception(e)
         )
+        if raise_on_error:
+            raise
         return None
 
 
@@ -6860,10 +6861,18 @@ def should_evaluate_user(username):
 # =========================================================
 
 def build_account_message(username):
-    info = get_user_info(
-        username,
-        use_cache=False
-    )
+    try:
+        info = get_user_info(
+            username,
+            use_cache=False,
+            raise_on_error=True
+        )
+    except Exception:
+        return (
+            "⚠️ Não foi possível consultar a Wikipédia agora. "
+            "Tente novamente em alguns instantes.",
+            None
+        )
 
     if info is None:
         return (
@@ -9397,9 +9406,12 @@ def process_telegram_command(message, from_channel=False):
             )
             return
 
-        account_message, parse_mode = (
-            build_account_message(argument)
-        )
+        try:
+            account_message, parse_mode = build_account_message(argument)
+        except Exception as e:
+            print("⚠️ Falha no comando /conta:", safe_exception(e))
+            account_message = "⚠️ Erro temporário ao consultar a conta. Tente novamente."
+            parse_mode = None
 
         send_telegram_message(
             account_message,
