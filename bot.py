@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.33"
-BOT_BUILD = "2.33"
+BOT_VERSION = "2.34"
+BOT_BUILD = "2.34"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -56,6 +56,67 @@ HEADERS = {
         "(https://t.me/ptwiki)"
     )
 }
+
+
+# Limite compartilhado entre threads para leituras da Action API. Não altera
+# Telegram, EventStreams nem o limite independente de escrita (desativada).
+# Ao receber 429, interrompe imediatamente novas consultas durante o cooldown;
+# não faz retries em massa nem mantém o listener do Telegram bloqueado.
+_wiki_read_lock = threading.Lock()
+_wiki_next_read_at = 0.0
+_wiki_cooldown_until = 0.0
+_wiki_original_request = requests.sessions.Session.request
+
+
+def _wiki_controlled_request(session, method, url, **kwargs):
+    global _wiki_next_read_at, _wiki_cooldown_until
+    from email.utils import parsedate_to_datetime
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    is_action_api = (
+        str(url).startswith("https://pt.wikipedia.org/w/api.php")
+        and str(method).upper() == "GET"
+    )
+    if not is_action_api:
+        return _wiki_original_request(session, method, url, **kwargs)
+
+    # A trava protege somente a reserva de horário; nunca uma operação de rede.
+    with _wiki_read_lock:
+        now = time.monotonic()
+        if now < _wiki_cooldown_until:
+            raise requests.exceptions.HTTPError(
+                "Wikipédia: HTTP 429; aguardando cooldown global de leitura"
+            )
+        reserved = max(now, _wiki_next_read_at)
+        _wiki_next_read_at = reserved + 1.25
+    if reserved > now:
+        time.sleep(reserved - now)
+    with _wiki_read_lock:
+        if time.monotonic() < _wiki_cooldown_until:
+            raise requests.exceptions.HTTPError(
+                "Wikipédia: HTTP 429; aguardando cooldown global de leitura"
+            )
+    response = _wiki_original_request(session, method, url, **kwargs)
+    if response.status_code == 429:
+        retry = response.headers.get("Retry-After", "")
+        seconds = 120.0
+        try:
+            seconds = float(retry)
+        except (ValueError, TypeError):
+            try:
+                parsed = parsedate_to_datetime(retry)
+                seconds = (parsed - _datetime.now(_timezone.utc)).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                pass
+        seconds = max(60.0, min(seconds, 900.0))
+        with _wiki_read_lock:
+            _wiki_cooldown_until = max(_wiki_cooldown_until, time.monotonic() + seconds)
+            _wiki_next_read_at = max(_wiki_next_read_at, _wiki_cooldown_until)
+        print(f"⚠️ Wikipédia HTTP 429: leituras suspensas por {seconds:.0f}s (Retry-After respeitado).")
+    return response
+
+
+requests.sessions.Session.request = _wiki_controlled_request
 
 
 # =========================================================
@@ -2177,11 +2238,12 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.33</b>\n\n"
-        "👤 <b>Correção de falhas no /conta</b>\n"
-        "• Falhas da API não são mais apresentadas como conta inexistente.\n"
-        "• Erros durante a montagem da resposta geram aviso em vez de silêncio.\n"
-        "• Preservada a correção de links da versão 2.32."
+        f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n\n"
+        "🛠 <b>Controle de consultas à Wikipédia</b>\n"
+        "• Limite compartilhado de leitura e pausa global após HTTP 429, respeitando Retry-After.\n"
+        "• /conta processado sem bloquear a recepção dos comandos seguintes.\n"
+        "• Diagnóstico de comandos recebidos e falhas de resposta no grupo.\n"
+        "• Mantidas as correções de links e de pendências; escrita na Wikipédia desativada."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -9413,11 +9475,18 @@ def process_telegram_command(message, from_channel=False):
             account_message = "⚠️ Erro temporário ao consultar a conta. Tente novamente."
             parse_mode = None
 
-        send_telegram_message(
+        sent = send_telegram_message(
             account_message,
             chat_id=chat_id,
             parse_mode=parse_mode
         )
+        if not sent:
+            print("⚠️ /conta: resposta não entregue pelo Telegram; chat_id=", chat_id)
+            if parse_mode:
+                send_telegram_message(
+                    "⚠️ Não foi possível formatar a resposta da conta. Tente novamente.",
+                    chat_id=chat_id,
+                )
         return
 
     if command == "/observadas":
@@ -10745,6 +10814,22 @@ def process_edit_action_callback(callback):
 # LISTENER TELEGRAM
 # =========================================================
 
+_account_command_slots = threading.BoundedSemaphore(3)
+
+
+def _process_account_command_async(message):
+    try:
+        process_telegram_command(message, from_channel=False)
+    except Exception as exc:
+        print("⚠️ Erro inesperado em /conta:", safe_exception(exc))
+        send_telegram_message(
+            "⚠️ Falha temporária ao consultar a conta.",
+            chat_id=(message.get("chat") or {}).get("id"),
+        )
+    finally:
+        _account_command_slots.release()
+
+
 def telegram_command_listener():
     offset = None
 
@@ -10803,10 +10888,24 @@ def telegram_command_listener():
                 message = update.get("message")
 
                 if message:
-                    process_telegram_command(
-                        message,
-                        from_channel=False
-                    )
+                    text = (message.get("text") or "").strip()
+                    is_account = text.split(maxsplit=1)[0].split("@")[0].lower() == "/conta" if text else False
+                    if is_account:
+                        print("📨 /conta recebido:", (message.get("chat") or {}).get("type"),
+                              "chat_id=", (message.get("chat") or {}).get("id"))
+                        if _account_command_slots.acquire(blocking=False):
+                            threading.Thread(
+                                target=_process_account_command_async,
+                                args=(message,), daemon=True,
+                                name="telegram-conta",
+                            ).start()
+                        else:
+                            send_telegram_message(
+                                "⏳ Consultas de conta ocupadas. Aguarde e tente novamente.",
+                                chat_id=(message.get("chat") or {}).get("id"),
+                            )
+                    else:
+                        process_telegram_command(message, from_channel=False)
 
                 channel_post = update.get(
                     "channel_post"
