@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.31"
-BOT_BUILD = "2.31"
+BOT_VERSION = "2.32"
+BOT_BUILD = "2.32"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2177,20 +2177,11 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.31</b>\n\n"
-        "👁 <b>Páginas vigiadas</b>\n"
-        "• Edições humanas em páginas explicitamente vigiadas agora são avisadas inclusive quando feitas por administradores.\n"
-        "• Edições identificadas como bot continuam excluídas.\n"
-        "• Correções recentes de autorreversão e falsos positivos foram preservadas."
-
-
-
-
-
-
-
-
-
+        "🤖 <b>TelesGramBot 2.32</b>\n\n"
+        "🔗 <b>Correção dos links do /conta</b>\n"
+        "• Corrigida a codificação dupla de nomes com acentos no link da página de usuário.\n"
+        "• Links de contribuições, edições e demais comandos permanecem inalterados.\n"
+        "• Preservadas as correções de pendências da versão 2.31."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -6922,15 +6913,10 @@ def build_account_message(username):
     else:
         block_status = "🟢 nenhum"
 
-    encoded_username = quote(
-        username.replace(" ", "_"),
-        safe=""
-    )
-
-    user_url = (
-        "https://pt.wikipedia.org/wiki/"
-        f"Usuário:{encoded_username}"
-    )
+    # Codificar o título completo uma única vez. Não codificar o nome
+    # separadamente e depois recodificar a URL na formatação do Telegram.
+    user_title = "Usuário:" + username.replace(" ", "_")
+    user_url = "https://pt.wikipedia.org/wiki/" + quote(user_title, safe=":")
 
     message = (
         f'👤 <a href="{html.escape(user_url, quote=True)}">'
