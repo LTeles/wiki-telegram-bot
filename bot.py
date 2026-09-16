@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.37"
-BOT_BUILD = "2.37"
+BOT_VERSION = "2.38"
+BOT_BUILD = "2.38"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2242,12 +2242,10 @@ def announce_new_version_if_needed():
 
     message = (
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n\n"
-        "↩️ <b>Recuperação de avisos resolvidos</b>\n"
-        "• Atualizações de avisos que falharem no Telegram entram em fila persistente de novas tentativas.\n"
-        "• Reversões e eliminações permanecem resolvidas mesmo durante falhas visuais.\n"
-        "• Tentativas têm intervalo progressivo e limite; nenhuma mensagem antiga é reprocessada automaticamente.\n"
-        "• Preservadas as correções de /conta, a calibração e os links/menções de falso positivo. "
-        "Escrita na Wikipédia desativada."
+        "🛠 <b>Manutenção conservadora</b>\n"
+        "• Corrigida a duplicação da função que remove os botões Resolver e Falso + de avisos resolvidos.\n"
+        "• Preservadas as demais funções, a recuperação de avisos e os controles de requisições.\n"
+        "• Escrita na Wikipédia permanece desativada."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -8677,34 +8675,6 @@ def reply_markup_without_resolution_buttons(reply_markup, revision_id):
             if not (
                 isinstance(button, dict)
                 and button.get("callback_data") in blocked
-            )
-        ]
-        if cleaned:
-            rows.append(cleaned)
-
-    return {"inline_keyboard": rows} if rows else None
-
-
-
-def reply_markup_without_resolution_buttons(reply_markup, revision_id):
-    if not isinstance(reply_markup, dict):
-        return tracked_edit_reply_markup(
-            revision_id,
-            include_resolve=False
-        )
-
-    target = f"resolve:{revision_id}"
-    rows = []
-
-    for row in reply_markup.get("inline_keyboard", []):
-        if not isinstance(row, list):
-            continue
-        cleaned = [
-            button
-            for button in row
-            if not (
-                isinstance(button, dict)
-                and button.get("callback_data") == target
             )
         ]
         if cleaned:
