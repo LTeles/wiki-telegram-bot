@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.38"
-BOT_BUILD = "2.38"
+BOT_VERSION = "2.39"
+BOT_BUILD = "2.39-reversoes-1"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -775,7 +775,8 @@ def send_telegram_message(text, chat_id=None, parse_mode=None, reply_markup=None
 
 
 def edit_telegram_message(message_id, text, parse_mode=None, reply_markup=None):
-    while True:
+    # Retorno False permite persistir uma tentativa de recuperação em vez de travar o monitor.
+    for attempt in range(4):
         try:
             payload = {
                 "chat_id": TELEGRAM_CHANNEL,
@@ -809,7 +810,7 @@ def edit_telegram_message(message_id, text, parse_mode=None, reply_markup=None):
                 except Exception:
                     retry_after = 2
 
-                time.sleep(retry_after)
+                time.sleep(min(max(float(retry_after), 1.0), 10.0))
                 continue
 
             # "message is not modified" não é falha relevante.
@@ -830,7 +831,7 @@ def edit_telegram_message(message_id, text, parse_mode=None, reply_markup=None):
                 return False
 
             if response.status_code >= 500:
-                time.sleep(5)
+                time.sleep(2)
                 continue
 
             response.raise_for_status()
@@ -838,7 +839,10 @@ def edit_telegram_message(message_id, text, parse_mode=None, reply_markup=None):
 
         except requests.RequestException as e:
             print("⚠️ Erro ao editar mensagem Telegram:", safe_exception(e))
-            time.sleep(5)
+            time.sleep(2)
+
+    print("⚠️ Telegram: limite de tentativas ao editar mensagem:", message_id)
+    return False
 
 
 def edit_telegram_message_in_chat(chat_id, message_id, text, parse_mode=None, reply_markup=None):
@@ -2242,9 +2246,11 @@ def announce_new_version_if_needed():
 
     message = (
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n\n"
-        "🛠 <b>Manutenção conservadora</b>\n"
-        "• Corrigida a duplicação da função que remove os botões Resolver e Falso + de avisos resolvidos.\n"
-        "• Preservadas as demais funções, a recuperação de avisos e os controles de requisições.\n"
+        "💬 <b>Calibração de conversas e correção do monitor de reversões</b>\n"
+        "• Comentários assinados em Ajuda:Tire suas dúvidas e Ajuda:Contato/Fale com a Wikipédia recebem análise contextual.\n"
+        "• Respostas inseridas no meio da discussão também podem receber redutor, sem blindar remoções ou abuso.\n"
+        "• Páginas iniciadas por Ajuda:Página de testes são ignoradas.\n"
+        "• Monitor de reversões reinicia após falha inesperada; edições de mensagens têm tentativas limitadas e recuperação persistente.\n"
         "• Escrita na Wikipédia permanece desativada."
     )
 
@@ -5484,7 +5490,7 @@ def retry_failed_status_messages():
         save_posted_edits()
 
 
-def posted_edit_status_monitor():
+def _posted_edit_status_monitor_loop():
     print(
         "✅ Monitor de reversões/patrulhamento iniciado."
     )
@@ -5720,6 +5726,22 @@ def posted_edit_status_monitor():
                     "⚠️ Erro ao salvar status de mensagens:",
                     safe_exception(e)
                 )
+
+
+
+def posted_edit_status_monitor():
+    """Reinicia somente o monitor de desfechos se uma exceção inesperada ocorrer.
+
+    Sem esta proteção, uma exceção encerra silenciosamente a thread daemon,
+    enquanto o restante do bot continua enviando alertas.
+    """
+    while True:
+        try:
+            _posted_edit_status_monitor_loop()
+            print("⚠️ Monitor de reversões retornou inesperadamente; reiniciando em 15s.")
+        except Exception as exc:
+            print("❌ Monitor de reversões interrompido; reiniciando em 15s:", safe_exception(exc))
+        time.sleep(15)
 
 
 # =========================================================
@@ -8302,22 +8324,30 @@ def benign_technical_change(diff):
 
 
 def is_discussion_namespace(change):
+    """Reconhece espaços de conversa, inclusive páginas de ajuda comunitária.
+
+    Não trata todo o namespace Ajuda como discussão: apenas páginas
+    reconhecidas como locais de perguntas e respostas recebem o redutor.
     """
-    MediaWiki organiza, em regra, namespaces de discussão nos IDs ímpares
-    pareados aos namespaces de conteúdo. Usa o ID quando disponível e cai
-    para o prefixo do título como fallback.
-    """
+    title = str(change.get("title") or "").replace("_", " ").strip()
+    normalized = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode().casefold()
+    discussion_help = (
+        "ajuda:tire suas duvidas",
+        "ajuda:contato/fale com a wikipedia",
+    )
+    if any(normalized == prefix or normalized.startswith(prefix + "/") for prefix in discussion_help):
+        return True
+    # Páginas comunitárias de conversa explicitamente identificadas.
+    if normalized.startswith(("wikipedia:esplanada/", "wikipedia:pedidos/", "wikipedia:cafe dos novatos")):
+        return True
     try:
         namespace = int(change.get("namespace"))
         if namespace > 0 and namespace % 2 == 1:
             return True
-    except Exception:
+    except (TypeError, ValueError):
         pass
-
-    title = str(change.get("title") or "")
     if ":" not in title:
         return False
-
     prefix = title.split(":", 1)[0].casefold()
     return "discussão" in prefix or "discussao" in prefix or prefix.endswith(" talk")
 
@@ -8405,7 +8435,7 @@ def contextual_discussion_adjustment(change, diff, strong_signals):
             return {
                 "multiplier": 0.45,
                 "additive": 0.0,
-                "reason": "acréscimo de comentário assinado em discussão, sem sinais fortes",
+                "reason": "comentário assinado inserido em espaço de conversa, sem remoções nem sinais fortes",
                 "kind": "talk_signed_append",
             }
         # Não aplica redutor genérico a edições com remoções ou links externos.
@@ -11061,6 +11091,15 @@ def eventstream_watchdog():
 # WIKIMEDIA EVENTSTREAMS
 # =========================================================
 
+def is_help_tests_page(title):
+    """Ignora Ajuda:Página de testes e todos os títulos com esse início."""
+    if not isinstance(title, str):
+        return False
+    normalized = unicodedata.normalize("NFKD", title.replace("_", " ").strip())
+    normalized = "".join(c for c in normalized if not unicodedata.combining(c)).casefold()
+    return normalized.startswith("ajuda:pagina de testes")
+
+
 def is_user_tests_page(title):
     """Ignora subpáginas /Testes no namespace de usuário."""
     if not isinstance(title, str):
@@ -11176,6 +11215,10 @@ def wikimedia_loop():
                 # Páginas pessoais de testes não entram no pipeline de
                 # análise/alertas. Aceita as formas localizadas do
                 # namespace de usuário e qualquer subpágina de /Testes.
+                if is_help_tests_page(change.get("title", "")):
+                    print("🧪 Página de testes de ajuda ignorada:", change.get("title"))
+                    continue
+
                 if is_user_tests_page(change.get("title", "")):
                     print(
                         "🧪 Página de testes de usuário ignorada:",
