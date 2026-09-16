@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.30"
-BOT_BUILD = "2.30"
+BOT_VERSION = "2.31"
+BOT_BUILD = "2.31"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2177,7 +2177,7 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.30</b>\n\n"
+        "🤖 <b>TelesGramBot 2.31</b>\n\n"
         "👁 <b>Páginas vigiadas</b>\n"
         "• Edições humanas em páginas explicitamente vigiadas agora são avisadas inclusive quando feitas por administradores.\n"
         "• Edições identificadas como bot continuam excluídas.\n"
@@ -5476,28 +5476,37 @@ def posted_edit_status_monitor():
                     include_resolution_buttons=False
                 )
 
+                # Persistir a resolução ANTES da atualização visual no Telegram.
+                # Falha de edição da mensagem não pode manter o alerta pendente.
+                with posted_edits_lock:
+                    live = posted_edits.get(str(revision_id))
+                    if not live or live.get("status") in (
+                        "reverted", "self_reverted", "deleted",
+                        "resolved_no_action", "false_positive"
+                    ):
+                        continue
+                    live["status"] = new_status
+                    if reverter:
+                        live["reverted_by"] = reverter
+                    if new_status in ("reverted", "self_reverted"):
+                        live["reverted_at"] = time.time()
+                    elif new_status == "patrolled":
+                        live["patrolled_at"] = time.time()
+
+                # A gravação não depende do sucesso da API do Telegram.
+                save_posted_edits()
+                changed_any = True
                 success = edit_telegram_message(
                     record["message_id"],
                     new_text,
                     parse_mode="HTML",
                     reply_markup=status_reply_markup
                 )
+                if not success:
+                    print("⚠️ Estado resolvido salvo; falhou atualização visual:", revision_id)
 
-                if success:
-                    with posted_edits_lock:
-                        live = posted_edits.get(
-                            str(revision_id)
-                        )
-
-                        if live:
-                            live["status"] = new_status
-                            if reverter:
-                                live["reverted_by"] = reverter
-                            if new_status in ("reverted", "self_reverted"):
-                                live["reverted_at"] = time.time()
-
-                    changed_any = True
-
+                # Contabilizar o desfecho mesmo quando a mensagem não é editável.
+                if True:
                     if new_status == "self_reverted":
                         # Uma autorreversão não conta como resposta da comunidade.
                         # Ela é registrada separadamente para não inflar a
@@ -6183,6 +6192,18 @@ def pending_alerts_summary_scheduler():
                 print("ℹ️ Resumo de pendências não publicado: lista inalterada.")
                 continue
 
+            # Revalidar contra o estado atual, pois o monitor pode ter
+            # encerrado alertas enquanto o resumo era preparado.
+            current_ids = {
+                str(item.get("revision_id")) for item in get_pending_posted_edits()
+            }
+            items = [
+                item for item in items
+                if str(item.get("revision_id")) in current_ids
+            ]
+            if not items:
+                continue
+            signature = pending_summary_signature(items)
             message = build_pending_summary_message(items)
             if not message:
                 with pending_summary_lock:
