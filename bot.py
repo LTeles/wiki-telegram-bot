@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.36"
-BOT_BUILD = "2.36"
+BOT_VERSION = "2.37"
+BOT_BUILD = "2.37"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2242,9 +2242,12 @@ def announce_new_version_if_needed():
 
     message = (
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n\n"
-        "🔗 <b>Link no aviso de resolução de falso positivo</b>\n"
-        "• O número da revisão na confirmação de /resolverfalso abre o diff correspondente.\n"
-        "• Preservadas calibração 2.35 e proteções de requisições; escrita na Wikipédia desativada."
+        "↩️ <b>Recuperação de avisos resolvidos</b>\n"
+        "• Atualizações de avisos que falharem no Telegram entram em fila persistente de novas tentativas.\n"
+        "• Reversões e eliminações permanecem resolvidas mesmo durante falhas visuais.\n"
+        "• Tentativas têm intervalo progressivo e limite; nenhuma mensagem antiga é reprocessada automaticamente.\n"
+        "• Preservadas as correções de /conta, a calibração e os links/menções de falso positivo. "
+        "Escrita na Wikipédia desativada."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -5403,6 +5406,86 @@ def message_with_status(record, status, reverter=None, deleter=None):
     return record.get("base_message", "").rstrip()
 
 
+# Estado da entrega visual é independente da resolução lógica da revisão.
+# Só avisos marcados explicitamente após esta versão entram na recuperação.
+TELEGRAM_STATUS_RETRY_LIMIT = 5
+TELEGRAM_STATUS_RETRY_DELAYS = (60, 180, 600, 1800, 3600)
+TERMINAL_ALERT_STATUSES = ("reverted", "self_reverted", "patrolled", "deleted")
+
+
+def record_status_delivery(revision_id, success):
+    """Persiste o resultado sem recolocar uma revisão resolvida nas pendências."""
+    with posted_edits_lock:
+        live = posted_edits.get(str(revision_id))
+        if not live:
+            return
+        if success:
+            live.pop("status_telegram_retry", None)
+        elif live.get("status") in TERMINAL_ALERT_STATUSES:
+            live["status_telegram_retry"] = {
+                "attempts": 1,
+                "next_at": time.time() + TELEGRAM_STATUS_RETRY_DELAYS[0],
+                "status": live["status"],
+            }
+    save_posted_edits()
+
+
+def retry_failed_status_messages():
+    """Reconstitui texto/teclado do estado salvo; não consulta nem edita a wiki."""
+    now = time.time()
+    with posted_edits_lock:
+        due = [dict(item) for item in posted_edits.values()
+               if isinstance(item.get("status_telegram_retry"), dict)
+               and float(item["status_telegram_retry"].get("next_at", float("inf"))) <= now]
+    for item in due[:5]:
+        revision_id = str(item.get("revision_id"))
+        with posted_edits_lock:
+            live = posted_edits.get(revision_id)
+            if not live:
+                continue
+            retry = live.get("status_telegram_retry")
+            if not isinstance(retry, dict) or retry.get("status") != live.get("status"):
+                live.pop("status_telegram_retry", None)
+                continue
+            attempts = int(retry.get("attempts", 1))
+            if attempts >= TELEGRAM_STATUS_RETRY_LIMIT:
+                print("⚠️ Atualização visual esgotou tentativas:", revision_id)
+                live.pop("status_telegram_retry", None)
+                continue
+            current = dict(live)
+        status = current["status"]
+        text = message_with_status(current, status,
+                                   reverter=current.get("reverted_by"),
+                                   deleter=current.get("deleted_by"))
+        markup = tracked_edit_reply_markup(
+            int(revision_id), current.get("alert_kind", "normal"),
+            include_resolution_buttons=False)
+        success = edit_telegram_message(current["message_id"], text,
+                                        parse_mode="HTML", reply_markup=markup)
+        with posted_edits_lock:
+            live = posted_edits.get(revision_id)
+            if not live or not isinstance(live.get("status_telegram_retry"), dict):
+                continue
+            if live.get("status") != status:
+                live.pop("status_telegram_retry", None)
+            elif success:
+                live.pop("status_telegram_retry", None)
+                print("✅ Aviso atualizado após nova tentativa:", revision_id)
+            else:
+                next_attempts = attempts + 1
+                if next_attempts >= TELEGRAM_STATUS_RETRY_LIMIT:
+                    live.pop("status_telegram_retry", None)
+                    print("⚠️ Atualização visual esgotou tentativas:", revision_id)
+                else:
+                    live["status_telegram_retry"] = {
+                        "attempts": next_attempts,
+                        "next_at": time.time() + TELEGRAM_STATUS_RETRY_DELAYS[
+                            min(next_attempts - 1, len(TELEGRAM_STATUS_RETRY_DELAYS) - 1)],
+                        "status": status,
+                    }
+        save_posted_edits()
+
+
 def posted_edit_status_monitor():
     print(
         "✅ Monitor de reversões/patrulhamento iniciado."
@@ -5417,6 +5500,10 @@ def posted_edit_status_monitor():
         time.sleep(POSTED_EDIT_CHECK_SECONDS)
 
         cleanup_posted_edits()
+        try:
+            retry_failed_status_messages()
+        except Exception as exc:
+            print("⚠️ Erro na recuperação de avisos:", safe_exception(exc))
 
         with posted_edits_lock:
             snapshot = [
@@ -5556,8 +5643,9 @@ def posted_edit_status_monitor():
                     parse_mode="HTML",
                     reply_markup=status_reply_markup
                 )
+                record_status_delivery(revision_id, success)
                 if not success:
-                    print("⚠️ Estado resolvido salvo; falhou atualização visual:", revision_id)
+                    print("⚠️ Estado resolvido salvo; atualização visual agendada:", revision_id)
 
                 # Contabilizar o desfecho mesmo quando a mensagem não é editável.
                 if True:
@@ -5684,6 +5772,9 @@ def mark_pending_title_deleted(title, deleter=None, deleted_at=None):
                 live["deleted_at"] = deleted_at
                 resolved += 1
 
+        # Persistir antes de contatar o Telegram para sobreviver a reinícios.
+        save_posted_edits()
+
         # Depois tenta refletir o estado na mensagem original.
         status_reply_markup = tracked_edit_reply_markup(
             revision_id,
@@ -5704,6 +5795,7 @@ def mark_pending_title_deleted(title, deleter=None, deleted_at=None):
             reply_markup=status_reply_markup
         )
 
+        record_status_delivery(revision_id, success)
         if success:
             print(
                 "🗑️ Alerta marcado como página eliminada:",
