@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.29"
-BOT_BUILD = "2.29"
+BOT_VERSION = "2.30"
+BOT_BUILD = "2.30"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -71,6 +71,9 @@ WIKI_WRITE_ENABLED = False
 WIKI_ALLOWED_TITLE_PREFIX = "Usuário:TelesGramBot/"
 WIKI_STATUS_TITLE = "Usuário:TelesGramBot/Status"
 WIKI_CREATE_ENABLED = False
+WIKI_WRITE_INTERVAL_SECONDS = 61 * 60
+WIKI_WRITE_QUEUE_FILE = "/data/wiki_write_queue.json"
+WIKI_WRITE_LOCK = threading.RLock()
 
 # Relatórios que serão usados quando a publicação for futuramente ativada.
 WIKI_DAILY_REPORT_PREFIX = "Usuário:TelesGramBot/Relatórios/Diário/"
@@ -1489,58 +1492,108 @@ def wiki_page_exists(title):
     return bool(pages and not pages[0].get("missing"))
 
 
-def wiki_edit_page(title, wikitext, summary):
-    """
-    Implementação pronta para uso futuro, mas bloqueada por duas barreiras:
-    1) WIKI_WRITE_ENABLED precisa ser alterado no código;
-    2) o título precisa começar por Usuário:TelesGramBot/;\n    3) a página precisa existir; criação automática é proibida.
+def wiki_report_creation_allowed(title):
+    if not isinstance(title, str):
+        return False
+    for prefix, pattern in (
+        (WIKI_DAILY_REPORT_PREFIX, r"[0-9]{4}-[0-9]{2}-[0-9]{2}"),
+        (WIKI_MONTHLY_REPORT_PREFIX, r"[0-9]{4}-[0-9]{2}"),
+    ):
+        if not title.startswith(prefix):
+            continue
+        suffix = title[len(prefix):]
+        if not re.fullmatch(pattern, suffix):
+            return False
+        try:
+            if prefix == WIKI_DAILY_REPORT_PREFIX:
+                return datetime.strptime(suffix, "%Y-%m-%d").strftime("%Y-%m-%d") == suffix
+            return datetime.strptime(suffix, "%Y-%m").strftime("%Y-%m") == suffix
+        except ValueError:
+            return False
+    return False
 
-    Nesta versão a primeira barreira é False e nenhuma chamada action=edit
-    é enviada.
-    """
+
+def queue_wiki_edit(title, wikitext, summary):
+    """Coalesce pending writes by title; no network access here."""
     if not wiki_title_is_allowed(title):
-        raise PermissionError(
-            f"título fora do prefixo permitido: {title!r}"
-        )
+        raise PermissionError("Título fora das subpáginas autorizadas")
+    if not isinstance(wikitext, str) or not wikitext.strip():
+        raise ValueError("Conteúdo wiki vazio")
+    with WIKI_WRITE_LOCK:
+        state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+        if not isinstance(state, dict):
+            state = {"pending": [], "last_attempt": 0}
+        pending = [item for item in state.get("pending", []) if item.get("title") != title]
+        pending.append({"title": title, "text": wikitext, "summary": summary})
+        state["pending"] = pending
+        atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+    return True
 
+
+def wiki_edit_page(title, wikitext, summary):
+    """Single guarded write entry point, called only by the queue worker."""
     if not WIKI_WRITE_ENABLED:
-        print(
-            "🔒 Escrita wiki bloqueada; relatório mantido apenas como prévia:",
-            title,
-        )
         return False
+    if not wiki_title_is_allowed(title):
+        raise PermissionError("Título wiki não autorizado")
+    with WIKI_WRITE_LOCK:
+        state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+        if time.time() - float(state.get("last_attempt") or 0) < WIKI_WRITE_INTERVAL_SECONDS:
+            return False
+        # Reserve the slot BEFORE any remote operation; crashes cannot cause a burst.
+        state["last_attempt"] = time.time()
+        atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+        exists = wiki_page_exists(title)
+        create = not exists
+        if create and not (WIKI_CREATE_ENABLED and wiki_report_creation_allowed(title)):
+            print("📄 Página ausente; criação bloqueada:", title)
+            return False
+        # A deletion log is a hard stop for any attempt to recreate a page.
+        if create and get_latest_deletion_log(title):
+            print("⛔ Página eliminada; recriação automática proibida:", title)
+            return False
+        token = get_wikimedia_csrf_token()
+        payload = {
+            "action": "edit", "format": "json", "formatversion": 2,
+            "title": title, "text": wikitext, "summary": summary,
+            "token": token, "assert": "user", "bot": 1,
+        }
+        payload["createonly" if create else "nocreate"] = 1
+        response = wikimedia_session.post(WIKIPEDIA_API, data=payload, timeout=35)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("error"):
+            raise RuntimeError("API edit recusou publicação: " + str(data["error"]))
+        return data.get("edit", {}).get("result") == "Success"
 
-    if not wiki_page_exists(title):
-        print("📄 Página wiki ausente; criação automática proibida:", title)
+
+def process_wiki_write_queue_once():
+    if not WIKI_WRITE_ENABLED:
         return False
+    with WIKI_WRITE_LOCK:
+        state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+        pending = state.get("pending", [])
+        if not pending or time.time() - float(state.get("last_attempt") or 0) < WIKI_WRITE_INTERVAL_SECONDS:
+            return False
+        item = pending[0]
+        try:
+            success = wiki_edit_page(item["title"], item["text"], item["summary"])
+        except Exception as exc:
+            print("⚠️ Falha na escrita wiki:", safe_exception(exc))
+            return False
+        if success:
+            state = load_json(WIKI_WRITE_QUEUE_FILE, state)
+            # Never remove a newer, coalesced update of the same page.
+            if state.get("pending") and state["pending"][0] == item:
+                state["pending"].pop(0)
+                atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+        return success
 
-    token = get_wikimedia_csrf_token()
 
-    response = wikimedia_session.post(
-        WIKIPEDIA_API,
-        data={
-            "action": "edit",
-            "nocreate": 1,
-            "format": "json",
-            "formatversion": 2,
-            "title": title,
-            "text": wikitext,
-            "summary": summary,
-            "token": token,
-            "assert": "user",
-            "bot": 1,
-        },
-        timeout=35,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    if data.get("error"):
-        raise RuntimeError(
-            f"API edit recusou publicação: {data['error']}"
-        )
-
-    return data.get("edit", {}).get("result") == "Success"
+def wiki_write_queue_worker():
+    while True:
+        time.sleep(30)
+        process_wiki_write_queue_once()
 
 
 def community_events_between(start_ts, end_ts):
@@ -2067,12 +2120,12 @@ def build_wiki_daily_and_monthly_previews(now=None):
     # Chamadas deliberadamente bloqueadas nesta versão. Mantidas aqui para
     # deixar o fluxo de publicação pronto para uma futura liberação explícita.
     if WIKI_WRITE_ENABLED:
-        wiki_edit_page(
+        queue_wiki_edit(
             daily_title,
             daily_text,
             "Atualizando relatório diário de manutenção e combate a vandalismo",
         )
-        wiki_edit_page(
+        queue_wiki_edit(
             monthly_title,
             monthly_text,
             "Atualizando painel mensal de manutenção e combate a vandalismo",
@@ -2124,7 +2177,7 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        "🤖 <b>TelesGramBot 2.29</b>\n\n"
+        "🤖 <b>TelesGramBot 2.30</b>\n\n"
         "👁 <b>Páginas vigiadas</b>\n"
         "• Edições humanas em páginas explicitamente vigiadas agora são avisadas inclusive quando feitas por administradores.\n"
         "• Edições identificadas como bot continuam excluídas.\n"
@@ -5047,6 +5100,50 @@ def get_patrol_status_batch(records):
         return {}
 
 
+def verify_direct_undo(title, revision_id):
+    """Confirm adjacent undo by content hashes, even when mw-reverted is delayed.
+
+    Returns the actual reverting username only if the immediate next revision
+    has an undo/revert tag AND restores the SHA1 of the revision preceding the
+    alerted edit. No guess based solely on a generic revert tag.
+    """
+    try:
+        response = requests.get(WIKIPEDIA_API, params={
+            "action": "query", "format": "json", "formatversion": 2,
+            "prop": "revisions", "titles": title,
+            "rvprop": "ids|sha1|user|tags", "rvdir": "older",
+            "rvstartid": int(revision_id), "rvlimit": 2,
+        }, headers=HEADERS, timeout=20)
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", [])
+        before = pages[0].get("revisions", []) if pages else []
+        if len(before) < 2 or int(before[0].get("revid", -1)) != int(revision_id):
+            return None
+        previous_hash = before[1].get("sha1")
+        if not previous_hash:
+            return None
+        response = requests.get(WIKIPEDIA_API, params={
+            "action": "query", "format": "json", "formatversion": 2,
+            "prop": "revisions", "titles": title,
+            "rvprop": "ids|sha1|user|tags", "rvdir": "newer",
+            "rvstartid": int(revision_id), "rvlimit": 2,
+        }, headers=HEADERS, timeout=20)
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", [])
+        after = pages[0].get("revisions", []) if pages else []
+        if len(after) < 2 or int(after[0].get("revid", -1)) != int(revision_id):
+            return None
+        undo = after[1]
+        if not ({"mw-undo", "mw-rollback", "mw-manual-revert"} & set(undo.get("tags") or [])):
+            return None
+        if undo.get("sha1") != previous_hash:
+            return None
+        return undo.get("user") or None
+    except Exception as exc:
+        print("⚠️ Falha ao confirmar desfazer direto:", safe_exception(exc))
+        return None
+
+
 def get_reverter_username(title, revision_id):
     """Tenta identificar quem realizou a reversão sem presumir um nome.
 
@@ -5329,6 +5426,12 @@ def posted_edit_status_monitor():
 
             if tags and "mw-reverted" in tags:
                 new_status = "reverted"
+            elif revision_id in tags_by_revision and verify_direct_undo(
+                record.get("title") or "", revision_id
+            ):
+                # Confirmed adjacent undo, even if the asynchronous mw-reverted
+                # tag has not yet appeared on the original revision.
+                new_status = "reverted"
 
             elif current_status != "patrolled":
                 if patrol_by_revision.get(revision_id) is True:
@@ -5346,9 +5449,10 @@ def posted_edit_status_monitor():
                 # autorreversão. A comparação usa a mesma normalização de nomes
                 # já empregada pelo bot (espaços/underscores e casefold).
                 if new_status == "reverted":
-                    reverter = get_reverter_username(
-                        record.get("title") or "",
-                        revision_id
+                    reverter = verify_direct_undo(
+                        record.get("title") or "", revision_id
+                    ) or get_reverter_username(
+                        record.get("title") or "", revision_id
                     )
 
                     if (
@@ -11064,4 +11168,5 @@ def main():
 
 
 if __name__ == "__main__":
+    threading.Thread(target=wiki_write_queue_worker, daemon=True).start()
     main()
