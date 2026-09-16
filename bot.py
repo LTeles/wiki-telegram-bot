@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.34"
-BOT_BUILD = "2.34"
+BOT_VERSION = "2.35"
+BOT_BUILD = "2.35"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2239,11 +2239,10 @@ def announce_new_version_if_needed():
 
     message = (
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n\n"
-        "🛠 <b>Controle de consultas à Wikipédia</b>\n"
-        "• Limite compartilhado de leitura e pausa global após HTTP 429, respeitando Retry-After.\n"
-        "• /conta processado sem bloquear a recepção dos comandos seguintes.\n"
-        "• Diagnóstico de comandos recebidos e falhas de resposta no grupo.\n"
-        "• Mantidas as correções de links e de pendências; escrita na Wikipédia desativada."
+        "🛠 <b>Calibração de mensagens em discussão</b>\n"
+        "• Redutor contextual somente para acréscimos assinados sem sinais fortes.\n"
+        "• Assinatura excluída da análise textual; remoções, insultos e links externos preservam a cautela.\n"
+        "• Mantidos controle HTTP 429, /conta e links; escrita na Wikipédia desativada."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -8276,63 +8275,75 @@ def count_external_links(value):
     )
 
 
+def discussion_comment_body(added):
+    """Retira apenas a assinatura FINAL; não interpreta seu ID/data como prosa."""
+    value = str(added or "")
+    # Assinatura expandida termina em data UTC. Preserva a prosa anterior.
+    timestamp = re.search(
+        r"\b\d{1,2}h\d{2}min\s+de\s+\d{1,2}\s+de\s+"
+        r"[A-Za-zÀ-ÿ]+\s+de\s+\d{4}\s*\(UTC\)\s*$",
+        value, re.I,
+    )
+    if timestamp:
+        prefix = value[:timestamp.start()]
+        # Identidade deve aparecer perto do horário; não apaga links arbitrários.
+        identity = list(re.finditer(
+            r"\[\[(?:Usu[aá]rio(?:\(a\))?|Especial:Contribui[^:]*|"
+            r"Usu[aá]rio\s+Discuss[aã]o):", prefix, re.I,
+        ))
+        if identity and len(prefix) - identity[-1].start() <= 450:
+            return prefix[:identity[-1].start()].strip()
+    return value.replace("~~~~", "").strip()
+
+
 def contextual_discussion_adjustment(change, diff, strong_signals):
-    """
-    Ajuste contextual por namespace.
-
-    Em páginas de discussão, uma mensagem assinada tem contexto legítimo e
-    recebe redutor moderado. Links externos ainda elevam o risco, pois podem
-    ser spam.
-
-    No domínio principal, uma mensagem com formato de discussão/assinatura
-    é contextualizada como inadequada e recebe acréscimo, especialmente se
-    trouxer link externo.
-
-    Sinais fortes de vandalismo nunca recebem o redutor de discussão.
-    """
+    """Reduz falsos positivos em respostas assinadas, sem blindar abuso."""
     added = str(diff.get("added", "") or "")
+    removed = str(diff.get("removed", "") or "")
     signed = looks_like_signed_discussion_comment(added)
-    links = count_external_links(added)
     talk = is_discussion_namespace(change)
-
-    if talk and signed and strong_signals == 0:
-        # Comentário assinado é esperado em discussão.
-        # Um link mantém parte da suspeita para não mascarar spam.
-        return {
-            "multiplier": 0.62,
-            "additive": min(0.12, 0.06 * links),
-            "reason": (
-                "comentário assinado em página de discussão"
-                + (" com link externo" if links else "")
-            ),
-            "kind": "talk_signed",
-        }
-
+    if talk and signed:
+        body = discussion_comment_body(added)
+        # Apenas acréscimos. Não encobre remoção, insultos, spam ou repetição.
+        # URLs da assinatura não contam como spam; URLs da mensagem contam.
+        links = count_external_links(body)
+        body_signals = max(profanity_score(body), repetition_score(body), nonsense_score(body))
+        if (not removed.strip() and strong_signals == 0 and body_signals < 0.75
+                and links == 0 and len(body) >= 12):
+            return {
+                "multiplier": 0.45,
+                "additive": 0.0,
+                "reason": "acréscimo de comentário assinado em discussão, sem sinais fortes",
+                "kind": "talk_signed_append",
+            }
+        # Não aplica redutor genérico a edições com remoções ou links externos.
+        return None
     if not talk and signed:
-        # Assinatura de discussão inserida em artigo/conteúdo é anômala.
         return {
             "multiplier": 1.0,
-            "additive": 0.10 + min(0.10, 0.05 * links),
-            "reason": (
-                "formato de mensagem de discussão inserido fora de página de discussão"
-            ),
+            "additive": 0.10 + min(0.10, 0.05 * count_external_links(added)),
+            "reason": "formato de mensagem de discussão inserido fora de página de discussão",
             "kind": "signed_outside_talk",
         }
-
     return None
 
 
 def analyze_vandalism(change, diff, revert_risk):
     added = diff.get("added", "")
     removed = diff.get("removed", "")
+    # Na discussão, avalia a prosa sem os números/links da assinatura final.
+    signal_text = (discussion_comment_body(added)
+                   if is_discussion_namespace(change)
+                   and looks_like_signed_discussion_comment(added)
+                   else added)
 
-    profanity = profanity_score(added)
-    repetition = repetition_score(added)
+    profanity = profanity_score(signal_text)
+    repetition = repetition_score(signal_text)
     destructive = destructive_score(
         added,
         removed
     )
-    nonsense = nonsense_score(added)
+    nonsense = nonsense_score(signal_text)
 
     signals = [
         profanity,
