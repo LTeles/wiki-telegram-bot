@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.42"
-BOT_BUILD = "2.42-liftwing-422-diagnostics"
+BOT_BUILD = "2.42-reversal-history-fallback"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2252,6 +2252,8 @@ def announce_new_version_if_needed():
         "• Logs simplificados e resumo operacional a cada 15 minutos.\n"
         "• Lift Wing: validação de revisão, diagnóstico HTTP 422 com resposta limitada, "
         "sem repetição automática e sem pontuação fictícia.\n"
+        "• Reversões: verificação complementar do histórico das páginas pendentes, inclusive autorreversões sem etiqueta mw-reverted.\n"
+        "• Falhas do Telegram: estado persistido e nova tentativa de entrega visual.\n"
         "• Nome do artigo clicável; link bruto do diff preservado.\n"
         "• Escrita na Wikipédia continua desativada."
     )
@@ -5207,6 +5209,56 @@ def verify_direct_undo(title, revision_id):
         return None
 
 
+# Fallback limitado e rotativo: a etiqueta mw-reverted pode demorar ou nunca
+# aparecer para uma edição não aprovada. Confirma somente restauração exata
+# do SHA1 anterior, associada a uma revisão de reversão identificável.
+REVERSAL_HISTORY_BATCH_PER_CYCLE = 12
+_reversal_history_cursor = 0
+
+
+def confirm_revert_from_history(title, revision_id):
+    """Retorna (autor, revid da reversão) somente com evidência verificável."""
+    if not title:
+        return None
+    try:
+        response = requests.get(WIKIPEDIA_API, params={
+            "action": "query", "format": "json", "formatversion": 2,
+            "prop": "revisions", "titles": title,
+            "rvprop": "ids|sha1|user|tags", "rvdir": "older",
+            "rvstartid": int(revision_id), "rvlimit": 2,
+        }, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", [])
+        before = pages[0].get("revisions", []) if pages else []
+        if len(before) != 2 or int(before[0].get("revid", -1)) != int(revision_id):
+            return None
+        old_sha1 = before[1].get("sha1")
+        if not old_sha1:
+            return None
+        response = requests.get(WIKIPEDIA_API, params={
+            "action": "query", "format": "json", "formatversion": 2,
+            "prop": "revisions", "titles": title,
+            "rvprop": "ids|sha1|user|tags", "rvdir": "newer",
+            "rvstartid": int(revision_id), "rvlimit": 50,
+        }, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", [])
+        newer = pages[0].get("revisions", []) if pages else []
+        if not newer or int(newer[0].get("revid", -1)) != int(revision_id):
+            return None
+        for rev in newer[1:]:
+            tags = set(rev.get("tags") or [])
+            if rev.get("sha1") == old_sha1 and tags.intersection(
+                {"mw-undo", "mw-rollback", "mw-manual-revert"}
+            ):
+                return (rev.get("user"), int(rev["revid"]))
+        return None
+    except Exception as exc:
+        print("⚠️ Consulta complementar de reversão falhou:",
+              revision_id, safe_exception(exc), flush=True)
+        return None
+
+
 def get_reverter_username(title, revision_id):
     """Tenta identificar quem realizou a reversão sem presumir um nome.
 
@@ -5537,10 +5589,11 @@ def reversal_diagnostic(stage, revision_id=None, **details):
     print(f"🔎 REVERSAO_DIAG utc={stamp} etapa={stage} revisao={revision_id or '-'} {extra}", flush=True)
 
 
-def _process_posted_statuses(active, tags_by_revision=None, patrol_by_revision=None):
+def _process_posted_statuses(active, tags_by_revision=None, patrol_by_revision=None, history_reverts=None):
     """Resolve a snapshot; recheck live state under lock before committing."""
     tags_by_revision = tags_by_revision or {}
     patrol_by_revision = patrol_by_revision or {}
+    history_reverts = history_reverts or {}
     changed_any = False
 
     for record in active:
@@ -5555,6 +5608,8 @@ def _process_posted_statuses(active, tags_by_revision=None, patrol_by_revision=N
         )
 
         if tags and "mw-reverted" in tags:
+            new_status = "reverted"
+        elif revision_id in history_reverts:
             new_status = "reverted"
         elif revision_id in tags_by_revision and verify_direct_undo(
             record.get("title") or "", revision_id
@@ -5582,7 +5637,7 @@ def _process_posted_statuses(active, tags_by_revision=None, patrol_by_revision=N
             # autorreversão. A comparação usa a mesma normalização de nomes
             # já empregada pelo bot (espaços/underscores e casefold).
             if new_status == "reverted":
-                reverter = verify_direct_undo(
+                reverter = (history_reverts.get(revision_id) or (None, None))[0] or verify_direct_undo(
                     record.get("title") or "", revision_id
                 ) or get_reverter_username(
                     record.get("title") or "", revision_id
@@ -5753,9 +5808,9 @@ def _publish_latest_result(result_queue, payload):
 
 def _reversal_result_worker():
     while True:
-        active, tags = _reversal_results.get()
+        active, tags, history_reverts = _reversal_results.get()
         try:
-            _process_posted_statuses(active, tags_by_revision=tags)
+            _process_posted_statuses(active, tags_by_revision=tags, history_reverts=history_reverts)
         except Exception as exc:
             print("⚠️ Erro ao processar reversões:", safe_exception(exc), flush=True)
         finally:
@@ -5784,6 +5839,7 @@ def _posted_status_maintenance():
 
 
 def _posted_edit_status_monitor_loop():
+    global _reversal_history_cursor
     print("✅ Consultas de reversões independentes a cada 30s.")
     next_check = time.monotonic()
     last_revision_check_at = None
@@ -5815,8 +5871,25 @@ def _posted_edit_status_monitor_loop():
         reversal_diagnostic("consulta_tags_concluida",
                             revisoes_retornadas=len(tags_by_revision),
                             duracao_s=round(time.monotonic() - started, 3))
-        if tags_by_revision:
-            _publish_latest_result(_reversal_results, (active, tags_by_revision))
+        # Rodízio independente da tag: cobre pendências antigas sem criar
+        # centenas de requisições por ciclo. Não bloqueia o relógio de 30s:
+        # o lote seguinte retoma a partir do cursor anterior.
+        history_reverts = {}
+        candidates = [item for item in active if "mw-reverted" not in
+                      tags_by_revision.get(int(item["revision_id"]), set())]
+        if candidates:
+            start_index = _reversal_history_cursor % len(candidates)
+            selected = (candidates[start_index:] + candidates[:start_index])[:REVERSAL_HISTORY_BATCH_PER_CYCLE]
+            _reversal_history_cursor = (start_index + len(selected)) % len(candidates)
+            for item in selected:
+                rid = int(item["revision_id"])
+                evidence = confirm_revert_from_history(item.get("title"), rid)
+                if evidence:
+                    history_reverts[rid] = evidence
+                    reversal_diagnostic("historico_reversao_confirmada", rid,
+                                        reversao=evidence[1])
+        if tags_by_revision or history_reverts:
+            _publish_latest_result(_reversal_results, (active, tags_by_revision, history_reverts))
         if time.monotonic() > next_check:
             reversal_diagnostic("ciclo_excedeu_intervalo",
                                 duracao_s=round(time.monotonic() - started, 3),
