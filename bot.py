@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.41"
-BOT_BUILD = "2.41-monitores-independentes-links"
+BOT_VERSION = "2.42"
+BOT_BUILD = "2.42-polling-30s-independent-workers"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -172,7 +172,7 @@ MAX_BLOCK_ALERTS_PER_MINUTE = 5
 # A mesma política é aplicada aos registros de proteção de páginas.
 MAX_PROTECTION_ALERTS_PER_MINUTE = 5
 
-POSTED_EDIT_CHECK_SECONDS = 10
+POSTED_EDIT_CHECK_SECONDS = 10  # legado; pollers usam intervalos próprios
 REVISION_STATUS_INTERVAL_SECONDS = 30
 POSTED_EDIT_TRACK_SECONDS = 48 * 60 * 60
 
@@ -183,9 +183,8 @@ PENDING_COMMAND_PAGE_SIZE = 5
 PENDING_RECONCILE_INTERVAL_SECONDS = 30 * 60
 PENDING_PAGE_BATCH_SIZE = 50
 
-# Patrulhamento: consulta em lote a cada 50s para manter a atualização
-# normalmente abaixo de 1 minuto, deixando margem para rede/API/Telegram.
-PATROL_REQUEST_INTERVAL_SECONDS = 50
+# Patrulhamento: intervalo mínimo de 30s; sem consultas quando indisponível.
+PATROL_REQUEST_INTERVAL_SECONDS = 30
 PATROL_RECENTCHANGES_LIMIT = 500
 
 # Reversões são verificadas em lote, reduzindo chamadas individuais.
@@ -5033,7 +5032,7 @@ def get_revision_tags_batch(revision_ids):
 
 def get_patrol_status_batch(records):
     """
-    Faz no máximo uma solicitação de patrulhamento a cada 50 segundos.
+    Faz no máximo uma solicitação de patrulhamento a cada 30 segundos.
 
     A chamada busca até 500 mudanças recentes de uma vez e compara
     localmente os revids/rcids com as mensagens acompanhadas.
@@ -5688,80 +5687,113 @@ def _process_posted_statuses(active, tags_by_revision=None, patrol_by_revision=N
 
 
 
-def _posted_edit_status_monitor_loop():
-    print(
-        "✅ Monitor independente de reversões iniciado."
-    )
+# Consultas e processamento separados: chamadas individuais à API, retries e
+# edições no Telegram não seguram o relógio de 30 segundos dos dois pollers.
+# Fila de capacidade 1: resultados novos substituem um snapshot antigo ainda
+# não iniciado; o worker sempre revalida o status atual antes de editar.
+_reversal_results = queue.Queue(maxsize=1)
+_patrol_results = queue.Queue(maxsize=1)
 
-    last_revision_check_at = 0.0
 
-    while True:
-        time.sleep(POSTED_EDIT_CHECK_SECONDS)
-
-        cleanup_posted_edits()
+def _publish_latest_result(result_queue, payload):
+    try:
+        result_queue.put_nowait(payload)
+    except queue.Full:
         try:
+            result_queue.get_nowait()
+            result_queue.task_done()
+        except queue.Empty:
+            pass
+        try:
+            result_queue.put_nowait(payload)
+        except queue.Full:
+            pass
+
+
+def _reversal_result_worker():
+    while True:
+        active, tags = _reversal_results.get()
+        try:
+            _process_posted_statuses(active, tags_by_revision=tags)
+        except Exception as exc:
+            print("⚠️ Erro ao processar reversões:", safe_exception(exc), flush=True)
+        finally:
+            _reversal_results.task_done()
+
+
+def _patrol_result_worker():
+    while True:
+        active, statuses = _patrol_results.get()
+        try:
+            _process_posted_statuses(active, patrol_by_revision=statuses)
+        except Exception as exc:
+            print("⚠️ Erro ao processar patrulhamento:", safe_exception(exc), flush=True)
+        finally:
+            _patrol_results.task_done()
+
+
+def _posted_status_maintenance():
+    while True:
+        try:
+            cleanup_posted_edits()
             retry_failed_status_messages()
         except Exception as exc:
-            print("⚠️ Erro na recuperação de avisos:", safe_exception(exc))
+            print("⚠️ Manutenção de avisos:", safe_exception(exc), flush=True)
+        time.sleep(30)
 
+
+def _posted_edit_status_monitor_loop():
+    print("✅ Consultas de reversões independentes a cada 30s.")
+    next_check = time.monotonic()
+    last_revision_check_at = None
+    while True:
+        wait = next_check - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        started = time.monotonic()
+        # Não cria consultas paralelas; se o ciclo ultrapassar 30s,
+        # reinicia imediatamente e registra o atraso real.
+        next_check = started + REVISION_STATUS_INTERVAL_SECONDS
         with posted_edits_lock:
-            snapshot = [
-                dict(item)
-                for item
-                in posted_edits.values()
-            ]
-
-        active = [
-            record
-            for record in snapshot
-            if record.get("status") not in ("reverted", "self_reverted", "deleted", "resolved_no_action", "false_positive")
-        ]
-
+            active = [dict(item) for item in posted_edits.values()
+                      if item.get("status") not in (
+                          "reverted", "self_reverted", "deleted",
+                          "resolved_no_action", "false_positive")]
         if not active:
             continue
-
         reversal_diagnostic("ciclo_iniciado", pendentes=len(active),
-                            segundos_desde_ultima_consulta=round(time.monotonic() - last_revision_check_at, 1)
-                            if last_revision_check_at else "primeira")
-
-        # -------- Reversões em lote --------
-        # O loop acorda a cada 10s, mas as consultas de tags são feitas
-        # a cada 30s. Todas as revisões acompanhadas entram no mesmo ciclo,
-        # divididas em lotes de até 50 IDs por solicitação.
+                            segundos_desde_ultima_consulta=round(started - last_revision_check_at, 1)
+                            if last_revision_check_at is not None else "primeira")
+        last_revision_check_at = started
+        reversal_diagnostic("consulta_tags_iniciada", pendentes=len(active))
         tags_by_revision = {}
-        now_monotonic = time.monotonic()
-
-        if (
-            now_monotonic - last_revision_check_at
-            >= REVISION_STATUS_INTERVAL_SECONDS
-        ):
-            last_revision_check_at = now_monotonic
-            reversal_diagnostic("consulta_tags_iniciada", pendentes=len(active))
-            tag_query_started = time.monotonic()
-
-            for batch_start in range(0, len(active), REVISION_TAG_BATCH_SIZE):
-                revision_batch = active[
-                    batch_start:batch_start + REVISION_TAG_BATCH_SIZE
-                ]
-                batch_result = get_revision_tags_batch(
-                    [
-                        record["revision_id"]
-                        for record in revision_batch
-                    ]
-                )
-                tags_by_revision.update(batch_result)
-            reversal_diagnostic("consulta_tags_concluida", revisoes_retornadas=len(tags_by_revision),
-                                duracao_s=round(time.monotonic() - tag_query_started, 3))
-
+        for batch_start in range(0, len(active), REVISION_TAG_BATCH_SIZE):
+            revision_batch = active[batch_start:batch_start + REVISION_TAG_BATCH_SIZE]
+            tags_by_revision.update(get_revision_tags_batch(
+                [record["revision_id"] for record in revision_batch]))
+        reversal_diagnostic("consulta_tags_concluida",
+                            revisoes_retornadas=len(tags_by_revision),
+                            duracao_s=round(time.monotonic() - started, 3))
         if tags_by_revision:
-            _process_posted_statuses(active, tags_by_revision=tags_by_revision)
+            _publish_latest_result(_reversal_results, (active, tags_by_revision))
+        if time.monotonic() > next_check:
+            reversal_diagnostic("ciclo_excedeu_intervalo",
+                                duracao_s=round(time.monotonic() - started, 3),
+                                lotes=(len(active) + REVISION_TAG_BATCH_SIZE - 1) // REVISION_TAG_BATCH_SIZE)
 
 
 def _posted_edit_patrol_monitor_loop():
-    """Independent patrol polling; cannot delay the reversal polling thread."""
-    print("✅ Monitor independente de patrulhamento iniciado.")
+    print("✅ Consultas de patrulhamento independentes a cada 30s.")
+    next_check = time.monotonic()
     while True:
-        time.sleep(POSTED_EDIT_CHECK_SECONDS)
+        wait = next_check - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        started = time.monotonic()
+        next_check = started + PATROL_REQUEST_INTERVAL_SECONDS
+        # Não registra consultas fictícias quando falta autenticação/permissão.
+        if not wikimedia_authenticated or patrol_visibility_supported is not True:
+            continue
         with posted_edits_lock:
             active = [dict(item) for item in posted_edits.values()
                       if item.get("status") not in (
@@ -5769,12 +5801,14 @@ def _posted_edit_patrol_monitor_loop():
                           "resolved_no_action", "false_positive", "patrolled")]
         if not active:
             continue
-        started = time.monotonic()
-        patrol_by_revision = get_patrol_status_batch(active)
+        statuses = get_patrol_status_batch(active)
         print("🔎 PATRULHA_DIAG etapa=consulta_concluida duracao_s=",
               round(time.monotonic() - started, 3), flush=True)
-        if patrol_by_revision:
-            _process_posted_statuses(active, patrol_by_revision=patrol_by_revision)
+        if statuses:
+            _publish_latest_result(_patrol_results, (active, statuses))
+        if time.monotonic() > next_check:
+            print("⚠️ PATRULHA_DIAG etapa=ciclo_excedeu_intervalo duracao_s=",
+                  round(time.monotonic() - started, 3), flush=True)
 
 
 def posted_edit_patrol_monitor():
@@ -11444,6 +11478,9 @@ def main():
         ("telegram-listener", telegram_command_listener),
         ("abuse-filter-monitor", abuse_filter_monitor),
         ("posted-edit-status", posted_edit_status_monitor),
+        ("reversal-result-worker", _reversal_result_worker),
+        ("patrol-result-worker", _patrol_result_worker),
+        ("posted-status-maintenance", _posted_status_maintenance),
         ("posted-edit-patrol", posted_edit_patrol_monitor),
         ("daily-detection-report", daily_detection_report_scheduler),
         ("pending-alerts-summary", pending_alerts_summary_scheduler),
