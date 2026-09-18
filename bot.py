@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.42"
-BOT_BUILD = "2.42-quiet-reversal-logs"
+BOT_BUILD = "2.42-liftwing-422-diagnostics"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2249,8 +2249,9 @@ def announce_new_version_if_needed():
         "• Identificação de autores e atualização das mensagens no Telegram "
         "separadas do agendamento das consultas.\n"
         "• Limpeza e recuperação de mensagens deslocadas para rotina própria.\n"
-        "• Logs simplificados: apenas reversões detectadas, resultados de atualização, "
-        "falhas e ciclos atrasados; resumo operacional a cada 15 minutos.\n"
+        "• Logs simplificados e resumo operacional a cada 15 minutos.\n"
+        "• Lift Wing: validação de revisão, diagnóstico HTTP 422 com resposta limitada, "
+        "sem repetição automática e sem pontuação fictícia.\n"
         "• Nome do artigo clicável; link bruto do diff preservado.\n"
         "• Escrita na Wikipédia continua desativada."
     )
@@ -8224,40 +8225,46 @@ def get_revision_diff(old_revision, new_revision):
 
 
 def get_revert_risk(revision_id):
+    """Retorna probabilidade ou None; nunca interpreta ausência de score como zero."""
+    try:
+        # bool é subtipo de int em Python, mas não é identificador de revisão.
+        if isinstance(revision_id, bool):
+            raise ValueError("rev_id booleano")
+        rev_id = int(revision_id)
+        if rev_id <= 0:
+            raise ValueError("rev_id não positivo")
+    except (TypeError, ValueError, OverflowError) as exc:
+        print("⚠️ Lift Wing: revisão inválida:", repr(revision_id), safe_exception(exc))
+        return None
+
     try:
         response = requests.post(
             REVERT_RISK_API,
-            headers={
-                **HEADERS,
-                "Content-Type": "application/json"
-            },
-            json={
-                "rev_id": revision_id,
-                "lang": "pt"
-            },
-            timeout=30
+            headers={**HEADERS, "Content-Type": "application/json"},
+            json={"rev_id": rev_id, "lang": "pt"},
+            timeout=30,
         )
-
+        if response.status_code == 422:
+            # Não repetir automaticamente: a resposta explica a revisão rejeitada.
+            # Não registrar cabeçalhos de autenticação ou tokens.
+            detail = (response.text or "").replace("\r", " ").replace("\n", " ")[:600]
+            print(f"⚠️ Lift Wing HTTP 422 rev_id={rev_id} lang=pt resposta={detail!r}")
+            return None
         if response.status_code == 429:
-            print("⚠️ Rate limit Lift Wing.")
+            print(f"⚠️ Rate limit Lift Wing rev_id={rev_id}.")
             return None
-
         response.raise_for_status()
-
-        probability = (
-            response.json()
-            .get("output", {})
-            .get("probabilities", {})
-            .get("true")
-        )
-
+        probability = response.json().get("output", {}).get("probabilities", {}).get("true")
         if probability is None:
+            print(f"⚠️ Lift Wing sem probabilidade rev_id={rev_id}.")
             return None
-
-        return float(probability)
-
-    except Exception as e:
-        print("⚠️ Erro Lift Wing:", safe_exception(e))
+        score = float(probability)
+        if not 0.0 <= score <= 1.0:
+            print(f"⚠️ Lift Wing probabilidade fora do intervalo rev_id={rev_id}.")
+            return None
+        return score
+    except Exception as exc:
+        print(f"⚠️ Erro Lift Wing rev_id={rev_id}:", safe_exception(exc))
         return None
 
 
