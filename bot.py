@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.40"
-BOT_BUILD = "2.40-diagnostico-1"
+BOT_VERSION = "2.41"
+BOT_BUILD = "2.41-monitores-independentes-links"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -5497,12 +5497,200 @@ def reversal_diagnostic(stage, revision_id=None, **details):
     print(f"🔎 REVERSAO_DIAG utc={stamp} etapa={stage} revisao={revision_id or '-'} {extra}", flush=True)
 
 
+def _process_posted_statuses(active, tags_by_revision=None, patrol_by_revision=None):
+    """Resolve a snapshot; recheck live state under lock before committing."""
+    tags_by_revision = tags_by_revision or {}
+    patrol_by_revision = patrol_by_revision or {}
+    changed_any = False
+
+    for record in active:
+        revision_id = int(
+            record["revision_id"]
+        )
+        current_status = record.get("status")
+        new_status = None
+
+        tags = tags_by_revision.get(
+            revision_id
+        )
+
+        if tags and "mw-reverted" in tags:
+            new_status = "reverted"
+        elif revision_id in tags_by_revision and verify_direct_undo(
+            record.get("title") or "", revision_id
+        ):
+            # Confirmed adjacent undo, even if the asynchronous mw-reverted
+            # tag has not yet appeared on the original revision.
+            new_status = "reverted"
+
+        elif current_status != "patrolled":
+            if patrol_by_revision.get(revision_id) is True:
+                new_status = "patrolled"
+
+        if (
+            new_status
+            and
+            new_status != current_status
+        ):
+            if new_status == "reverted":
+                reversal_diagnostic("reversao_identificada", revision_id,
+                                    origem="tag_ou_desfazer_direto")
+            reverter = None
+
+            # Quando a revisão foi revertida, identifica primeiro o autor
+            # da reversão para distinguir uma reversão comum de uma
+            # autorreversão. A comparação usa a mesma normalização de nomes
+            # já empregada pelo bot (espaços/underscores e casefold).
+            if new_status == "reverted":
+                reverter = verify_direct_undo(
+                    record.get("title") or "", revision_id
+                ) or get_reverter_username(
+                    record.get("title") or "", revision_id
+                )
+
+                if (
+                    reverter
+                    and username_key(reverter)
+                    == username_key(record.get("username"))
+                ):
+                    new_status = "self_reverted"
+
+            if new_status in ("reverted", "self_reverted"):
+                reversal_diagnostic("reversao_confirmada", revision_id,
+                                    status=new_status, autor_identificado=bool(reverter))
+
+            new_text = message_with_status(
+                record,
+                new_status,
+                reverter=reverter if new_status == "reverted" else None
+            )
+
+            # Após um desfecho, Resolver/Falso + deixam de ser aplicáveis.
+            # Mantém apenas os controles de conta/página.
+            status_reply_markup = tracked_edit_reply_markup(
+                revision_id,
+                record.get("alert_kind", "normal"),
+                include_resolution_buttons=False
+            )
+
+            # Persistir a resolução ANTES da atualização visual no Telegram.
+            # Falha de edição da mensagem não pode manter o alerta pendente.
+            with posted_edits_lock:
+                live = posted_edits.get(str(revision_id))
+                if not live or live.get("status") in (
+                    "reverted", "self_reverted", "deleted",
+                    "resolved_no_action", "false_positive"
+                ):
+                    continue
+                live["status"] = new_status
+                if reverter:
+                    live["reverted_by"] = reverter
+                if new_status in ("reverted", "self_reverted"):
+                    live["reverted_at"] = time.time()
+                elif new_status == "patrolled":
+                    live["patrolled_at"] = time.time()
+
+            # A gravação não depende do sucesso da API do Telegram.
+            save_posted_edits()
+            changed_any = True
+            if new_status in ("reverted", "self_reverted"):
+                reversal_diagnostic("telegram_edicao_iniciada", revision_id)
+                telegram_edit_started = time.monotonic()
+            success = edit_telegram_message(
+                record["message_id"],
+                new_text,
+                parse_mode="HTML",
+                reply_markup=status_reply_markup
+            )
+            record_status_delivery(revision_id, success)
+            if new_status in ("reverted", "self_reverted"):
+                reversal_diagnostic("telegram_edicao_concluida", revision_id,
+                                    sucesso=success,
+                                    duracao_s=round(time.monotonic() - telegram_edit_started, 3))
+            if not success:
+                print("⚠️ Estado resolvido salvo; atualização visual agendada:", revision_id)
+
+            # Contabilizar o desfecho mesmo quando a mensagem não é editável.
+            if True:
+                if new_status == "self_reverted":
+                    # Uma autorreversão não conta como resposta da comunidade.
+                    # Ela é registrada separadamente para não inflar a
+                    # capacidade de checagem do canal.
+                    remove_detection_stat(revision_id)
+                    record_community_event(
+                        "self_revert",
+                        actor=record.get("username"),
+                        title=record.get("title"),
+                        timestamp=time.time(),
+                        revision_id=revision_id,
+                    )
+
+                elif new_status == "reverted":
+                    event_time = time.time()
+                    mark_detection_stat_reverted(
+                        revision_id,
+                        event_time
+                    )
+                    record_community_event(
+                        "revert",
+                        actor=reverter,
+                        title=record.get("title"),
+                        timestamp=event_time,
+                        revision_id=revision_id,
+                        latency=max(
+                            0,
+                            event_time - float(record.get("posted_at", event_time))
+                        ),
+                        categories=get_page_categories(record.get("title")),
+                    )
+
+                elif new_status == "patrolled":
+                    event_time = time.time()
+                    patroller = get_patroller_username(
+                        record.get("title") or "",
+                        revision_id,
+                    )
+                    mark_detection_stat_patrolled(
+                        revision_id,
+                        event_time
+                    )
+                    record_community_event(
+                        "patrol",
+                        actor=patroller,
+                        title=record.get("title"),
+                        timestamp=event_time,
+                        revision_id=revision_id,
+                        latency=max(
+                            0,
+                            event_time - float(
+                                record.get("posted_at", event_time)
+                            )
+                        ),
+                    )
+
+                print(
+                    "✏️ Mensagem atualizada:",
+                    revision_id,
+                    "→",
+                    new_status
+                )
+
+            time.sleep(1)
+
+    if changed_any:
+        try:
+            save_posted_edits()
+        except Exception as e:
+            print(
+                "⚠️ Erro ao salvar status de mensagens:",
+                safe_exception(e)
+            )
+
+
+
 def _posted_edit_status_monitor_loop():
     print(
-        "✅ Monitor de reversões/patrulhamento iniciado."
-    )
-    print(
-        "🔄 Patrulhamento em lote: máximo de 1 chamada a cada 50s."
+        "✅ Monitor independente de reversões iniciado."
     )
 
     last_revision_check_at = 0.0
@@ -5565,196 +5753,37 @@ def _posted_edit_status_monitor_loop():
             reversal_diagnostic("consulta_tags_concluida", revisoes_retornadas=len(tags_by_revision),
                                 duracao_s=round(time.monotonic() - tag_query_started, 3))
 
-        # -------- Patrulhamento em lote --------
-        # Teto rígido: no máximo uma chamada à API a cada 50 s.
-        patrol_by_revision = get_patrol_status_batch(
-            active
-        )
+        if tags_by_revision:
+            _process_posted_statuses(active, tags_by_revision=tags_by_revision)
 
-        changed_any = False
 
-        for record in active:
-            revision_id = int(
-                record["revision_id"]
-            )
-            current_status = record.get("status")
-            new_status = None
+def _posted_edit_patrol_monitor_loop():
+    """Independent patrol polling; cannot delay the reversal polling thread."""
+    print("✅ Monitor independente de patrulhamento iniciado.")
+    while True:
+        time.sleep(POSTED_EDIT_CHECK_SECONDS)
+        with posted_edits_lock:
+            active = [dict(item) for item in posted_edits.values()
+                      if item.get("status") not in (
+                          "reverted", "self_reverted", "deleted",
+                          "resolved_no_action", "false_positive", "patrolled")]
+        if not active:
+            continue
+        started = time.monotonic()
+        patrol_by_revision = get_patrol_status_batch(active)
+        print("🔎 PATRULHA_DIAG etapa=consulta_concluida duracao_s=",
+              round(time.monotonic() - started, 3), flush=True)
+        if patrol_by_revision:
+            _process_posted_statuses(active, patrol_by_revision=patrol_by_revision)
 
-            tags = tags_by_revision.get(
-                revision_id
-            )
 
-            if tags and "mw-reverted" in tags:
-                new_status = "reverted"
-            elif revision_id in tags_by_revision and verify_direct_undo(
-                record.get("title") or "", revision_id
-            ):
-                # Confirmed adjacent undo, even if the asynchronous mw-reverted
-                # tag has not yet appeared on the original revision.
-                new_status = "reverted"
-
-            elif current_status != "patrolled":
-                if patrol_by_revision.get(revision_id) is True:
-                    new_status = "patrolled"
-
-            if (
-                new_status
-                and
-                new_status != current_status
-            ):
-                if new_status == "reverted":
-                    reversal_diagnostic("reversao_identificada", revision_id,
-                                        origem="tag_ou_desfazer_direto")
-                reverter = None
-
-                # Quando a revisão foi revertida, identifica primeiro o autor
-                # da reversão para distinguir uma reversão comum de uma
-                # autorreversão. A comparação usa a mesma normalização de nomes
-                # já empregada pelo bot (espaços/underscores e casefold).
-                if new_status == "reverted":
-                    reverter = verify_direct_undo(
-                        record.get("title") or "", revision_id
-                    ) or get_reverter_username(
-                        record.get("title") or "", revision_id
-                    )
-
-                    if (
-                        reverter
-                        and username_key(reverter)
-                        == username_key(record.get("username"))
-                    ):
-                        new_status = "self_reverted"
-
-                if new_status in ("reverted", "self_reverted"):
-                    reversal_diagnostic("reversao_confirmada", revision_id,
-                                        status=new_status, autor_identificado=bool(reverter))
-
-                new_text = message_with_status(
-                    record,
-                    new_status,
-                    reverter=reverter if new_status == "reverted" else None
-                )
-
-                # Após um desfecho, Resolver/Falso + deixam de ser aplicáveis.
-                # Mantém apenas os controles de conta/página.
-                status_reply_markup = tracked_edit_reply_markup(
-                    revision_id,
-                    record.get("alert_kind", "normal"),
-                    include_resolution_buttons=False
-                )
-
-                # Persistir a resolução ANTES da atualização visual no Telegram.
-                # Falha de edição da mensagem não pode manter o alerta pendente.
-                with posted_edits_lock:
-                    live = posted_edits.get(str(revision_id))
-                    if not live or live.get("status") in (
-                        "reverted", "self_reverted", "deleted",
-                        "resolved_no_action", "false_positive"
-                    ):
-                        continue
-                    live["status"] = new_status
-                    if reverter:
-                        live["reverted_by"] = reverter
-                    if new_status in ("reverted", "self_reverted"):
-                        live["reverted_at"] = time.time()
-                    elif new_status == "patrolled":
-                        live["patrolled_at"] = time.time()
-
-                # A gravação não depende do sucesso da API do Telegram.
-                save_posted_edits()
-                changed_any = True
-                if new_status in ("reverted", "self_reverted"):
-                    reversal_diagnostic("telegram_edicao_iniciada", revision_id)
-                    telegram_edit_started = time.monotonic()
-                success = edit_telegram_message(
-                    record["message_id"],
-                    new_text,
-                    parse_mode="HTML",
-                    reply_markup=status_reply_markup
-                )
-                record_status_delivery(revision_id, success)
-                if new_status in ("reverted", "self_reverted"):
-                    reversal_diagnostic("telegram_edicao_concluida", revision_id,
-                                        sucesso=success,
-                                        duracao_s=round(time.monotonic() - telegram_edit_started, 3))
-                if not success:
-                    print("⚠️ Estado resolvido salvo; atualização visual agendada:", revision_id)
-
-                # Contabilizar o desfecho mesmo quando a mensagem não é editável.
-                if True:
-                    if new_status == "self_reverted":
-                        # Uma autorreversão não conta como resposta da comunidade.
-                        # Ela é registrada separadamente para não inflar a
-                        # capacidade de checagem do canal.
-                        remove_detection_stat(revision_id)
-                        record_community_event(
-                            "self_revert",
-                            actor=record.get("username"),
-                            title=record.get("title"),
-                            timestamp=time.time(),
-                            revision_id=revision_id,
-                        )
-
-                    elif new_status == "reverted":
-                        event_time = time.time()
-                        mark_detection_stat_reverted(
-                            revision_id,
-                            event_time
-                        )
-                        record_community_event(
-                            "revert",
-                            actor=reverter,
-                            title=record.get("title"),
-                            timestamp=event_time,
-                            revision_id=revision_id,
-                            latency=max(
-                                0,
-                                event_time - float(record.get("posted_at", event_time))
-                            ),
-                            categories=get_page_categories(record.get("title")),
-                        )
-
-                    elif new_status == "patrolled":
-                        event_time = time.time()
-                        patroller = get_patroller_username(
-                            record.get("title") or "",
-                            revision_id,
-                        )
-                        mark_detection_stat_patrolled(
-                            revision_id,
-                            event_time
-                        )
-                        record_community_event(
-                            "patrol",
-                            actor=patroller,
-                            title=record.get("title"),
-                            timestamp=event_time,
-                            revision_id=revision_id,
-                            latency=max(
-                                0,
-                                event_time - float(
-                                    record.get("posted_at", event_time)
-                                )
-                            ),
-                        )
-
-                    print(
-                        "✏️ Mensagem atualizada:",
-                        revision_id,
-                        "→",
-                        new_status
-                    )
-
-                time.sleep(1)
-
-        if changed_any:
-            try:
-                save_posted_edits()
-            except Exception as e:
-                print(
-                    "⚠️ Erro ao salvar status de mensagens:",
-                    safe_exception(e)
-                )
+def posted_edit_patrol_monitor():
+    while True:
+        try:
+            _posted_edit_patrol_monitor_loop()
+        except Exception as exc:
+            print("❌ Monitor de patrulhamento interrompido:", safe_exception(exc))
+        time.sleep(15)
 
 
 
@@ -8620,6 +8649,13 @@ def build_diff_url(change):
     )
 
 
+def article_link_html(title):
+    """Article title linked to the current page; diff remains a separate raw URL."""
+    display = str(title or "Sem título")
+    url = "https://pt.wikipedia.org/wiki/" + quote(display.replace(" ", "_"), safe="/:()")
+    return f'<a href="{html.escape(url, quote=True)}">{html.escape(display)}</a>'
+
+
 def user_contributions_url(username):
     encoded_username = quote(
         str(username or "").replace("_", " ").strip(),
@@ -8778,7 +8814,7 @@ def format_observed_message(change, observation):
     return (
         "👁 Edição de conta observada\n\n"
         f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
-        f"📝 {html.escape(str(change.get('title', 'Sem título')))}\n"
+        f"📝 {article_link_html(change.get('title', 'Sem título'))}\n"
         f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n"
         f"{reason_line}\n"
         f"{edit_link_html(build_diff_url(change))}"
@@ -8788,7 +8824,7 @@ def format_observed_message(change, observation):
 def format_watched_message(change):
     return (
         "👁 Edição em página vigiada\n\n"
-        f"📝 {html.escape(str(change.get('title', 'Sem título')))}\n"
+        f"📝 {article_link_html(change.get('title', 'Sem título'))}\n"
         f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
         f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n\n"
         f"{edit_link_html(build_diff_url(change))}"
@@ -8812,7 +8848,7 @@ def format_message(change, result):
 
     return (
         f"{heading}\n\n"
-        f"📝 {html.escape(str(change.get('title', 'Sem título')))}\n"
+        f"📝 {article_link_html(change.get('title', 'Sem título'))}\n"
         f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
         f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n\n"
         f"🤖 Risco de reversão: {revert_score}%\n\n"
@@ -11408,6 +11444,7 @@ def main():
         ("telegram-listener", telegram_command_listener),
         ("abuse-filter-monitor", abuse_filter_monitor),
         ("posted-edit-status", posted_edit_status_monitor),
+        ("posted-edit-patrol", posted_edit_patrol_monitor),
         ("daily-detection-report", daily_detection_report_scheduler),
         ("pending-alerts-summary", pending_alerts_summary_scheduler),
         ("pending-resolution-reconciliation", pending_resolution_reconciliation_scheduler),
