@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.42"
-BOT_BUILD = "2.42-polling-30s-independent-workers"
+BOT_BUILD = "2.42-polling-30s-independent-workers-release-notes-fix"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2239,12 +2239,20 @@ def announce_new_version_if_needed():
         return
 
     message = (
-        f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n\n"
-        "🔎 <b>Diagnóstico de latência das reversões e privacidade</b>\n"
-        "• Registros UTC de consulta, identificação, confirmação e atualização dos avisos.\n"
-        "• Monitor e intervalos de consulta preservados, sem novas requisições.\n"
-        "• Relatórios públicos sem nomes ou perfis de participantes do Telegram.\n"
-        "• Escrita na Wikipédia permanece desativada."
+        f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
+        f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
+        "<b>Novidades desta versão</b>\n"
+        "• Reversões: consultas agendadas a cada 30 segundos, "
+        "sem esperar o processamento dos avisos anteriores.\n"
+        "• Patrulhamento: consultas independentes, também com intervalo "
+        "de 30 segundos quando houver acesso aos dados.\n"
+        "• Identificação de autores e atualização das mensagens no Telegram "
+        "separadas do agendamento das consultas.\n"
+        "• Limpeza e recuperação de mensagens deslocadas para rotina própria.\n"
+        "• Diagnósticos para ciclos que ultrapassem 30 segundos e redução "
+        "dos registros repetitivos de patrulhamento.\n"
+        "• Nome do artigo clicável; link bruto do diff preservado.\n"
+        "• Escrita na Wikipédia continua desativada."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
