@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.39"
-BOT_BUILD = "2.39-reversoes-1"
+BOT_VERSION = "2.40"
+BOT_BUILD = "2.40-diagnostico-1"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2075,11 +2075,6 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         "|-",
         f"| Mediana entre reporte e ajuste || {format_minutes(false_positive_metrics['median_adjustment_seconds'])}",
         "|}",
-        "'''Quem ajudou a calibrar o detector'''",
-        wikitext_false_positive_reporters(
-            false_positive_metrics["reporter_counts"],
-            top=5,
-        ),
         "''Cada falso positivo confirmado alimenta um ciclo de melhoria do detector. "
         "Isso significa revisão e ajuste das regras do bot; não há retreinamento automático do modelo.''",
         "== Reconhecimento de trabalho de manutenção ==",
@@ -2246,11 +2241,10 @@ def announce_new_version_if_needed():
 
     message = (
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n\n"
-        "💬 <b>Calibração de conversas e correção do monitor de reversões</b>\n"
-        "• Comentários assinados em Ajuda:Tire suas dúvidas e Ajuda:Contato/Fale com a Wikipédia recebem análise contextual.\n"
-        "• Respostas inseridas no meio da discussão também podem receber redutor, sem blindar remoções ou abuso.\n"
-        "• Páginas iniciadas por Ajuda:Página de testes são ignoradas.\n"
-        "• Monitor de reversões reinicia após falha inesperada; edições de mensagens têm tentativas limitadas e recuperação persistente.\n"
+        "🔎 <b>Diagnóstico de latência das reversões e privacidade</b>\n"
+        "• Registros UTC de consulta, identificação, confirmação e atualização dos avisos.\n"
+        "• Monitor e intervalos de consulta preservados, sem novas requisições.\n"
+        "• Relatórios públicos sem nomes ou perfis de participantes do Telegram.\n"
         "• Escrita na Wikipédia permanece desativada."
     )
 
@@ -5464,8 +5458,14 @@ def retry_failed_status_messages():
         markup = tracked_edit_reply_markup(
             int(revision_id), current.get("alert_kind", "normal"),
             include_resolution_buttons=False)
+        if status in ("reverted", "self_reverted"):
+            reversal_diagnostic("telegram_recuperacao_iniciada", revision_id, tentativa=attempts)
+        retry_started = time.monotonic()
         success = edit_telegram_message(current["message_id"], text,
                                         parse_mode="HTML", reply_markup=markup)
+        if status in ("reverted", "self_reverted"):
+            reversal_diagnostic("telegram_recuperacao_concluida", revision_id,
+                                sucesso=success, duracao_s=round(time.monotonic() - retry_started, 3))
         with posted_edits_lock:
             live = posted_edits.get(revision_id)
             if not live or not isinstance(live.get("status_telegram_retry"), dict):
@@ -5488,6 +5488,13 @@ def retry_failed_status_messages():
                         "status": status,
                     }
         save_posted_edits()
+
+
+def reversal_diagnostic(stage, revision_id=None, **details):
+    """UTC timestamps; only revision IDs and operational timings, no Telegram identities."""
+    stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    extra = " ".join(f"{key}={value}" for key, value in details.items())
+    print(f"🔎 REVERSAO_DIAG utc={stamp} etapa={stage} revisao={revision_id or '-'} {extra}", flush=True)
 
 
 def _posted_edit_status_monitor_loop():
@@ -5525,6 +5532,10 @@ def _posted_edit_status_monitor_loop():
         if not active:
             continue
 
+        reversal_diagnostic("ciclo_iniciado", pendentes=len(active),
+                            segundos_desde_ultima_consulta=round(time.monotonic() - last_revision_check_at, 1)
+                            if last_revision_check_at else "primeira")
+
         # -------- Reversões em lote --------
         # O loop acorda a cada 10s, mas as consultas de tags são feitas
         # a cada 30s. Todas as revisões acompanhadas entram no mesmo ciclo,
@@ -5537,6 +5548,8 @@ def _posted_edit_status_monitor_loop():
             >= REVISION_STATUS_INTERVAL_SECONDS
         ):
             last_revision_check_at = now_monotonic
+            reversal_diagnostic("consulta_tags_iniciada", pendentes=len(active))
+            tag_query_started = time.monotonic()
 
             for batch_start in range(0, len(active), REVISION_TAG_BATCH_SIZE):
                 revision_batch = active[
@@ -5549,6 +5562,8 @@ def _posted_edit_status_monitor_loop():
                     ]
                 )
                 tags_by_revision.update(batch_result)
+            reversal_diagnostic("consulta_tags_concluida", revisoes_retornadas=len(tags_by_revision),
+                                duracao_s=round(time.monotonic() - tag_query_started, 3))
 
         # -------- Patrulhamento em lote --------
         # Teto rígido: no máximo uma chamada à API a cada 50 s.
@@ -5587,6 +5602,9 @@ def _posted_edit_status_monitor_loop():
                 and
                 new_status != current_status
             ):
+                if new_status == "reverted":
+                    reversal_diagnostic("reversao_identificada", revision_id,
+                                        origem="tag_ou_desfazer_direto")
                 reverter = None
 
                 # Quando a revisão foi revertida, identifica primeiro o autor
@@ -5606,6 +5624,10 @@ def _posted_edit_status_monitor_loop():
                         == username_key(record.get("username"))
                     ):
                         new_status = "self_reverted"
+
+                if new_status in ("reverted", "self_reverted"):
+                    reversal_diagnostic("reversao_confirmada", revision_id,
+                                        status=new_status, autor_identificado=bool(reverter))
 
                 new_text = message_with_status(
                     record,
@@ -5641,6 +5663,9 @@ def _posted_edit_status_monitor_loop():
                 # A gravação não depende do sucesso da API do Telegram.
                 save_posted_edits()
                 changed_any = True
+                if new_status in ("reverted", "self_reverted"):
+                    reversal_diagnostic("telegram_edicao_iniciada", revision_id)
+                    telegram_edit_started = time.monotonic()
                 success = edit_telegram_message(
                     record["message_id"],
                     new_text,
@@ -5648,6 +5673,10 @@ def _posted_edit_status_monitor_loop():
                     reply_markup=status_reply_markup
                 )
                 record_status_delivery(revision_id, success)
+                if new_status in ("reverted", "self_reverted"):
+                    reversal_diagnostic("telegram_edicao_concluida", revision_id,
+                                        sucesso=success,
+                                        duracao_s=round(time.monotonic() - telegram_edit_started, 3))
                 if not success:
                     print("⚠️ Estado resolvido salvo; atualização visual agendada:", revision_id)
 
