@@ -1150,7 +1150,7 @@ def mark_false_positive_fixed(revision_id, actor):
 
 
 def false_positive_message(item, fixed=False):
-    title = html.escape(str(item.get("title") or "Sem título"))
+    title = article_link_html(item.get("title") or "Sem título")
     username = user_contributions_link_html(
         item.get("username") or "Desconhecido"
     )
@@ -5301,7 +5301,7 @@ def observation_remaining_line(username):
 
 
 def message_with_status(record, status, reverter=None, deleter=None):
-    title = html.escape(str(record.get("title") or "Sem título"))
+    title = article_link_html(record.get("title") or "Sem título")
     username = user_contributions_link_html(record.get("username") or "Desconhecido")
     comment = html.escape(str(record.get("edit_comment") or "Sem resumo"))
     risk = record.get("revert_risk")
