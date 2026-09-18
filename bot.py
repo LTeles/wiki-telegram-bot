@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.42"
-BOT_BUILD = "2.42-polling-30s-independent-workers-release-notes-fix"
+BOT_BUILD = "2.42-quiet-reversal-logs"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2249,8 +2249,8 @@ def announce_new_version_if_needed():
         "• Identificação de autores e atualização das mensagens no Telegram "
         "separadas do agendamento das consultas.\n"
         "• Limpeza e recuperação de mensagens deslocadas para rotina própria.\n"
-        "• Diagnósticos para ciclos que ultrapassem 30 segundos e redução "
-        "dos registros repetitivos de patrulhamento.\n"
+        "• Logs simplificados: apenas reversões detectadas, resultados de atualização, "
+        "falhas e ciclos atrasados; resumo operacional a cada 15 minutos.\n"
         "• Nome do artigo clicável; link bruto do diff preservado.\n"
         "• Escrita na Wikipédia continua desativada."
     )
@@ -5497,9 +5497,41 @@ def retry_failed_status_messages():
         save_posted_edits()
 
 
+REVERSAL_LOG_SUMMARY_INTERVAL_SECONDS = 900
+_reversal_log_counters = {"consultas": 0, "reversoes": 0, "telegram_sucesso": 0, "telegram_falha": 0, "erros": 0}
+_reversal_log_lock = threading.Lock()
+_reversal_log_last_summary = time.monotonic()
+
+
 def reversal_diagnostic(stage, revision_id=None, **details):
-    """UTC timestamps; only revision IDs and operational timings, no Telegram identities."""
+    """Record operational outcomes, not every normal poll; never log Telegram identities."""
+    global _reversal_log_last_summary
+    quiet = {"ciclo_iniciado", "consulta_tags_iniciada", "consulta_tags_concluida",
+             "reversao_identificada",
+             "telegram_edicao_iniciada", "telegram_recuperacao_iniciada"}
+    with _reversal_log_lock:
+        if stage == "consulta_tags_concluida":
+            _reversal_log_counters["consultas"] += 1
+        elif stage == "reversao_confirmada":
+            _reversal_log_counters["reversoes"] += 1
+        elif stage in ("telegram_edicao_concluida", "telegram_recuperacao_concluida"):
+            key = "telegram_sucesso" if details.get("sucesso") else "telegram_falha"
+            _reversal_log_counters[key] += 1
+        elif "erro" in stage or "falha" in stage:
+            _reversal_log_counters["erros"] += 1
+        now = time.monotonic()
+        summary = None
+        if now - _reversal_log_last_summary >= REVERSAL_LOG_SUMMARY_INTERVAL_SECONDS:
+            summary = dict(_reversal_log_counters)
+            for key in _reversal_log_counters:
+                _reversal_log_counters[key] = 0
+            _reversal_log_last_summary = now
     stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    if summary is not None:
+        print(f"📊 REVERSAO_RESUMO utc={stamp} periodo_s=900 "
+              + " ".join(f"{key}={value}" for key, value in summary.items()), flush=True)
+    if stage in quiet or (stage == "telegram_recuperacao_concluida" and details.get("sucesso")):
+        return
     extra = " ".join(f"{key}={value}" for key, value in details.items())
     print(f"🔎 REVERSAO_DIAG utc={stamp} etapa={stage} revisao={revision_id or '-'} {extra}", flush=True)
 
@@ -5810,8 +5842,6 @@ def _posted_edit_patrol_monitor_loop():
         if not active:
             continue
         statuses = get_patrol_status_batch(active)
-        print("🔎 PATRULHA_DIAG etapa=consulta_concluida duracao_s=",
-              round(time.monotonic() - started, 3), flush=True)
         if statuses:
             _publish_latest_result(_patrol_results, (active, statuses))
         if time.monotonic() > next_check:
