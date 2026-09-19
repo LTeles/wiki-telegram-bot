@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.42"
-BOT_BUILD = "2.42-direct-undo-latency"
+BOT_BUILD = "2.42-false-positive-unmark-sync"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -10655,6 +10655,7 @@ def process_edit_action_callback(callback):
         # mas os metadados false_positive_* permanecem. Aceitar esses metadados
         # como prova da marcação permite corrigir também alertas legados.
         fp = None
+        previous_marker = record.get("false_positive_by")
         with false_positives_lock:
             fp = false_positives.get(str(revision_id))
 
@@ -10670,7 +10671,7 @@ def process_edit_action_callback(callback):
                 )
                 return
 
-            if not fp and not legacy_marked:
+            if not fp and not legacy_marked and record.get("status") != "false_positive":
                 answer_callback_query(
                     callback_id,
                     "Este alerta não possui marcação de falso positivo ativa."
@@ -10758,27 +10759,42 @@ def process_edit_action_callback(callback):
                     include_resolution_buttons=True
                 )
 
-            edit_telegram_message(
+            restored_ok = edit_telegram_message(
                 record.get("message_id"),
                 restored_text,
                 parse_mode=record.get("parse_mode") or "HTML",
                 reply_markup=restored_markup
             )
         except Exception as exc:
+            restored_ok = False
             safe_log(
                 f"Falha ao restaurar post após desmarcar falso positivo "
                 f"{revision_id}: {exc}"
             )
 
+        # O botão fica numa mensagem auxiliar. Sua edição só é confirmada
+        # depois que o post original foi restaurado no Telegram.
+        if not restored_ok:
+            with posted_edits_lock:
+                live = posted_edits.get(str(revision_id))
+                if live and live.get("status") is None:
+                    live["status"] = "false_positive"
+                    live["false_positive_at"] = time.time()
+                    live["false_positive_by"] = previous_marker or actor or "administrador do canal"
+            save_posted_edits()
+            answer_callback_query(callback_id, "Não consegui restaurar o post; tente novamente.")
+            return
         answer_callback_query(callback_id, "Marcação de falso positivo desfeita.")
-        try:
-            edit_telegram_message(
-                callback.get("message", {}).get("message_id"),
+        auxiliary_message_id = callback_message.get("message_id")
+        if auxiliary_message_id and auxiliary_message_id != record.get("message_id"):
+            auxiliary_ok = edit_telegram_message(
+                auxiliary_message_id,
                 "↩️ Marcação de falso positivo desfeita.",
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup={"inline_keyboard": []}
             )
-        except Exception:
-            pass
+            if not auxiliary_ok:
+                safe_log(f"Falha ao sincronizar mensagem auxiliar de falso positivo {revision_id}")
         return
 
     if action == "falsepos":
