@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.42"
-BOT_BUILD = "2.42-false-positive-unmark-sync"
+BOT_BUILD = "2.42-patrol-actor-in-post"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2243,18 +2243,10 @@ def announce_new_version_if_needed():
     message = (
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
-        "<b>Novidades desta versão</b>\n"
-        "• Reversões: consultas agendadas a cada 30 segundos, "
-        "sem esperar o processamento dos avisos anteriores.\n"
-        "• Patrulhamento: consultas independentes, também com intervalo "
-        "de 30 segundos quando houver acesso aos dados.\n"
-        "• Identificação de autores e atualização das mensagens no Telegram "
-        "separadas do agendamento das consultas.\n"
-        "• Limpeza e recuperação de mensagens deslocadas para rotina própria.\n"
-        "• Logs simplificados e resumo operacional a cada 15 minutos.\n"
-        "• Lift Wing: validação de revisão, diagnóstico HTTP 422 com resposta limitada, "
-        "sem repetição automática e sem pontuação fictícia.\n"
-        "• Nome do artigo clicável; link bruto do diff preservado.\n"
+        "<b>Novidade desta build</b>\n"
+        "• Alertas patrulhados passam a exibir o nome do patrulhador, "
+        "com link para suas contribuições, quando identificado no registro.\n"
+        "• Se o responsável não estiver disponível, o aviso permanece sem nome.\n"
         "• Escrita na Wikipédia continua desativada."
     )
 
@@ -5303,7 +5295,7 @@ def observation_remaining_line(username):
     return f"\n⏳ Tempo restante de observação: {format_remaining(remaining)}"
 
 
-def message_with_status(record, status, reverter=None, deleter=None):
+def message_with_status(record, status, reverter=None, deleter=None, patroller=None):
     title = article_link_html(record.get("title") or "Sem título")
     username = user_contributions_link_html(record.get("username") or "Desconhecido")
     comment = html.escape(str(record.get("edit_comment") or "Sem resumo"))
@@ -5360,6 +5352,10 @@ def message_with_status(record, status, reverter=None, deleter=None):
         )
 
     if status == "patrolled":
+        patroller_line = (
+            f"\nPatrulhada por: {user_contributions_link_html(patroller)}"
+            if patroller else ""
+        )
         return (
             "✅ Possível vandalismo patrulhado\n\n"
             f"📝 {title}\n"
@@ -5367,6 +5363,7 @@ def message_with_status(record, status, reverter=None, deleter=None):
             f"💬 {comment}\n"
             f"{risk_line}\n"
             f"{edit_link}"
+            f"{patroller_line}"
         )
 
     if status == "false_positive":
@@ -5656,10 +5653,16 @@ def _process_posted_statuses(
                 reversal_diagnostic("reversao_confirmada", revision_id,
                                     status=new_status, autor_identificado=bool(reverter))
 
+            patroller = None
+            if new_status == "patrolled":
+                patroller = get_patroller_username(
+                    record.get("title") or "", revision_id
+                )
             new_text = message_with_status(
                 record,
                 new_status,
-                reverter=reverter if new_status == "reverted" else None
+                reverter=reverter if new_status == "reverted" else None,
+                patroller=patroller,
             )
 
             # Após um desfecho, Resolver/Falso + deixam de ser aplicáveis.
@@ -5686,6 +5689,8 @@ def _process_posted_statuses(
                     live["reverted_at"] = time.time()
                 elif new_status == "patrolled":
                     live["patrolled_at"] = time.time()
+                    if patroller:
+                        live["patrolled_by"] = patroller
 
             # A gravação não depende do sucesso da API do Telegram.
             save_posted_edits()
@@ -5743,10 +5748,6 @@ def _process_posted_statuses(
 
                 elif new_status == "patrolled":
                     event_time = time.time()
-                    patroller = get_patroller_username(
-                        record.get("title") or "",
-                        revision_id,
-                    )
                     mark_detection_stat_patrolled(
                         revision_id,
                         event_time
