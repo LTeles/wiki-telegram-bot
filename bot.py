@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.42"
-BOT_BUILD = "2.42-patrol-actor-in-post"
+BOT_BUILD = "2.42-orthographic-minor-priority"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2244,10 +2244,11 @@ def announce_new_version_if_needed():
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
         "<b>Novidade desta build</b>\n"
-        "• Alertas patrulhados passam a exibir o nome do patrulhador, "
-        "com link para suas contribuições, quando identificado no registro.\n"
-        "• Se o responsável não estiver disponível, o aviso permanece sem nome.\n"
-        "• Escrita na Wikipédia continua desativada."
+        "• Redução moderada de prioridade para até três correções pequenas "
+        "de pontuação ou acentuação, sem alterar o Revert Risk original.\n"
+        "• Exige palavras equivalentes sem acentos/pontuação; não reduz "
+        "alterações numéricas nem edições com sinais fortes.\n"
+        "• Escrita na Wikipédia permanece desativada."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -8434,6 +8435,64 @@ def normalized_diff_lines(value):
     return lines
 
 
+def orthographic_priority_adjustment(diff):
+    """Reduz prioridade somente para até três alterações de pontuação/acentuação.
+
+    Exige palavras idênticas após remover apenas acentos e pontuação;
+    não equipara palavras diferentes, números, negações ou conteúdo removido.
+    """
+    import difflib
+    old = " ".join(normalized_diff_lines(diff.get("removed", "")))
+    new = " ".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > 2000:
+        return None
+    if re.search(r"\d", old + new):
+        return None
+    def canonical(value):
+        import unicodedata
+        decomposed = unicodedata.normalize("NFD", value)
+        without_accents = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+        return re.sub(r"[^\w]+", " ", without_accents, flags=re.UNICODE).strip().casefold()
+    if canonical(old) != canonical(new):
+        return None
+    edits = [(old[a:b], new[c:d]) for op, a, b, c, d in
+             difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+             if op != "equal"]
+    if not 1 <= len(edits) <= 3 or any(max(len(a), len(b)) > 3 for a, b in edits):
+        return None
+    return {"factor": 0.85, "reason": "correção mínima de pontuação/acentuação; conferir contexto"}
+
+
+def minimal_text_priority_adjustment(diff):
+    """Redutor moderado de prioridade para uma única mudança lexical curta.
+
+    Não altera o Revert Risk original nem trata a edição como legítima.
+    Exclui números, negações e mudanças com mais de um trecho modificado.
+    """
+    import difflib
+    old = " ".join(normalized_diff_lines(diff.get("removed", "")))
+    new = " ".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or len(old) > 500 or len(new) > 500:
+        return None
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    edits = [(old[a:b], new[c:d]) for op, a, b, c, d in matcher.get_opcodes()
+             if op != "equal"]
+    if len(edits) != 1:
+        return None
+    before, after = edits[0]
+    if max(len(before), len(after)) > 16 or any(ch.isdigit() for ch in before + after):
+        return None
+    if not re.fullmatch(r"[\wÀ-ÿ-]*", before) or not re.fullmatch(r"[\wÀ-ÿ-]*", after):
+        return None
+    if not before and not after:
+        return None
+    # Negações podem inverter inteiramente o sentido da frase.
+    if re.search(r"\b(?:não|nao|nunca|jamais|sem)\b", before + " " + after, re.I):
+        return None
+    # Somente um pequeno ajuste na prioridade, sem blindar alterações factuais.
+    return {"factor": 0.85, "reason": "alteração lexical mínima; conferir contexto factual"}
+
+
 def benign_technical_change(diff):
     """
     Reconhece alterações técnicas mínimas e de baixo risco.
@@ -8696,6 +8755,13 @@ def analyze_vandalism(change, diff, revert_risk):
     if benign:
         score *= float(benign.get("factor", 1.0))
 
+    minimal_adjustment = None
+    if not benign and not change.get("type") == "new" and max(signals) < 0.75:
+        minimal_adjustment = (orthographic_priority_adjustment(diff)
+                              or minimal_text_priority_adjustment(diff))
+        if minimal_adjustment:
+            score *= float(minimal_adjustment["factor"])
+
     context_adjustment = contextual_discussion_adjustment(
         change,
         diff,
@@ -8748,6 +8814,9 @@ def analyze_vandalism(change, diff, revert_risk):
             str(benign.get("reason") or "alteração técnica mínima")
         )
 
+    if minimal_adjustment:
+        reasons.append(minimal_adjustment["reason"])
+
     if context_adjustment:
         reasons.append(
             str(
@@ -8766,6 +8835,7 @@ def analyze_vandalism(change, diff, revert_risk):
         "revert_risk": revert_risk,
         "reason": ", ".join(reasons),
         "benign_reduction": benign,
+        "minimal_adjustment": minimal_adjustment,
         "context_adjustment": context_adjustment,
         "promotional_adjustment": promotional_adjustment,
     }
