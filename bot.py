@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.43"
-BOT_BUILD = "2.43-resolverfalso-diff-url"
+BOT_BUILD = "2.43-contextual-calibration-user-talk-help"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2244,8 +2244,8 @@ def announce_new_version_if_needed():
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
         "<b>Novidade desta build</b>\n"
-        "• /resolverfalso agora aceita ID da revisão ou link do diff da Wikipédia em português.\n"
-        "• Escrita na Wikipédia permanece desativada."
+        "• Calibração contextual: correções triviais em páginas de usuário, comentários assinados e pedidos de ajuda comunitários.\n"
+        "• Redutores não são acumulados; escrita na Wikipédia permanece desativada."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -8517,6 +8517,41 @@ def minimal_text_priority_adjustment(diff):
     return {"factor": 0.85, "reason": "alteração lexical mínima; conferir contexto factual"}
 
 
+def contextual_priority_calibration(change, diff, strong_signals):
+    """Conservative contextual discount; never stacks with other discounts."""
+    if change.get("type") == "new" or strong_signals:
+        return None
+    title = str(change.get("title") or "").replace("_", " ").strip()
+    folded = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode().casefold()
+    added = str(diff.get("added") or "")
+    removed = str(diff.get("removed") or "")
+    # User pages: only literal punctuation/accent edits, no new links or promotion.
+    if folded.startswith(("usuario:", "usuaria:", "usuario(a):")) and not folded.startswith(("usuario discussao:", "usuaria discussao:")):
+        adjustment = orthographic_priority_adjustment(diff)
+        if (adjustment and not count_external_links(added + removed)
+                and not re.search(r"(?:www\.|@|\b(?:instagram|whatsapp|telegram|compre|contrate|patrocinad[oa]|empresa|servicos?)\b)", added + removed, re.I)
+                and not re.search(r"\[\[|\{\{|<[^>]+>", added + removed)):
+            return {"factor": 0.70, "reason": "correção trivial em página de usuário; conferir contexto"}
+    # Community conversations: append-only signed comments, not arbitrary project pages.
+    community = is_discussion_namespace(change)
+    if not community or removed.strip() or not added.strip():
+        return None
+    body = discussion_comment_body(added)
+    if (not looks_like_signed_discussion_comment(added) or len(body) < 12
+            or count_external_links(body) or max(profanity_score(body), repetition_score(body), nonsense_score(body)) >= 0.75
+            or re.search(r"(?:www\.|\b(?:compre|contrate|patrocinad[oa]|whatsapp|instagram)\b)", body, re.I)):
+        return None
+    help_page = any(x in folded for x in (
+        "ajuda:", "wikipedia:cafe dos novatos", "wikipedia:pedidos/", "wikipedia:esplanada/"))
+    help_request = bool(re.search(
+        r"\b(?:peco ajuda|peço ajuda|preciso de (?:ajuda|orientacao|orientação)|"
+        r"sou nov[oa]|como faco|como faço|agradeco sugestoes|agradeço sugestões|"
+        r"avaliacao|avaliação|podem me ajudar|alguma duvida|alguma dúvida)\b", body, re.I))
+    if help_page and help_request:
+        return {"factor": 0.70, "reason": "pedido de ajuda assinado em espaço comunitário"}
+    return {"factor": 0.70, "reason": "comentário assinado em espaço de discussão"}
+
+
 def benign_technical_change(diff):
     """
     Reconhece alterações técnicas mínimas e de baixo risco.
@@ -8780,10 +8815,13 @@ def analyze_vandalism(change, diff, revert_risk):
         score *= float(benign.get("factor", 1.0))
 
     minimal_adjustment = None
+    contextual_calibration = contextual_priority_calibration(change, diff, strong_signals)
     if not benign and not change.get("type") == "new" and max(signals) < 0.75:
         minimal_adjustment = (equivalent_wikimarkup_priority_adjustment(diff)
                               or orthographic_priority_adjustment(diff)
                               or minimal_text_priority_adjustment(diff))
+        if contextual_calibration and (not minimal_adjustment or contextual_calibration["factor"] < minimal_adjustment["factor"]):
+            minimal_adjustment = contextual_calibration
         if minimal_adjustment:
             score *= float(minimal_adjustment["factor"])
 
@@ -8793,6 +8831,8 @@ def analyze_vandalism(change, diff, revert_risk):
         strong_signals,
     )
 
+    if context_adjustment and contextual_calibration and context_adjustment.get("kind") == "talk_signed_append":
+        context_adjustment = None  # One contextual discount, never multiply 0.70 by 0.45.
     if context_adjustment:
         score *= float(context_adjustment.get("multiplier", 1.0))
         score += float(context_adjustment.get("additive", 0.0))
