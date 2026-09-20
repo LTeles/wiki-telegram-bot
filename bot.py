@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.42"
-BOT_BUILD = "2.42-orthographic-minor-priority"
+BOT_VERSION = "2.43"
+BOT_BUILD = "2.43-resolverfalso-diff-url"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2244,10 +2244,7 @@ def announce_new_version_if_needed():
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
         "<b>Novidade desta build</b>\n"
-        "• Redução moderada de prioridade para até três correções pequenas "
-        "de pontuação ou acentuação, sem alterar o Revert Risk original.\n"
-        "• Exige palavras equivalentes sem acentos/pontuação; não reduz "
-        "alterações numéricas nem edições com sinais fortes.\n"
+        "• /resolverfalso agora aceita ID da revisão ou link do diff da Wikipédia em português.\n"
         "• Escrita na Wikipédia permanece desativada."
     )
 
@@ -8463,6 +8460,33 @@ def orthographic_priority_adjustment(diff):
     return {"factor": 0.85, "reason": "correção mínima de pontuação/acentuação; conferir contexto"}
 
 
+def equivalent_wikimarkup_priority_adjustment(diff):
+    """Reduz prioridade só quando a mudança isolada é aspas wiki de ênfase.
+
+    Preserva literalmente texto, links, números e demais marcações; não tenta
+    inferir equivalência visual para mudanças de conteúdo ou de estilo real.
+    """
+    old = "\n".join(normalized_diff_lines(diff.get("removed", "")))
+    new = "\n".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > 500:
+        return None
+    # Apenas sequências de apóstrofos que representam marcação wiki (2 a 5).
+    # O restante do conteúdo deve ser byte a byte idêntico, inclusive links.
+    def without_emphasis(value):
+        return re.sub(r"(?<!')'{2,5}(?!')", "", value)
+    if old == new or without_emphasis(old) != without_emphasis(new):
+        return None
+    if not re.search(r"(?<!')'{2,5}(?!')", old + new):
+        return None
+    # Conservar apenas mudanças locais de marcação: não aceitar a remoção
+    # de toda a ênfase ou mudanças que alterem o conjunto de estilos.
+    def marks(value):
+        return sorted(re.findall(r"(?<!')'{2,5}(?!')", value))
+    if marks(old) != marks(new):
+        return None
+    return {"factor": 0.85, "reason": "marcação wiki de ênfase equivalente; conferir contexto"}
+
+
 def minimal_text_priority_adjustment(diff):
     """Redutor moderado de prioridade para uma única mudança lexical curta.
 
@@ -8757,7 +8781,8 @@ def analyze_vandalism(change, diff, revert_risk):
 
     minimal_adjustment = None
     if not benign and not change.get("type") == "new" and max(signals) < 0.75:
-        minimal_adjustment = (orthographic_priority_adjustment(diff)
+        minimal_adjustment = (equivalent_wikimarkup_priority_adjustment(diff)
+                              or orthographic_priority_adjustment(diff)
                               or minimal_text_priority_adjustment(diff))
         if minimal_adjustment:
             score *= float(minimal_adjustment["factor"])
@@ -9301,7 +9326,7 @@ def commands_message():
         "📋 /filtros — lista filtros vigiados.\n\n"
         "🧹 Manutenção\n"
         "🧹 /revisarpendentes — revisa imediatamente os alertas pendentes.\n"
-        "✅ /resolverfalso ID — marca como concluído o ajuste de um falso positivo.\n"
+        "✅ /resolverfalso ID ou LINK — marca como concluído o ajuste de um falso positivo.\n"
         "✅ /resolverfalsonegativo ID — marca como concluído o ajuste de um falso negativo.\n\n"
         "ℹ️ /start — apresentação do bot.\n"
         "📖 /comandos — mostra esta lista.\n\n"
@@ -9575,16 +9600,16 @@ def process_telegram_command(message, from_channel=False):
     if command == "/resolverfalso":
         if not argument:
             send_telegram_message(
-                "Uso: /resolverfalso ID_DA_REVISÃO",
+                "Uso: /resolverfalso ID_OU_LINK_DA_REVISÃO",
                 chat_id=chat_id
             )
             return
 
         try:
-            revision_id = int(argument.strip())
-        except Exception:
+            revision_id = parse_revision_reference(argument)
+        except ValueError as exc:
             send_telegram_message(
-                "❌ ID de revisão inválido.",
+                f"❌ Referência de revisão inválida: {html.escape(str(exc))}",
                 chat_id=chat_id
             )
             return
