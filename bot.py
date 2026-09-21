@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.45"
-BOT_BUILD = "2.45-wiki-statistics-consolidated"
+BOT_VERSION = "2.46"
+BOT_BUILD = "2.46-wiki-metrics-and-health"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1729,6 +1729,9 @@ def process_wiki_write_queue_once():
             success = wiki_edit_page(item["title"], item["text"], item["summary"])
         except Exception as exc:
             print("⚠️ Falha na escrita wiki:", safe_exception(exc))
+            state = load_json(WIKI_WRITE_QUEUE_FILE, state)
+            state["write_failures"] = [x for x in state.get("write_failures", []) if isinstance(x, (int, float)) and time.time() - x <= 86400][-99:] + [time.time()]
+            atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
             # Notificação única da primeira falha, persistente entre reinícios.
             if not state.get("first_error_notified"):
                 state = load_json(WIKI_WRITE_QUEUE_FILE, state)
@@ -1745,6 +1748,8 @@ def process_wiki_write_queue_once():
         if success:
             print("✅ Publicação wiki confirmada:", item["title"])
             state = load_json(WIKI_WRITE_QUEUE_FILE, state)
+            state["last_success_at"] = time.time()
+            atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
             # Never remove a newer, coalesced update of the same page.
             if state.get("pending") and state["pending"][0] == item:
                 state["pending"].pop(0)
@@ -1754,6 +1759,7 @@ def process_wiki_write_queue_once():
 
 
 def wiki_write_queue_worker():
+    wiki_record_release()
     mark_wiki_page_pending(WIKI_STATUS_TITLE)
     mark_wiki_page_pending(WIKI_STATISTICS_TITLE)
     mark_wiki_page_pending("Usuário:TelesGramBot/Sobre")  # Inventário apenas; sem criação/publicação automática.
@@ -2333,6 +2339,158 @@ def build_wiki_observations_wikitext():
     return "\n".join(lines)
 
 
+# Histórico explícito: nunca inferir notas de versões anteriores.
+WIKI_RELEASE_NOTES = {
+    "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
+}
+WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
+
+
+def wiki_record_release():
+    """Registra esta versão no volume persistente, sem duplicar em reinícios."""
+    with WIKI_WRITE_LOCK:
+        state = load_json(WIKI_RELEASE_HISTORY_FILE, {"releases": []})
+        releases = state.get("releases", [])
+        if not isinstance(releases, list):
+            releases = []
+        if not any(isinstance(x, dict) and x.get("build") == BOT_BUILD for x in releases):
+            releases.append({"version": BOT_VERSION, "build": BOT_BUILD,
+                             "timestamp": time.time(), "notes": WIKI_RELEASE_NOTES[BOT_VERSION]})
+            atomic_write_json(WIKI_RELEASE_HISTORY_FILE, {"releases": releases[-150:]})
+
+
+def wiki_daily_release_wikitext():
+    tz = ZoneInfo(REPORT_TIMEZONE)
+    today = datetime.now(tz).date()
+    entries = load_json(WIKI_RELEASE_HISTORY_FILE, {"releases": []}).get("releases", [])
+    rows = []
+    for item in entries if isinstance(entries, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            moment = datetime.fromtimestamp(float(item["timestamp"]), tz)
+        except (KeyError, ValueError, TypeError, OverflowError):
+            continue
+        if moment.date() == today:
+            version = str(item.get("version", "")).replace("|", "&#124;")
+            notes = str(item.get("notes", "Sem descrição registrada.")).replace("|", "&#124;").replace("<", "&lt;")
+            rows.append((moment, version, notes))
+    lines = ["=== Atualizações do dia ===", "''Versões registradas pelo bot no volume persistente; histórico anterior não é reconstruído.''",
+             '{| class="wikitable"', "! Horário (Brasília) !! Versão !! Alterações"]
+    for moment, version, notes in sorted(rows, reverse=True):
+        lines.extend(["|-", f"| {moment:%H:%M} || {version} || {notes}"])
+    if not rows:
+        lines.extend(["|-", '| colspan="3" | Nenhuma versão registrada hoje.'])
+    return "\n".join(lines + ["|}"])
+
+
+def wiki_health_wikitext():
+    now = time.time()
+    with stream_lock:
+        last = last_stream_event_at
+        connected = current_stream_response is not None and last is not None and now - last <= STREAM_STALL_SECONDS
+    state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": []})
+    pending = state.get("pending", [])
+    pending = pending if isinstance(pending, list) else []
+    latest = state.get("last_success_at")
+    failures = state.get("write_failures", [])
+    failures = [x for x in failures if isinstance(x, (int, float)) and now - x <= 86400] if isinstance(failures, list) else []
+    last_label = datetime.fromtimestamp(last, ZoneInfo(REPORT_TIMEZONE)).strftime("%d/%m/%Y %H:%M:%S") if last else "Não registrado"
+    success_label = datetime.fromtimestamp(latest, ZoneInfo(REPORT_TIMEZONE)).strftime("%d/%m/%Y %H:%M:%S") if latest else "Não registrado"
+    return "\n".join(["=== Saúde do robô ===",
+        f"* EventStreams: {wiki_state_label(connected)} (conexão com atividade recente; não garante processamento de todas as edições)",
+        f"* Último evento recebido: {last_label} (horário de Brasília)",
+        f"* Última publicação wiki confirmada: {success_label} (horário de Brasília)",
+        f"* Falhas de escrita wiki nas últimas 24 horas: {len(failures)} (somente falhas registradas desde esta versão)",
+        f"* Páginas na fila de escrita: {len(pending)}"])
+
+
+def wiki_extended_statistics_wikitext():
+    now = time.time()
+    with community_stats_lock:
+        events = [dict(e) for e in community_stats.get("events", []) if isinstance(e, dict)]
+    with detection_stats_lock:
+        detections = [dict(d) for d in detection_stats.get("records", []) if isinstance(d, dict)]
+    with false_positives_lock:
+        fp = [dict(x) for x in false_positives.values()]
+    with false_negatives_lock:
+        fn = [dict(x) for x in false_negatives.values()]
+    # Desfecho prioritário e exclusivo por revisão; nunca equiparar reversão a vandalismo confirmado.
+    alerts = {}
+    outcomes = defaultdict(set)
+    for event in events:
+        rid = event.get("revision_id")
+        if rid is None:
+            continue
+        kind = event.get("kind")
+        if kind == "alert":
+            alerts[rid] = event
+        elif kind in ("revert", "self_revert", "patrol", "delete", "resolved_no_action"):
+            outcomes[rid].add(kind)
+    counts = Counter()
+    for rid in alerts:
+        kinds = outcomes[rid]
+        if "self_revert" in kinds:
+            counts["Autorrevertidas"] += 1
+        elif "revert" in kinds:
+            counts["Revertidas"] += 1
+        elif "delete" in kinds or "patrol" in kinds or "resolved_no_action" in kinds:
+            counts["Mantidas/revisadas sem reversão"] += 1
+        else:
+            counts["Pendentes sem desfecho registrado"] += 1
+    # Tempo real edição -> reversão quando o detector reteve ambos os timestamps.
+    durations = []
+    for item in detections:
+        try:
+            start, end = float(item["posted_at"]), float(item["reverted_at"])
+            if 0 <= end - start <= 400 * 86400:
+                durations.append(end - start)
+        except (KeyError, ValueError, TypeError):
+            pass
+    med = format_minutes(median(durations)) if durations else "Dados insuficientes"
+    pct = f"{100 * sum(x <= 600 for x in durations) / len(durations):.1f}%" if durations else "Dados insuficientes"
+    lines = ["=== Tempo até a reversão ===",
+        "''Medido do registro do alerta até a reversão identificada, não necessariamente desde a edição original. Somente casos com ambos os horários disponíveis.''",
+        f"* Reversões com tempos válidos: {len(durations)}", f"* Mediana: {med}",
+        f"* Revertidas em até 10 minutos (entre as reversões com tempo válido): {pct}",
+        "=== Destino dos alertas ===",
+        "''Amostra: alertas publicados e retidos no histórico comunitário; categorias exclusivas, sem inferir vandalismo confirmado.''"]
+    for label in ("Revertidas", "Mantidas/revisadas sem reversão", "Pendentes sem desfecho registrado", "Autorrevertidas"):
+        n = counts[label]
+        lines.append(f"* {label}: {n} ({100*n/len(alerts):.1f}%)" if alerts else f"* {label}: 0 (sem alertas registrados)")
+    lines += ["=== Classificação humana e falsos positivos ===",
+        f"* Falsos positivos reportados: {len(fp)}",
+        f"* Falsos positivos com ajuste registrado: {sum(bool(x.get('resolved_at')) for x in fp)}",
+        f"* Falsos negativos reportados: {len(fn)}",
+        f"* Alertas sem classificação humana explícita: {sum(rid not in {x.get('revision_id') for x in fp} for rid in alerts)} (não implica acerto do algoritmo)",
+        "* Precisão do algoritmo: não calculável com segurança sem classificação humana completa e amostra representativa.",
+        "=== Curiosidades e tendências ===",
+        "''Somente alertas observados pelo bot; distribuição não representa todas as edições da Wikipédia. Horário de Brasília.''"]
+    tz = ZoneInfo(REPORT_TIMEZONE)
+    hours, weekdays, months, pages = Counter(), Counter(), Counter(), Counter()
+    for event in alerts.values():
+        try:
+            dt = datetime.fromtimestamp(float(event["timestamp"]), tz)
+        except (KeyError, ValueError, TypeError, OverflowError):
+            continue
+        hours[f"{dt.hour:02d}:00–{dt.hour:02d}:59"] += 1
+        weekdays[("Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo")[dt.weekday()]] += 1
+        months[dt.strftime("%Y-%m")] += 1
+        if event.get("title"):
+            pages[str(event["title"])] += 1
+    lines.append("==== Horários ====")
+    lines.extend(f"* {key}: {value}" for key, value in sorted(hours.items()))
+    lines.append("==== Dias da semana ====")
+    lines.extend(f"* {key}: {value}" for key, value in weekdays.most_common())
+    lines.append("==== Evolução mensal ====")
+    lines.extend(f"* {key}: {value}" for key, value in sorted(months.items()))
+    lines.append("==== Artigos/páginas mais sinalizados ====")
+    lines.extend(f"* {wiki_page_link(title)}: {count}" for title, count in pages.most_common(10))
+    if not alerts:
+        lines.append("''Sem alertas suficientes para as distribuições.''")
+    return "\n".join(lines)
+
+
 def build_wiki_status_wikitext():
     writing_enabled, queued_edits = wiki_write_status_snapshot()
     pending_titles = wiki_pending_pages_snapshot()
@@ -2346,6 +2504,8 @@ def build_wiki_status_wikitext():
         f"* Páginas aguardando atualização: {len(pending_titles)}",
         "* Intervalo mínimo entre tentativas de escrita: 60 minutos",
         "* Atualização programada do status: a cada 6 horas",
+        wiki_health_wikitext(),
+        wiki_daily_release_wikitext(),
         "=== Páginas e relatórios ===", pending_lines,
         f"* [[{WIKI_STATISTICS_TITLE}|Estatísticas, revisores e contas observadas]]",
         "=== Projetos e dependências ===",
@@ -2373,6 +2533,7 @@ def build_wiki_statistics_wikitext():
         f"* Resoluções sem ação necessária: {kinds['resolved_no_action']}",
         f"* Contas atualmente observadas: {observed_count}",
         "''Nenhum nome, @ ou identificador de operadores do Telegram é divulgado.''",
+        wiki_extended_statistics_wikitext(),
         build_wiki_reviewers_wikitext(),
         build_wiki_observations_wikitext(),
     ])
@@ -2496,7 +2657,7 @@ def announce_new_version_if_needed():
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
         "<b>Novidade desta build</b>\n"
-        "• Status wiki com cores, contas observadas e bloqueios; ranking de 20 revisores; estatísticas agregadas sem identidades do Telegram."
+        "• Métricas de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões; sem identidades do Telegram."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
