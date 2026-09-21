@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.44"
-BOT_BUILD = "2.44-auth-observation-calibration-pending"
+BOT_VERSION = "2.45"
+BOT_BUILD = "2.45-wiki-statistics-consolidated"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -131,6 +131,7 @@ WIKI_WRITE_ENABLED = True
 # versão futura, o bot somente poderá editar títulos iniciados exatamente por:
 WIKI_ALLOWED_TITLE_PREFIX = "Usuário:TelesGramBot/"
 WIKI_STATUS_TITLE = "Usuário:TelesGramBot/Status"
+WIKI_STATISTICS_TITLE = "Usuário:TelesGramBot/Estatísticas"
 WIKI_CREATE_ENABLED = True
 WIKI_WRITE_INTERVAL_SECONDS = 60 * 60
 WIKI_STATUS_INTERVAL_SECONDS = 6 * 60 * 60
@@ -1681,7 +1682,7 @@ def wiki_edit_page(title, wikitext, summary):
         atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
         exists = wiki_page_exists(title)
         create = not exists
-        if create and not (WIKI_CREATE_ENABLED and (title == WIKI_STATUS_TITLE or wiki_report_creation_allowed(title))):
+        if create and not (WIKI_CREATE_ENABLED and (title in (WIKI_STATUS_TITLE, WIKI_STATISTICS_TITLE) or wiki_report_creation_allowed(title))):
             print("📄 Página ausente; criação bloqueada:", title)
             return False
         # A deletion log is a hard stop for any attempt to recreate a page.
@@ -1754,13 +1755,25 @@ def process_wiki_write_queue_once():
 
 def wiki_write_queue_worker():
     mark_wiki_page_pending(WIKI_STATUS_TITLE)
+    mark_wiki_page_pending(WIKI_STATISTICS_TITLE)
     mark_wiki_page_pending("Usuário:TelesGramBot/Sobre")  # Inventário apenas; sem criação/publicação automática.
     # O agendamento usa relógio persistido: reiniciar não provoca publicação extra.
     while True:
         try:
             state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+            legacy_title = "Usuário:TelesGramBot/Revisores"
+            if any(item.get("title") == legacy_title for item in state.get("pending", [])):
+                with WIKI_WRITE_LOCK:
+                    state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+                    state["pending"] = [item for item in state.get("pending", []) if item.get("title") != legacy_title]
+                    atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
             last_status = float(state.get("last_status_enqueued") or 0)
             if WIKI_WRITE_ENABLED and not wiki_writing_paused() and time.time() - last_status >= WIKI_STATUS_INTERVAL_SECONDS:
+                queue_wiki_edit(
+                    WIKI_STATISTICS_TITLE,
+                    build_wiki_statistics_wikitext(),
+                    "Atualizando estatísticas agregadas do TelesGramBot",
+                )
                 queue_wiki_edit(
                     WIKI_STATUS_TITLE,
                     build_wiki_status_wikitext(),
@@ -1770,6 +1783,7 @@ def wiki_write_queue_worker():
                     state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
                     state["last_status_enqueued"] = time.time()
                     atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+            # As estatísticas são atualizadas junto com o status, respeitando a mesma fila e limite de escrita.
             process_wiki_write_queue_once()
         except Exception as exc:
             print("⚠️ Falha no agendador de escrita wiki:", safe_exception(exc))
@@ -2228,23 +2242,140 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
     ])
 
 
+def wiki_state_label(enabled):
+    color = "#006400" if enabled else "#8B0000"
+    return f'<span style="color:{color};font-weight:bold">{"Habilitada" if enabled else "Desabilitada"}</span>'
+
+
+def wiki_safe_username(username):
+    # Apenas nomes obtidos de eventos wiki; nunca nomes/IDs de operadores Telegram.
+    name = str(username or "").strip()
+    if not name or any(ch in name for ch in "\n\r[]{}|<>"):
+        return None
+    return name[:255]
+
+
+def wiki_review_events():
+    with community_stats_lock:
+        return [dict(x) for x in community_stats.get("events", []) if isinstance(x, dict)]
+
+
+def build_wiki_reviewers_wikitext():
+    totals = defaultdict(Counter)
+    for event in wiki_review_events():
+        kind = event.get("kind")
+        if kind not in ("patrol", "delete", "revert"):
+            continue
+        actor = wiki_safe_username(event.get("actor"))
+        if actor:
+            totals[actor][kind] += 1
+    ranking = sorted(totals.items(), key=lambda x: (-sum(x[1].values()), x[0].casefold()))[:20]
+    lines = ["=== Revisores — 20 maiores totais observados ===",
+             "''Somente ações públicas da Wikipédia registradas pelo bot; não é um ranking histórico completo. "
+             "Os eventos são retidos por até 400 dias. Nenhuma identidade do Telegram é publicada.''",
+             '{| class="wikitable sortable"',
+             "! Pos. !! Conta da Wikipédia !! Patrulhas !! Eliminações !! Reversões !! Total"]
+    for position, (actor, counts) in enumerate(ranking, 1):
+        patrol, delete, revert = (counts[k] for k in ("patrol", "delete", "revert"))
+        lines += ["|-", f"| {position} || {wiki_user_link(actor)} || {patrol} || {delete} || {revert} || {patrol + delete + revert}"]
+    if not ranking:
+        lines += ["|-", '| colspan="6" | Nenhuma ação identificada.']
+    lines += ["|}", "''Cada evento registrado conta uma vez; ações não observadas não são estimadas.''"]
+    return "\n".join(lines)
+
+
+def wiki_observed_block_status(names):
+    """Consulta pública, em lote; falha = não verificado, nunca 'não bloqueada'."""
+    result = {name: "Não verificado" for name in names}
+    if not names:
+        return result
+    for offset in range(0, len(names), 50):
+        batch = names[offset:offset + 50]
+        try:
+            _, data = wikimedia_api_get({"action": "query", "format": "json", "formatversion": 2,
+                                         "list": "blocks", "bkusers": "|".join(batch), "bklimit": "max",
+                                         "bkprop": "user|restrictions"}, timeout=25)
+            if data.get("error"):
+                continue
+            blocks = (data.get("query") or {}).get("blocks", [])
+            for name in batch:
+                result[name] = "Não bloqueada"
+            for block in blocks:
+                name = block.get("user")
+                if name in result:
+                    result[name] = "Bloqueio parcial" if block.get("restrictions") else "Bloqueada"
+        except Exception as exc:
+            print("⚠️ Falha ao consultar bloqueios para relatório:", safe_exception(exc))
+    return result
+
+
+def build_wiki_observations_wikitext():
+    now = time.time()
+    with observed_users_lock:
+        observations = [dict(item) for item in observed_users.values()
+                        if float(item.get("expires_at") or 0) > now]
+    observations.sort(key=lambda item: str(item.get("username") or "").casefold())
+    names = [name for item in observations if (name := wiki_safe_username(item.get("username")))]
+    statuses = wiki_observed_block_status(names)
+    lines = ["=== Contas em observação ===", "''Somente contas da Wikipédia. Nenhum observador ou identificador do Telegram é divulgado.''",
+             '{| class="wikitable sortable"', "! Conta !! Bloqueio na última consulta !! Tempo restante na geração"]
+    for item in observations:
+        name = wiki_safe_username(item.get("username"))
+        if not name:
+            continue
+        status = statuses.get(name, "Não verificado")
+        color = "#8B0000" if status in ("Bloqueada", "Bloqueio parcial") else ("#006400" if status == "Não bloqueada" else "#8B6508")
+        remaining = max(0, int(float(item["expires_at"]) - now))
+        lines += ["|-", f'| {wiki_user_link(name)} || <span style="color:{color}">{status}</span> || {remaining // 3600}h {(remaining % 3600) // 60:02d}min']
+    if not names:
+        lines += ["|-", '| colspan="3" | Nenhuma conta em observação.']
+    lines += ["|}"]
+    return "\n".join(lines)
+
+
 def build_wiki_status_wikitext():
     writing_enabled, queued_edits = wiki_write_status_snapshot()
     pending_titles = wiki_pending_pages_snapshot()
     pending_lines = "\n".join("* [[" + title + "]]" for title in pending_titles) or "* Nenhuma página registrada"
-    return (
-        "== Status do TelesGramBot ==\n"
-        f"* Versão: {BOT_VERSION}\n"
-        f"* Escrita na Wikipédia: {'habilitada' if writing_enabled else 'pausada/desabilitada'}\n"
-        f"* Edições na fila de publicação: {queued_edits}\n"
-        f"* Páginas registradas como necessitando atualização: {len(pending_titles)}\n"
-        f"{pending_lines}\n"
-        "* Criação automática de subpáginas autorizadas: habilitada\n"
-        "* Intervalo mínimo entre tentativas de escrita: 60 minutos\n"
-        "* Atualização programada do status: a cada 6 horas\n\n"
-        "=== Projetos e dependências ===\n"
-        "* Criação limitada ao status e aos relatórios diários e mensais previstos.\n"
-    )
+    return "\n".join([
+        "== Status do TelesGramBot ==",
+        f"* Versão: {BOT_VERSION}",
+        f"* Escrita na Wikipédia: {wiki_state_label(writing_enabled)}",
+        f"* Criação de subpáginas autorizadas: {wiki_state_label(WIKI_CREATE_ENABLED)}",
+        f"* Edições na fila de publicação: {queued_edits}",
+        f"* Páginas aguardando atualização: {len(pending_titles)}",
+        "* Intervalo mínimo entre tentativas de escrita: 60 minutos",
+        "* Atualização programada do status: a cada 6 horas",
+        "=== Páginas e relatórios ===", pending_lines,
+        f"* [[{WIKI_STATISTICS_TITLE}|Estatísticas, revisores e contas observadas]]",
+        "=== Projetos e dependências ===",
+        "* Criação limitada às páginas Status, Estatísticas e relatórios diários e mensais previstos.",
+    ])
+
+
+def build_wiki_statistics_wikitext():
+    now = time.time()
+    events = wiki_review_events()
+    kinds = Counter(x.get("kind") for x in events)
+    with false_positives_lock:
+        fp_items = [dict(x) for x in false_positives.values()]
+    with observed_users_lock:
+        observed_count = sum(float(x.get("expires_at") or 0) > now for x in observed_users.values())
+    return "\n".join([
+        "== Estatísticas do TelesGramBot ==",
+        "''Dados observados pelo bot dentro da janela de retenção. Ações não registradas não são estimadas.''",
+        "=== Atividade agregada ===",
+        f"* Falsos positivos registrados: {len(fp_items)}",
+        f"* Falsos positivos com ajuste concluído: {sum(bool(x.get('resolved_at')) for x in fp_items)}",
+        f"* Reversões identificadas: {kinds['revert']}",
+        f"* Patrulhamentos identificados: {kinds['patrol']}",
+        f"* Eliminações identificadas: {kinds['delete']}",
+        f"* Resoluções sem ação necessária: {kinds['resolved_no_action']}",
+        f"* Contas atualmente observadas: {observed_count}",
+        "''Nenhum nome, @ ou identificador de operadores do Telegram é divulgado.''",
+        build_wiki_reviewers_wikitext(),
+        build_wiki_observations_wikitext(),
+    ])
 
 
 def build_wiki_daily_and_monthly_previews(now=None):
@@ -2365,7 +2496,7 @@ def announce_new_version_if_needed():
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
         "<b>Novidade desta build</b>\n"
-        "• Recuperação de autenticação para escrita; páginas que precisam de atualização; menção verificável em observações; sensibilidade geral reduzida em 10%."
+        "• Status wiki com cores, contas observadas e bloqueios; ranking de 20 revisores; estatísticas agregadas sem identidades do Telegram."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
