@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.43"
-BOT_BUILD = "2.43-wiki-write-status-queue"
+BOT_VERSION = "2.44"
+BOT_BUILD = "2.44-auth-observation-calibration-pending"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -137,6 +137,8 @@ WIKI_STATUS_INTERVAL_SECONDS = 6 * 60 * 60
 WIKI_WRITE_QUEUE_FILE = "/data/wiki_write_queue.json"
 WIKI_WRITE_CONTROL_FILE = "/data/wiki_write_control.json"
 WIKI_WRITE_LOCK = threading.RLock()
+GENERAL_PRIORITY_FACTOR = 0.90  # Redução geral de 10% na prioridade, sem alterar o Revert Risk.
+WIKI_PENDING_PAGES_FILE = "/data/wiki_pending_pages.json"
 
 # Relatórios que serão usados quando a publicação for futuramente ativada.
 WIKI_DAILY_REPORT_PREFIX = "Usuário:TelesGramBot/Relatórios/Diário/"
@@ -1572,13 +1574,22 @@ def get_wikimedia_csrf_token():
         timeout=25,
     )
     response.raise_for_status()
-    token = (
-        response.json()
-        .get("query", {})
-        .get("tokens", {})
-        .get("csrftoken")
-    )
-    if not token:
+    data = response.json()
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict) and error.get("code") in {"notloggedin", "assertuserfailed", "readapidenied"}:
+        if not wikimedia_login():
+            raise RuntimeError("Falha ao renovar sessão para token CSRF: " + str(error))
+        response = wikimedia_session.get(
+            WIKIPEDIA_API,
+            params={"action": "query", "meta": "tokens", "type": "csrf", "format": "json", "formatversion": 2, "assert": "user"},
+            timeout=25,
+        )
+        response.raise_for_status()
+        data = response.json()
+    if data.get("error"):
+        raise RuntimeError("Falha ao obter token CSRF: " + str(data["error"]))
+    token = data.get("query", {}).get("tokens", {}).get("csrftoken")
+    if not token or token == "+\\":
         raise RuntimeError("token CSRF não retornado")
     return token
 
@@ -1614,12 +1625,36 @@ def wiki_report_creation_allowed(title):
     return False
 
 
+def wiki_pending_pages_snapshot():
+    """Persistent inventory independent of the actual publication queue."""
+    data = load_json(WIKI_PENDING_PAGES_FILE, {"titles": []})
+    titles = data.get("titles", []) if isinstance(data, dict) else []
+    return sorted({title for title in titles if isinstance(title, str) and wiki_title_is_allowed(title)})
+
+
+def mark_wiki_page_pending(title):
+    if not wiki_title_is_allowed(title):
+        raise PermissionError("Título wiki não autorizado")
+    with WIKI_WRITE_LOCK:
+        titles = set(wiki_pending_pages_snapshot())
+        titles.add(title)
+        atomic_write_json(WIKI_PENDING_PAGES_FILE, {"titles": sorted(titles)})
+
+
+def mark_wiki_page_published(title):
+    with WIKI_WRITE_LOCK:
+        titles = set(wiki_pending_pages_snapshot())
+        titles.discard(title)
+        atomic_write_json(WIKI_PENDING_PAGES_FILE, {"titles": sorted(titles)})
+
+
 def queue_wiki_edit(title, wikitext, summary):
     """Coalesce pending writes by title; no network access here."""
     if not wiki_title_is_allowed(title):
         raise PermissionError("Título fora das subpáginas autorizadas")
     if not isinstance(wikitext, str) or not wikitext.strip():
         raise ValueError("Conteúdo wiki vazio")
+    mark_wiki_page_pending(title)
     with WIKI_WRITE_LOCK:
         state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
         if not isinstance(state, dict):
@@ -1653,6 +1688,8 @@ def wiki_edit_page(title, wikitext, summary):
         if create and get_latest_deletion_log(title):
             print("⛔ Página eliminada; recriação automática proibida:", title)
             return False
+        if not wikimedia_authenticated and not wikimedia_login():
+            raise RuntimeError("Falha ao autenticar sessão de escrita Wikimedia")
         token = get_wikimedia_csrf_token()
         payload = {
             "action": "edit", "format": "json", "formatversion": 2,
@@ -1663,6 +1700,14 @@ def wiki_edit_page(title, wikitext, summary):
         response = wikimedia_session.post(WIKIPEDIA_API, data=payload, timeout=35)
         response.raise_for_status()
         data = response.json()
+        error = data.get("error")
+        if isinstance(error, dict) and error.get("code") in {"notloggedin", "assertuserfailed", "badtoken", "invalidcsrf", "assertbotfailed"}:
+            if not wikimedia_login():
+                raise RuntimeError("Sessão wiki expirada e relogin falhou: " + str(error))
+            payload["token"] = get_wikimedia_csrf_token()
+            response = wikimedia_session.post(WIKIPEDIA_API, data=payload, timeout=35)
+            response.raise_for_status()
+            data = response.json()
         if data.get("error"):
             raise RuntimeError("API edit recusou publicação: " + str(data["error"]))
         if data.get("edit", {}).get("result") != "Success":
@@ -1703,10 +1748,13 @@ def process_wiki_write_queue_once():
             if state.get("pending") and state["pending"][0] == item:
                 state["pending"].pop(0)
                 atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+                mark_wiki_page_published(item["title"])
         return success
 
 
 def wiki_write_queue_worker():
+    mark_wiki_page_pending(WIKI_STATUS_TITLE)
+    mark_wiki_page_pending("Usuário:TelesGramBot/Sobre")  # Inventário apenas; sem criação/publicação automática.
     # O agendamento usa relógio persistido: reiniciar não provoca publicação extra.
     while True:
         try:
@@ -2182,11 +2230,15 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
 
 def build_wiki_status_wikitext():
     writing_enabled, queued_edits = wiki_write_status_snapshot()
+    pending_titles = wiki_pending_pages_snapshot()
+    pending_lines = "\n".join("* [[" + title + "]]" for title in pending_titles) or "* Nenhuma página registrada"
     return (
         "== Status do TelesGramBot ==\n"
         f"* Versão: {BOT_VERSION}\n"
         f"* Escrita na Wikipédia: {'habilitada' if writing_enabled else 'pausada/desabilitada'}\n"
         f"* Edições na fila de publicação: {queued_edits}\n"
+        f"* Páginas registradas como necessitando atualização: {len(pending_titles)}\n"
+        f"{pending_lines}\n"
         "* Criação automática de subpáginas autorizadas: habilitada\n"
         "* Intervalo mínimo entre tentativas de escrita: 60 minutos\n"
         "* Atualização programada do status: a cada 6 horas\n\n"
@@ -2213,6 +2265,8 @@ def build_wiki_daily_and_monthly_previews(now=None):
 
     daily_title = WIKI_DAILY_REPORT_PREFIX + day_start.strftime("%Y-%m-%d")
     monthly_title = WIKI_MONTHLY_REPORT_PREFIX + month_start.strftime("%Y-%m")
+    mark_wiki_page_pending(daily_title)
+    mark_wiki_page_pending(monthly_title)
 
     daily_text = build_wiki_community_report(
         day_start.timestamp(),
@@ -2311,7 +2365,7 @@ def announce_new_version_if_needed():
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
         "<b>Novidade desta build</b>\n"
-        "• /status no Telegram e página Status na Wikipédia mostram o estado efetivo da escrita e o número de edições pendentes na fila."
+        "• Recuperação de autenticação para escrita; páginas que precisam de atualização; menção verificável em observações; sensibilidade geral reduzida em 10%."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -2615,6 +2669,7 @@ def load_observed_users():
             "username": username,
             "reason": reason or "",
             "expires_at": expires_at,
+            "observer_mention": item.get("observer_mention"),
         }
 
     with observed_users_lock:
@@ -2631,7 +2686,7 @@ def load_observed_users():
         pass
 
 
-def observe_user(username, reason=None):
+def observe_user(username, reason=None, observer_mention=None):
     expires_at = (
         time.time()
         +
@@ -2647,6 +2702,7 @@ def observe_user(username, reason=None):
             "username": username,
             "reason": reason,
             "expires_at": expires_at,
+            "observer_mention": observer_mention,
         }
 
     try:
@@ -8907,7 +8963,8 @@ def analyze_vandalism(change, diff, revert_risk):
     if promotional_adjustment["bonus"] > 0:
         score += promotional_adjustment["bonus"]
 
-    score = min(max(score, 0.0), 1.0)
+    # Aplicar uma única vez após os redutores existentes; Revert Risk original intacto.
+    score = min(max(score * GENERAL_PRIORITY_FACTOR, 0.0), 1.0)
 
     reasons = []
 
@@ -9156,6 +9213,8 @@ def tracked_queue_item(
 def format_observed_message(change, observation):
     reason = (observation.get("reason") or "").strip()
     reason_line = f"\n📌 Motivo: {html.escape(reason)}\n" if reason else ""
+    mention = observation.get("observer_mention")
+    observer_line = f"\n🔔 Observação solicitada por: {html.escape(mention)}" if mention else ""
     return (
         "👁 Edição de conta observada\n\n"
         f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
@@ -9163,6 +9222,7 @@ def format_observed_message(change, observation):
         f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n"
         f"{reason_line}\n"
         f"{edit_link_html(build_diff_url(change))}"
+        f"{observer_line}"
     )
 
 
@@ -9967,7 +10027,9 @@ def process_telegram_command(message, from_channel=False):
                 f"🕗 Relatório diário: 20:05 (Brasília)\n"
                 f"📝 Escrita na wiki: {'habilitada' if wiki_writing_enabled else 'pausada/desabilitada'}\n"
                 f"📚 Edições na fila wiki: {wiki_queued_edits}\n"
-                f"🔐 Wikimedia: {auth_text}\n"
+                f"📄 Páginas registradas para atualização: {len(wiki_pending_pages_snapshot())}\n"
+                + ("\n".join("• " + html.escape(t) for t in wiki_pending_pages_snapshot()) + "\n" if wiki_pending_pages_snapshot() else "")
+                + f"🔐 Wikimedia: {auth_text}\n"
                 f"✅ Patrulhamento: {patrol_text}\n"
                 f"🔑 Direito patrol: {patrol_right_text}\n"
                 f"🔑 Direito patrolmarks: {patrolmarks_right_text}\n"
@@ -10130,9 +10192,13 @@ def process_telegram_command(message, from_channel=False):
             )
             return
 
+        observation_actor = observation_actor_from_channel_post(message)
+        # Apenas @username verificável permite menção; assinatura textual não é identidade autenticada.
+        observer_mention = observation_actor if observation_actor and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", observation_actor) else None
         if observe_user(
             canonical_username,
-            reason
+            reason,
+            observer_mention=observer_mention,
         ):
             observation_actor = observation_actor_from_channel_post(message)
             observation_actor_line = (
