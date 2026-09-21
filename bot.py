@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.43"
-BOT_BUILD = "2.43-wiki-writing-hourly-status-six-hours"
+BOT_BUILD = "2.43-wiki-writing-fix-page-exists-request"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1557,9 +1557,13 @@ def get_wikimedia_csrf_token():
 
 
 def wiki_page_exists(title):
-    data = wikimedia_authenticated_request({"action":"query","format":"json","formatversion":2,"titles":title})
+    _response, data = wikimedia_api_get({"action":"query","format":"json","formatversion":2,"titles":title})
+    if data.get("error"):
+        raise RuntimeError("Falha ao consultar existência da página: " + str(data["error"]))
     pages = ((data or {}).get("query") or {}).get("pages") or []
-    return bool(pages and not pages[0].get("missing"))
+    if not pages:
+        raise RuntimeError("Resposta da API sem dados da página; criação bloqueada por segurança")
+    return not bool(pages[0].get("missing"))
 
 
 def wiki_report_creation_allowed(title):
