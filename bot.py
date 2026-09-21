@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.43"
-BOT_BUILD = "2.43-wiki-writing-fix-page-exists-request"
+BOT_BUILD = "2.43-wiki-pause-resume-controls"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -135,6 +135,7 @@ WIKI_CREATE_ENABLED = True
 WIKI_WRITE_INTERVAL_SECONDS = 60 * 60
 WIKI_STATUS_INTERVAL_SECONDS = 6 * 60 * 60
 WIKI_WRITE_QUEUE_FILE = "/data/wiki_write_queue.json"
+WIKI_WRITE_CONTROL_FILE = "/data/wiki_write_control.json"
 WIKI_WRITE_LOCK = threading.RLock()
 
 # Relatórios que serão usados quando a publicação for futuramente ativada.
@@ -1521,6 +1522,23 @@ def get_patroller_username(title, revision_id):
     return None
 
 
+def wiki_writing_paused():
+    """Persisted operator override; fail closed if control file is unreadable."""
+    try:
+        state = load_json(WIKI_WRITE_CONTROL_FILE, {"paused": False})
+        if not isinstance(state, dict):
+            return True
+        return bool(state.get("paused", False))
+    except Exception as exc:
+        print("⚠️ Não foi possível ler controle da escrita wiki:", safe_exception(exc))
+        return True
+
+
+def set_wiki_writing_paused(paused):
+    with WIKI_WRITE_LOCK:
+        atomic_write_json(WIKI_WRITE_CONTROL_FILE, {"paused": bool(paused)})
+
+
 def wiki_title_is_allowed(title):
     return (
         isinstance(title, str)
@@ -1606,13 +1624,13 @@ def queue_wiki_edit(title, wikitext, summary):
 
 def wiki_edit_page(title, wikitext, summary):
     """Single guarded write entry point, called only by the queue worker."""
-    if not WIKI_WRITE_ENABLED:
+    if not WIKI_WRITE_ENABLED or wiki_writing_paused():
         return False
     if not wiki_title_is_allowed(title):
         raise PermissionError("Título wiki não autorizado")
     with WIKI_WRITE_LOCK:
         state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
-        if time.time() - float(state.get("last_attempt") or 0) < WIKI_WRITE_INTERVAL_SECONDS:
+        if wiki_writing_paused() or time.time() - float(state.get("last_attempt") or 0) < WIKI_WRITE_INTERVAL_SECONDS:
             return False
         # Reserve the slot BEFORE any remote operation; crashes cannot cause a burst.
         state["last_attempt"] = time.time()
@@ -1644,12 +1662,12 @@ def wiki_edit_page(title, wikitext, summary):
 
 
 def process_wiki_write_queue_once():
-    if not WIKI_WRITE_ENABLED:
+    if not WIKI_WRITE_ENABLED or wiki_writing_paused():
         return False
     with WIKI_WRITE_LOCK:
         state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
         pending = state.get("pending", [])
-        if not pending or time.time() - float(state.get("last_attempt") or 0) < WIKI_WRITE_INTERVAL_SECONDS:
+        if wiki_writing_paused() or not pending or time.time() - float(state.get("last_attempt") or 0) < WIKI_WRITE_INTERVAL_SECONDS:
             return False
         item = pending[0]
         try:
@@ -1685,7 +1703,7 @@ def wiki_write_queue_worker():
         try:
             state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
             last_status = float(state.get("last_status_enqueued") or 0)
-            if WIKI_WRITE_ENABLED and time.time() - last_status >= WIKI_STATUS_INTERVAL_SECONDS:
+            if WIKI_WRITE_ENABLED and not wiki_writing_paused() and time.time() - last_status >= WIKI_STATUS_INTERVAL_SECONDS:
                 queue_wiki_edit(
                     WIKI_STATUS_TITLE,
                     build_wiki_status_wikitext(),
@@ -2282,8 +2300,7 @@ def announce_new_version_if_needed():
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
         "<b>Novidade desta build</b>\n"
-        "• Escrita wiki habilitada exclusivamente nas subpáginas autorizadas; criação de status e relatórios permitida.\n"
-        "• No máximo uma tentativa por hora; status agendado a cada seis horas e aviso da primeira falha."
+        "• Comandos /pausarwiki e /reiniciarwiki para controlar a escrita com estado persistente, sem perder fila ou limite horário."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -9385,7 +9402,9 @@ def commands_message():
         "🏷 /falsospositivos — lista os falsos positivos aguardando ajuste; não exige ID.\n"
         "🔎 /falsonegativo ID ou LINK — registra uma revisão que o detector deixou passar.\n"
         "🧪 /falsosnegativos — mostra a base de calibração de falsos negativos.\n"
-        "📡 /status — mostra o estado do bot.\n\n"
+        "📡 /status — mostra o estado do bot.\n"
+        "⏸ /pausarwiki — suspende a escrita na Wikipédia.\n"
+        "▶️ /reiniciarwiki — retoma a escrita respeitando o limite horário.\n\n"
         "👁 Vigilância de páginas\n"
         "👁 /vigiar Página — vigia uma página permanentemente.\n"
         "🙈 /desvigiar Página — encerra a vigilância.\n"
@@ -9526,6 +9545,8 @@ def process_telegram_command(message, from_channel=False):
         "/resolverfalso",
         "/falsonegativo",
         "/resolverfalsonegativo",
+        "/pausarwiki",
+        "/reiniciarwiki",
     }
 
     if command in mutating_commands and (
@@ -9535,6 +9556,20 @@ def process_telegram_command(message, from_channel=False):
             "⚠️ Este comando administrativo deve ser publicado diretamente no canal configurado.",
             chat_id=chat_id,
         )
+        return
+
+    if command in ("/pausarwiki", "/reiniciarwiki"):
+        try:
+            pause = command == "/pausarwiki"
+            set_wiki_writing_paused(pause)
+            send_telegram_message(
+                "⏸ Escrita na Wikipédia pausada por tempo indeterminado. A fila foi preservada."
+                if pause else
+                "▶️ Escrita na Wikipédia retomada. Fila e limite de uma tentativa por hora preservados.",
+                chat_id=chat_id,
+            )
+        except Exception as exc:
+            send_telegram_message("❌ Não foi possível alterar escrita wiki: " + safe_exception(exc), chat_id=chat_id)
         return
 
     if command == "/start":
