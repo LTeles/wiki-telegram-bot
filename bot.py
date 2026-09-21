@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.43"
-BOT_BUILD = "2.43-wiki-pause-resume-controls"
+BOT_BUILD = "2.43-wiki-write-status-queue"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1539,6 +1539,15 @@ def set_wiki_writing_paused(paused):
         atomic_write_json(WIKI_WRITE_CONTROL_FILE, {"paused": bool(paused)})
 
 
+def wiki_write_status_snapshot():
+    """Read effective writing state and pending edit count from persistent state."""
+    with WIKI_WRITE_LOCK:
+        paused = wiki_writing_paused()
+        state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+        pending = state.get("pending", []) if isinstance(state, dict) else []
+        return (bool(WIKI_WRITE_ENABLED and not paused), len(pending) if isinstance(pending, list) else 0)
+
+
 def wiki_title_is_allowed(title):
     return (
         isinstance(title, str)
@@ -2172,10 +2181,12 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
 
 
 def build_wiki_status_wikitext():
+    writing_enabled, queued_edits = wiki_write_status_snapshot()
     return (
         "== Status do TelesGramBot ==\n"
         f"* Versão: {BOT_VERSION}\n"
-        f"* Escrita na Wikipédia: {'habilitada' if WIKI_WRITE_ENABLED else 'desabilitada'}\n"
+        f"* Escrita na Wikipédia: {'habilitada' if writing_enabled else 'pausada/desabilitada'}\n"
+        f"* Edições na fila de publicação: {queued_edits}\n"
         "* Criação automática de subpáginas autorizadas: habilitada\n"
         "* Intervalo mínimo entre tentativas de escrita: 60 minutos\n"
         "* Atualização programada do status: a cada 6 horas\n\n"
@@ -2300,7 +2311,7 @@ def announce_new_version_if_needed():
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
         "<b>Novidade desta build</b>\n"
-        "• Comandos /pausarwiki e /reiniciarwiki para controlar a escrita com estado persistente, sem perder fila ou limite horário."
+        "• /status no Telegram e página Status na Wikipédia mostram o estado efetivo da escrita e o número de edições pendentes na fila."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -9917,6 +9928,8 @@ def process_telegram_command(message, from_channel=False):
             "🔴 reconectando"
         )
 
+        wiki_writing_enabled, wiki_queued_edits = wiki_write_status_snapshot()
+
         send_telegram_message(
             (
                 "🤖 Status do bot\n\n"
@@ -9952,6 +9965,8 @@ def process_telegram_command(message, from_channel=False):
                 f"📊 Registros estatísticos (90d): "
                 f"{stats_count}\n"
                 f"🕗 Relatório diário: 20:05 (Brasília)\n"
+                f"📝 Escrita na wiki: {'habilitada' if wiki_writing_enabled else 'pausada/desabilitada'}\n"
+                f"📚 Edições na fila wiki: {wiki_queued_edits}\n"
                 f"🔐 Wikimedia: {auth_text}\n"
                 f"✅ Patrulhamento: {patrol_text}\n"
                 f"🔑 Direito patrol: {patrol_right_text}\n"
