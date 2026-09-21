@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # =========================================================
 
 BOT_VERSION = "2.43"
-BOT_BUILD = "2.43-contextual-calibration-user-talk-help"
+BOT_BUILD = "2.43-wiki-writing-hourly-status-six-hours"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -125,14 +125,15 @@ requests.sessions.Session.request = _wiki_controlled_request
 
 # Trava deliberadamente hardcoded. Nesta versão não existe variável de
 # ambiente capaz de habilitar escrita por acidente.
-WIKI_WRITE_ENABLED = False
+WIKI_WRITE_ENABLED = True
 
 # Regra de segurança solicitada: mesmo quando a escrita for liberada numa
 # versão futura, o bot somente poderá editar títulos iniciados exatamente por:
 WIKI_ALLOWED_TITLE_PREFIX = "Usuário:TelesGramBot/"
 WIKI_STATUS_TITLE = "Usuário:TelesGramBot/Status"
-WIKI_CREATE_ENABLED = False
-WIKI_WRITE_INTERVAL_SECONDS = 61 * 60
+WIKI_CREATE_ENABLED = True
+WIKI_WRITE_INTERVAL_SECONDS = 60 * 60
+WIKI_STATUS_INTERVAL_SECONDS = 6 * 60 * 60
 WIKI_WRITE_QUEUE_FILE = "/data/wiki_write_queue.json"
 WIKI_WRITE_LOCK = threading.RLock()
 
@@ -1614,7 +1615,7 @@ def wiki_edit_page(title, wikitext, summary):
         atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
         exists = wiki_page_exists(title)
         create = not exists
-        if create and not (WIKI_CREATE_ENABLED and wiki_report_creation_allowed(title)):
+        if create and not (WIKI_CREATE_ENABLED and (title == WIKI_STATUS_TITLE or wiki_report_creation_allowed(title))):
             print("📄 Página ausente; criação bloqueada:", title)
             return False
         # A deletion log is a hard stop for any attempt to recreate a page.
@@ -1633,7 +1634,9 @@ def wiki_edit_page(title, wikitext, summary):
         data = response.json()
         if data.get("error"):
             raise RuntimeError("API edit recusou publicação: " + str(data["error"]))
-        return data.get("edit", {}).get("result") == "Success"
+        if data.get("edit", {}).get("result") != "Success":
+            raise RuntimeError("API edit não confirmou sucesso: " + str(data.get("edit")))
+        return True
 
 
 def process_wiki_write_queue_once():
@@ -1649,8 +1652,21 @@ def process_wiki_write_queue_once():
             success = wiki_edit_page(item["title"], item["text"], item["summary"])
         except Exception as exc:
             print("⚠️ Falha na escrita wiki:", safe_exception(exc))
+            # Notificação única da primeira falha, persistente entre reinícios.
+            if not state.get("first_error_notified"):
+                state = load_json(WIKI_WRITE_QUEUE_FILE, state)
+                if not state.get("first_error_notified"):
+                    state["first_error_notified"] = True
+                    atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+                    send_telegram_message(
+                        "⚠️ Primeira falha na publicação wiki: "
+                        + html.escape(str(item.get("title", "")))
+                        + " — " + html.escape(safe_exception(exc)),
+                        parse_mode="HTML",
+                    )
             return False
         if success:
+            print("✅ Publicação wiki confirmada:", item["title"])
             state = load_json(WIKI_WRITE_QUEUE_FILE, state)
             # Never remove a newer, coalesced update of the same page.
             if state.get("pending") and state["pending"][0] == item:
@@ -1660,9 +1676,25 @@ def process_wiki_write_queue_once():
 
 
 def wiki_write_queue_worker():
+    # O agendamento usa relógio persistido: reiniciar não provoca publicação extra.
     while True:
+        try:
+            state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+            last_status = float(state.get("last_status_enqueued") or 0)
+            if WIKI_WRITE_ENABLED and time.time() - last_status >= WIKI_STATUS_INTERVAL_SECONDS:
+                queue_wiki_edit(
+                    WIKI_STATUS_TITLE,
+                    build_wiki_status_wikitext(),
+                    "Atualizando status periódico do TelesGramBot",
+                )
+                with WIKI_WRITE_LOCK:
+                    state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+                    state["last_status_enqueued"] = time.time()
+                    atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+            process_wiki_write_queue_once()
+        except Exception as exc:
+            print("⚠️ Falha no agendador de escrita wiki:", safe_exception(exc))
         time.sleep(30)
-        process_wiki_write_queue_once()
 
 
 def community_events_between(start_ts, end_ts):
@@ -2122,9 +2154,11 @@ def build_wiki_status_wikitext():
         "== Status do TelesGramBot ==\n"
         f"* Versão: {BOT_VERSION}\n"
         f"* Escrita na Wikipédia: {'habilitada' if WIKI_WRITE_ENABLED else 'desabilitada'}\n"
-        "* Criação automática de páginas: proibida\n\n"
+        "* Criação automática de subpáginas autorizadas: habilitada\n"
+        "* Intervalo mínimo entre tentativas de escrita: 60 minutos\n"
+        "* Atualização programada do status: a cada 6 horas\n\n"
         "=== Projetos e dependências ===\n"
-        "* Projetos impedidos por páginas inexistentes devem indicar aqui a página que precisa ser criada manualmente.\n"
+        "* Criação limitada ao status e aos relatórios diários e mensais previstos.\n"
     )
 
 
@@ -2244,8 +2278,8 @@ def announce_new_version_if_needed():
         f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
         f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
         "<b>Novidade desta build</b>\n"
-        "• Calibração contextual: correções triviais em páginas de usuário, comentários assinados e pedidos de ajuda comunitários.\n"
-        "• Redutores não são acumulados; escrita na Wikipédia permanece desativada."
+        "• Escrita wiki habilitada exclusivamente nas subpáginas autorizadas; criação de status e relatórios permitida.\n"
+        "• No máximo uma tentativa por hora; status agendado a cada seis horas e aviso da primeira falha."
     )
 
     sent = send_telegram_message(message, parse_mode="HTML")
@@ -11721,7 +11755,7 @@ def main():
         "com confirmação de páginas eliminadas"
     )
     print(
-        "📝 Relatórios wiki: coleta ativa, escrita DESATIVADA"
+        "📝 Relatórios wiki: escrita habilitada com limite de 60 minutos"
     )
     print(
         "🔒 Prefixo permitido para futura escrita:",
