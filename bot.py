@@ -9,6 +9,7 @@ import unicodedata
 import html
 import ipaddress
 import secrets
+import math
 
 from datetime import datetime, timezone, timedelta
 from statistics import median
@@ -24,8 +25,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.48"
-BOT_BUILD = "2.48-testwiki-diff-preview"
+BOT_VERSION = "2.49"
+BOT_BUILD = "2.49-testwiki-reviewed-patterns"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2239,8 +2240,8 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         "* Nível de checagem: percentual dos alertas elegíveis que receberam reversão por terceiro, patrulhamento, eliminação ou resolução manual sem ação necessária.",
         "* Patrulhamento: desfecho próprio e separado, indicando que a edição foi marcada como patrulhada na Wikipédia.",
         "* Resolução sem ação necessária: confirmação manual por administrador do canal de que a edição foi vista e não exige intervenção; não é tratada como patrulhamento.",
-        "* Falso positivo: alerta retirado da fila operacional por um administrador por não representar vandalismo e enviado à fila de melhoria do detector.",
-        "* Ajuste concluído: confirmação administrativa de que o caso de falso positivo já foi tratado no código/regras do bot; isso não implica retreinamento automático do modelo.",
+        "* Falso positivo: edição marcada por administrador como sem vandalismo; o diff entra como exemplo dessa classe no arquivo de padrões.",
+        "* Padrões de IA: revertidas/eliminadas são exemplos de vandalismo; patrulhadas/falsos positivos são exemplos sem vandalismo. A semelhança é informativa e não altera o risco nem as regras do detector.",
         "* Faixas de checagem: muito alto ≥85%; alto 70–84%; moderado 50–69%; baixo 30–49%; muito baixo <30%.",
         "* Capacidade observada: folga quando ≥85% e backlog muito pequeno; adequada ≥70%; pressionada 50–69%; sobrecarregada <50%.",
         "* Autorreversões são retiradas da demanda comunitária e não melhoram artificialmente o índice.",
@@ -2342,6 +2343,7 @@ def build_wiki_observations_wikitext():
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
+    "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -12344,13 +12346,220 @@ def high_risk_diff_excerpt(record, limit=360):
             + reasons_line + "</div>")
 
 
+HIGH_RISK_PATTERN_MIN_PER_CLASS = 3
+HIGH_RISK_PATTERN_MAX_SAMPLES_PER_CLASS = 300
+HIGH_RISK_PATTERN_MIN_MATCH = 0.03
+HIGH_RISK_PATTERN_MIN_MARGIN = 0.01
+
+HIGH_RISK_PATTERN_STOPWORDS = frozenset((
+    "a", "as", "o", "os", "um", "uma", "uns", "umas", "de", "da",
+    "do", "das", "dos", "em", "no", "na", "nos", "nas", "por", "para",
+    "com", "sem", "sob", "sobre", "entre", "que", "quem", "qual", "quais",
+    "como", "quando", "onde", "mais", "menos", "muito", "muita", "muitos",
+    "muitas", "ser", "estar", "foi", "foram", "era", "sao", "seu", "sua",
+    "seus", "suas", "ele", "ela", "eles", "elas", "isso", "isto", "aquele",
+    "aquela", "the", "and", "for", "with", "from", "that", "this", "was",
+    "were", "are", "but", "not", "you", "your", "have", "has", "had",
+))
+
+
+def high_risk_pattern_label(status):
+    """Usa somente as categorias de desfecho definidas para a página."""
+    if status in ("reverted", "deleted"):
+        return "vandalismo"
+    if status in ("patrolled", "false_positive"):
+        return "sem_vandalismo"
+    return None
+
+
+def high_risk_pattern_features(record):
+    """Extrai palavras, pares de palavras e formas simples do diff."""
+    added = str(record.get("diff_added") or "")[:MAX_DIFF_CHARS]
+    removed = str(record.get("diff_removed") or "")[:MAX_DIFF_CHARS]
+    features = set()
+
+    def normalized_words(text):
+        normalized = unicodedata.normalize("NFKC", text).casefold()
+        words = re.findall(r"[^\W_]{3,}", normalized, flags=re.UNICODE)
+        result = []
+        for word in words:
+            folded = unicodedata.normalize("NFKD", word)
+            word = "".join(ch for ch in folded if not unicodedata.combining(ch))
+            if len(word) >= 3 and word not in HIGH_RISK_PATTERN_STOPWORDS:
+                result.append(word)
+        return result[:180]
+
+    for side, text in (("add", added), ("remove", removed)):
+        words = normalized_words(text)
+        for word in set(words):
+            features.add(f"{side}:word:{word}")
+        for first, second in zip(words, words[1:]):
+            if first != second:
+                features.add(f"{side}:pair:{first}_{second}")
+
+        char_count = len(text.strip())
+        if char_count:
+            size = "short" if char_count < 80 else "medium" if char_count < 500 else "long"
+            features.add(f"{side}:size:{size}")
+            if re.search(r"https?://|www\.", text, flags=re.IGNORECASE):
+                features.add(f"{side}:has_url")
+            if re.search(r"<ref\b|\{\{\s*(?:citar|cite)", text, flags=re.IGNORECASE):
+                features.add(f"{side}:has_reference")
+            if re.search(r"\[\[Categoria:", text, flags=re.IGNORECASE):
+                features.add(f"{side}:has_category")
+
+    if len(removed.strip()) > max(300, len(added.strip()) * 3):
+        features.add("shape:large_removal")
+    if not added.strip() and removed.strip():
+        features.add("shape:blanking")
+    if added.count("!") >= 4:
+        features.add("shape:many_exclamation_marks")
+    if re.search(r"(.)\1{5,}", added, flags=re.DOTALL):
+        features.add("shape:repeated_character_run")
+    return features
+
+
+def train_high_risk_pattern_model():
+    """Aprende apenas de diffs arquivados com um dos quatro rótulos definidos."""
+    with high_risk_archive_lock:
+        records = [dict(item) for item in high_risk_archive.values()]
+
+    by_label = {"vandalismo": [], "sem_vandalismo": []}
+    for record in records:
+        label = high_risk_pattern_label(record.get("status"))
+        if not label:
+            continue
+        features = high_risk_pattern_features(record)
+        if not features:
+            continue
+        try:
+            timestamp = float(
+                record.get("reverted_at")
+                or record.get("deleted_at")
+                or record.get("patrolled_at")
+                or record.get("false_positive_at")
+                or record.get("posted_at")
+                or 0
+            )
+        except (TypeError, ValueError):
+            timestamp = 0.0
+        by_label[label].append((timestamp, features))
+
+    samples = {}
+    for label, items in by_label.items():
+        items.sort(key=lambda item: item[0], reverse=True)
+        samples[label] = [
+            features for _, features in items[:HIGH_RISK_PATTERN_MAX_SAMPLES_PER_CLASS]
+        ]
+
+    document_frequency = Counter()
+    total_documents = sum(len(items) for items in samples.values())
+    for items in samples.values():
+        for features in items:
+            document_frequency.update(features)
+
+    inverse_document_frequency = {
+        feature: math.log((total_documents + 1) / (frequency + 1)) + 1.0
+        for feature, frequency in document_frequency.items()
+    }
+    return {
+        "samples": samples,
+        "counts": {label: len(items) for label, items in samples.items()},
+        "idf": inverse_document_frequency,
+        "ready": all(
+            len(samples[label]) >= HIGH_RISK_PATTERN_MIN_PER_CLASS
+            for label in ("vandalismo", "sem_vandalismo")
+        ),
+    }
+
+
+def high_risk_pattern_similarity(left, right, idf):
+    union = left | right
+    if not union:
+        return 0.0
+    union_weight = sum(idf.get(feature, 1.0) for feature in union)
+    if union_weight <= 0:
+        return 0.0
+    shared_weight = sum(idf.get(feature, 1.0) for feature in left & right)
+    return shared_weight / union_weight
+
+
+def classify_high_risk_pattern(record, model):
+    features = high_risk_pattern_features(record)
+    counts = model.get("counts", {})
+    result = {
+        "label": None,
+        "vandalismo_similarity": 0.0,
+        "sem_vandalismo_similarity": 0.0,
+        "counts": counts,
+        "ready": bool(model.get("ready")),
+    }
+    if not model.get("ready") or not features:
+        return result
+
+    idf = model.get("idf", {})
+    for label in ("vandalismo", "sem_vandalismo"):
+        similarities = sorted(
+            (
+                high_risk_pattern_similarity(features, sample, idf)
+                for sample in model.get("samples", {}).get(label, [])
+            ),
+            reverse=True,
+        )
+        if similarities:
+            # A média dos três exemplos mais próximos limita o peso de um caso único.
+            result[label + "_similarity"] = (
+                sum(similarities[:3]) / min(3, len(similarities))
+            )
+
+    vandalismo = result["vandalismo_similarity"]
+    sem_vandalismo = result["sem_vandalismo_similarity"]
+    if (
+        max(vandalismo, sem_vandalismo) >= HIGH_RISK_PATTERN_MIN_MATCH
+        and abs(vandalismo - sem_vandalismo) >= HIGH_RISK_PATTERN_MIN_MARGIN
+    ):
+        result["label"] = "vandalismo" if vandalismo > sem_vandalismo else "sem_vandalismo"
+    return result
+
+
+def high_risk_pattern_annotation(record, model):
+    label = high_risk_pattern_label(record.get("status"))
+    if label:
+        label_text = "vandalismo" if label == "vandalismo" else "sem vandalismo"
+        return (
+            "<small>'''Rótulo registrado para aprendizagem:''' "
+            + label_text + "</small>"
+        )
+
+    if high_risk_action(record)[0] is not None:
+        return ""
+
+    result = classify_high_risk_pattern(record, model)
+    if not result["ready"]:
+        return ""
+
+    vandalismo = result["vandalismo_similarity"]
+    sem_vandalismo = result["sem_vandalismo_similarity"]
+    if result["label"] == "vandalismo":
+        assessment = "mais próximo de padrões rotulados como vandalismo"
+    elif result["label"] == "sem_vandalismo":
+        assessment = "mais próximo de padrões rotulados sem vandalismo"
+    else:
+        assessment = "sem correspondência clara entre as classes"
+    return (
+        "<small>'''Padrão IA (sem alterar o risco):''' "
+        + assessment
+        + f" · vandalismo {vandalismo:.0%}, sem vandalismo {sem_vandalismo:.0%}</small>"
+    )
+
+
 def high_risk_background(record):
     if high_risk_action(record)[0] is not None:
         return "#cfe2ff"  # Revista: azul tem prioridade.
     return "#f8d7da" if float(record.get("revert_risk") or 0) > 0.95 else "#fff3cd"
 
 
-def build_high_risk_edit_line(record):
+def build_high_risk_edit_line(record, pattern_model=None):
     revision_id = int(record["revision_id"])
     username = str(record.get("username") or "Desconhecido")
     title = str(record.get("title") or "Sem título")
@@ -12377,12 +12586,15 @@ def build_high_risk_edit_line(record):
         status_text = f"{action} por {high_risk_account_link(actor)}" if actor else action
     else:
         status_text = "Pendente de revisão"
+    pattern_line = high_risk_pattern_annotation(record, pattern_model or {})
     background = high_risk_background(record)
     return (
         f'<div style="background:{background}; border:1px solid #a2a9b1; '
         f'padding:0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
         f"{first_line}<br>{second_line}<br>"
-        f"<small>'''Estado:''' {status_text}</small></div>"
+        f"<small>'''Estado:''' {status_text}</small>"
+        + ("<br>" + pattern_line if pattern_line else "")
+        + "</div>"
     )
 
 
@@ -12417,6 +12629,8 @@ def high_risk_header_transclusion():
 
 def build_high_risk_page(records, heading, introduction):
     eligible = select_high_risk_records(records)
+    pattern_model = train_high_risk_pattern_model()
+    pattern_counts = pattern_model.get("counts", {})
     lines = [
         "__NOINDEX__",
         high_risk_header_transclusion(),
@@ -12425,10 +12639,30 @@ def build_high_risk_page(records, heading, introduction):
         "",
         "Amarelo: pendente (85–95%); vermelho: pendente (acima de 95%); "
         "azul: edição revista.",
+        "Treino de padrões: revertida/eliminada = vandalismo; patrulhada/falso positivo = sem vandalismo. "
+        "Autorrevertidas e outros estados ficam fora do treino.",
+        "A semelhança de padrões é informativa; não altera o risco calculado nem confirma sozinha o caso.",
         "",
     ]
+    if pattern_model.get("ready"):
+        lines.append(
+            "''Base de padrões: "
+            f"{pattern_counts.get('vandalismo', 0)} exemplos de vandalismo e "
+            f"{pattern_counts.get('sem_vandalismo', 0)} exemplos sem vandalismo.''"
+        )
+    else:
+        lines.append(
+            "''Aprendizagem em fase inicial: "
+            f"{pattern_counts.get('vandalismo', 0)} exemplos de vandalismo e "
+            f"{pattern_counts.get('sem_vandalismo', 0)} sem vandalismo; "
+            f"mínimo de {HIGH_RISK_PATTERN_MIN_PER_CLASS} por classe para exibir semelhanças.''"
+        )
+    lines.append("")
     if eligible:
-        lines.extend(build_high_risk_edit_line(record) for record in eligible)
+        lines.extend(
+            build_high_risk_edit_line(record, pattern_model)
+            for record in eligible
+        )
     else:
         lines.append("''Não há edições que atendam ao limiar neste momento.''")
     return "\n".join(lines) + "\n"
