@@ -25,8 +25,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.52"
-BOT_BUILD = "2.52-independent-wiki-pause-controls"
+BOT_VERSION = "2.54"
+BOT_BUILD = "2.54-biography-children-contextual-additions"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2347,6 +2347,8 @@ WIKI_RELEASE_NOTES = {
     "2.50": "Calibração de traduções equivalentes de datas em referências e mudanças exclusivamente de espaços/linhas vazias.",
     "2.51": "Calibração de inclusão isolada de wikilinks e remoção de referências conforme justificativa; correção das notas de versão e atualização do anúncio no Telegram.",
     "2.52": "Controles independentes de pausa e retomada da escrita na Wikipédia em português e na Test Wikipedia, com estado persistente e filas preservadas.",
+    "2.53": "Correção do anúncio de versão no Telegram: confirmação de entrega, recuperação de estado incompleto e novas tentativas automáticas após falhas.",
+    "2.54": "Calibração de alterações isoladas no número de filhos (+1 com cautela; saltos maiores suspeitos) e acréscimos curtos de prosa contextual, sem validar automaticamente fatos.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -2651,42 +2653,68 @@ def save_bot_version(version, build=None):
     print("💾 Versão/build registrada:", version, build or version)
 
 
+_version_announcement_lock = threading.Lock()
+
+
 def announce_new_version_if_needed():
-    """Atualiza o anúncio anterior; só registra versão após sucesso no Telegram."""
-    state = load_json(BOT_VERSION_FILE, {})
-    if not isinstance(state, dict):
-        state = {}
-    if load_saved_bot_version() == BOT_BUILD:
-        print("ℹ️ Versão já anunciada. Nenhuma mensagem enviada.")
-        return
-    notes = WIKI_RELEASE_NOTES.get(BOT_VERSION, "Alterações desta versão não registradas.")
-    message = (
-        f"🤖 <b>TelesGramBot {html.escape(BOT_VERSION)}</b>\n"
-        f"🔧 Build: <code>{html.escape(BOT_BUILD)}</code>\n\n"
-        f"<b>Novidades desta versão</b>\n• {html.escape(notes)}"
-    )
-    previous_id = state.get("announcement_message_id")
-    updated = False
-    if previous_id:
-        try:
-            updated = edit_telegram_message(int(previous_id), message, parse_mode="HTML")
-        except (TypeError, ValueError) as exc:
-            print("⚠️ ID do anúncio anterior inválido:", safe_exception(exc))
-    if updated:
-        message_id = int(previous_id)
-    else:
-        sent = send_telegram_message(message, parse_mode="HTML")
-        if not sent or not sent.get("message_id"):
-            print("⚠️ Não foi possível atualizar ou publicar o anúncio da versão.")
-            return
-        message_id = int(sent["message_id"])
+    """Publica/edita anúncio; registra build apenas após confirmação da API."""
+    if not _version_announcement_lock.acquire(blocking=False):
+        print("ℹ️ Anúncio de versão já em andamento; tentativa simultânea ignorada.")
+        return False
+    try:
+        state = load_json(BOT_VERSION_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        previous_id = state.get("announcement_message_id")
+        # Uma build sem ID confirmado é estado incompleto, não anúncio entregue.
+        if load_saved_bot_version() == BOT_BUILD and previous_id:
+            print("ℹ️ Anúncio desta build já confirmado; ID:", previous_id)
+            return True
+        notes = WIKI_RELEASE_NOTES.get(BOT_VERSION, "Alterações desta versão não registradas.")
+        message = (
+            f"🤖 <b>TelesGramBot {html.escape(BOT_VERSION)}</b>\n"
+            f"🔧 Build: <code>{html.escape(BOT_BUILD)}</code>\n\n"
+            f"<b>Novidades desta versão</b>\n• {html.escape(notes)}"
+        )
+        message_id = None
         if previous_id:
-            print("⚠️ Edição do anúncio anterior falhou; novo anúncio publicado:", message_id)
-    state.update({"version": BOT_VERSION, "build": BOT_BUILD,
-                  "updated_at": datetime.now(timezone.utc).isoformat(),
-                  "announcement_message_id": message_id})
-    atomic_write_json(BOT_VERSION_FILE, state)
-    print("✅ Anúncio da versão atualizado e ID persistido:", message_id)
+            try:
+                if edit_telegram_message(int(previous_id), message, parse_mode="HTML"):
+                    message_id = int(previous_id)
+                    print("✅ Anúncio anterior editado:", message_id)
+            except (TypeError, ValueError) as exc:
+                print("⚠️ ID do anúncio anterior inválido:", safe_exception(exc))
+        if message_id is None:
+            sent = send_telegram_message(message, parse_mode="HTML")
+            if not isinstance(sent, dict) or not sent.get("message_id"):
+                print("⚠️ Anúncio não confirmado pelo Telegram; nova tentativa em 5 minutos.")
+                return False
+            message_id = int(sent["message_id"])
+            print("✅ Novo anúncio publicado:", message_id)
+        # Preserva outros campos do estado e só confirma após resposta da API.
+        state.update({"version": BOT_VERSION, "build": BOT_BUILD,
+                      "updated_at": datetime.now(timezone.utc).isoformat(),
+                      "announcement_message_id": message_id})
+        try:
+            atomic_write_json(BOT_VERSION_FILE, state)
+        except Exception as exc:
+            print("⚠️ Anúncio entregue, mas estado não persistido; pode ser repetido após reinício:", safe_exception(exc))
+            return False
+        print("✅ Anúncio da versão confirmado e ID persistido:", message_id)
+        return True
+    finally:
+        _version_announcement_lock.release()
+
+
+def version_announcement_worker():
+    """Recupera falhas transitórias sem bloquear EventStreams ou outros workers."""
+    while True:
+        try:
+            if announce_new_version_if_needed():
+                return
+        except Exception as exc:
+            print("⚠️ Falha inesperada no anúncio da versão; nova tentativa em 5 minutos:", safe_exception(exc))
+        time.sleep(300)
 
 
 # =========================================================
@@ -9099,6 +9127,66 @@ def minimal_text_priority_adjustment(diff):
     return {"factor": 0.85, "reason": "alteração lexical mínima; conferir contexto factual"}
 
 
+def children_count_priority_adjustment(change, diff):
+    """Avalia apenas uma troca isolada no parâmetro numérico |filhos da infocaixa."""
+    if change.get("type") == "new":
+        return None
+    old = "\n".join(normalized_diff_lines(diff.get("removed", "")))
+    new = "\n".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > 600:
+        return None
+    pattern = r"(?im)(?P<prefix>^\s*\|\s*filhos\s*=\s*)(?P<number>\d{1,2})(?P<suffix>\s*$)"
+    before = list(re.finditer(pattern, old))
+    after = list(re.finditer(pattern, new))
+    if len(before) != 1 or len(after) != 1:
+        return None
+    a, b = before[0], after[0]
+    # A única mudança admissível é o valor numérico; outras linhas intactas.
+    if old[:a.start("number")] != new[:b.start("number")]:
+        return None
+    if old[a.end("number"):] != new[b.end("number") :]:
+        return None
+    delta = int(b.group("number")) - int(a.group("number"))
+    if delta == 1:
+        return {"factor": 0.80, "reason": "acréscimo isolado de um filho na infocaixa; informação não verificada"}
+    if delta > 1:
+        return {"bonus": min(0.12, 0.04 + 0.02 * (delta - 1)),
+                "reason": "aumento de vários filhos na infocaixa; verificar informação biográfica"}
+    return None
+
+
+def contextual_prose_addition_adjustment(change, diff):
+    """Redução modesta para uma inserção curta em prosa, sem supor veracidade."""
+    import difflib
+    if change.get("type") == "new":
+        return None
+    old = "\n".join(normalized_diff_lines(diff.get("removed", "")))
+    new = "\n".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or len(old) < 70 or max(len(old), len(new)) > MAX_DIFF_CHARS:
+        return None
+    if re.search(r"<ref\b|\{\{|\[\[|https?://|www\.", old + new, re.I):
+        return None
+    edits = [(tag, i, j, k, l) for tag, i, j, k, l in
+             difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+             if tag != "equal"]
+    if len(edits) != 1 or edits[0][0] != "insert":
+        return None
+    _, i, j, k, l = edits[0]
+    addition = new[k:l]
+    if not 8 <= len(addition.strip()) <= 90 or len(addition.split()) > 16:
+        return None
+    # Exige prosa dentro de uma frase, não acréscimo de seção ou conteúdo isolado.
+    if i < 20 or i > len(old) - 15 or not old[i - 1].isalnum() and old[i - 1] not in ' ,;:':
+        return None
+    if re.search(r"[<>={}\[\]{}|#@]|\b(?:não|nunca|jamais|sem)\b", addition, re.I):
+        return None
+    if re.search(r"(?:https?://|www\.|\b(?:compre|clique|telegram|whatsapp)\b)", addition, re.I):
+        return None
+    if not re.search(r"[A-Za-zÀ-ÿ]", addition):
+        return None
+    return {"factor": 0.85, "reason": "acréscimo curto de prosa contextual; fatos não verificados"}
+
+
 def contextual_priority_calibration(change, diff, strong_signals):
     """Conservative contextual discount; never stacks with other discounts."""
     if change.get("type") == "new" or strong_signals:
@@ -9396,7 +9484,12 @@ def analyze_vandalism(change, diff, revert_risk):
         cosmetic_adjustment = (whitespace_only_priority_adjustment(diff)
                                or reference_date_priority_adjustment(diff)
                                or isolated_wikilink_priority_adjustment(diff))
-    benign = None if cosmetic_adjustment else benign_technical_change(diff)
+    children_adjustment = children_count_priority_adjustment(change, diff)
+    if children_adjustment and children_adjustment.get("factor") and not cosmetic_adjustment and max(signals) < 0.75:
+        cosmetic_adjustment = children_adjustment
+    if not cosmetic_adjustment and max(signals) < 0.75:
+        cosmetic_adjustment = contextual_prose_addition_adjustment(change, diff)
+    benign = None if cosmetic_adjustment or children_adjustment else benign_technical_change(diff)
 
     # O redutor técnico atua apenas em mudanças mínimas reconhecidas.
     if benign:
@@ -9436,6 +9529,8 @@ def analyze_vandalism(change, diff, revert_risk):
     reference_removal = reference_removal_priority_adjustment(change, diff)
     if reference_removal:
         score += reference_removal["bonus"]
+    if children_adjustment and children_adjustment.get("bonus"):
+        score += children_adjustment["bonus"]
 
     # Aplicar uma única vez após os redutores existentes; Revert Risk original intacto.
     score = min(max(score * GENERAL_PRIORITY_FACTOR, 0.0), 1.0)
@@ -9491,6 +9586,8 @@ def analyze_vandalism(change, diff, revert_risk):
 
     if reference_removal:
         reasons.append(reference_removal["reason"])
+    if children_adjustment and children_adjustment.get("bonus"):
+        reasons.append(children_adjustment["reason"])
 
     reasons.extend(promotional_adjustment.get("signals", []))
 
@@ -13266,7 +13363,7 @@ def main():
     # A indisponibilidade do Telegram não deve impedir a conexão ao
     # EventStreams. O anúncio de versão roda isolado do fluxo principal.
     threading.Thread(
-        target=announce_new_version_if_needed,
+        target=version_announcement_worker,
         daemon=True,
         name="version-announcement",
     ).start()
