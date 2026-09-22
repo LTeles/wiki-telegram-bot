@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.46"
-BOT_BUILD = "2.46-wiki-metrics-and-health"
+BOT_VERSION = "2.47"
+BOT_BUILD = "2.47-testwiki-high-risk"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -152,7 +152,7 @@ WIKI_MONTHLY_REPORT_PREFIX = "Usuário:TelesGramBot/Relatórios/Mensal/"
 # =========================================================
 
 REVERT_RISK_THRESHOLD = 0.25
-VANDALISM_THRESHOLD = 0.45
+VANDALISM_THRESHOLD = 0.50
 MAX_DIFF_CHARS = 6000
 
 MAX_ACCOUNT_AGE_DAYS = 60
@@ -12069,6 +12069,589 @@ def wikimedia_loop():
 # MAIN
 # =========================================================
 
+
+# =========================================================
+# TEST WIKIPEDIA: LISTA DE ALTO RISCO (PTWIKI)
+# =========================================================
+import hashlib
+import calendar
+
+# Publicação de testes independente dos relatórios da ptwiki.
+TESTWIKI_API = "https://test.wikipedia.org/w/api.php"
+WIKIPEDIA_WRITE_API = TESTWIKI_API
+TESTWIKI_BOT_USERNAME = os.environ.get("TESTWIKI_WIKIMEDIA_BOT_USERNAME")
+TESTWIKI_BOT_PASSWORD = os.environ.get("TESTWIKI_WIKIMEDIA_BOT_PASSWORD")
+WIKI_HIGH_RISK_TITLE = "User:TelesGramBot/Edições de alto risco"
+WIKI_HIGH_RISK_ARCHIVE_PREFIX = WIKI_HIGH_RISK_TITLE + "/"
+WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Arquivo"
+WIKI_HIGH_RISK_HEADER_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Cabeçalho"
+WIKI_HIGH_RISK_THRESHOLD = 0.85
+WIKI_HIGH_RISK_RESOLVED_TTL_SECONDS = 30 * 60
+HIGH_RISK_ARCHIVE_FILE = "/data/ptwiki_high_risk_archive.json"
+TESTWIKI_QUEUE_FILE = "/data/ptwiki_testwiki_queue.json"
+TESTWIKI_WRITE_INTERVAL_SECONDS = 121
+TESTWIKI_LOCK = threading.RLock()
+testwiki_session = requests.Session()
+testwiki_session.headers.update(HEADERS)
+testwiki_auth_lock = threading.Lock()
+testwiki_authenticated = False
+testwiki_authenticated_user = None
+high_risk_archive = {}
+high_risk_archive_lock = threading.Lock()
+
+def testwiki_login():
+    """Autentica a sessão dedicada exclusivamente à Test Wikipedia."""
+    global testwiki_authenticated, testwiki_authenticated_user
+
+    if not TESTWIKI_BOT_USERNAME or not TESTWIKI_BOT_PASSWORD:
+        testwiki_authenticated = False
+        testwiki_authenticated_user = None
+        print("⚠️ Credenciais da Test Wikipedia não configuradas.")
+        return False
+
+    with testwiki_auth_lock:
+        try:
+            token_response = testwiki_session.get(
+                WIKIPEDIA_WRITE_API,
+                params={
+                    "action": "query", "meta": "tokens", "type": "login",
+                    "format": "json", "formatversion": 2,
+                },
+                timeout=25,
+            )
+            token_response.raise_for_status()
+            login_token = (
+                token_response.json().get("query", {})
+                .get("tokens", {}).get("logintoken")
+            )
+            if not login_token:
+                raise RuntimeError("token de login da Test Wikipedia não retornado")
+
+            login_response = testwiki_session.post(
+                WIKIPEDIA_WRITE_API,
+                data={
+                    "action": "login",
+                    "lgname": TESTWIKI_BOT_USERNAME,
+                    "lgpassword": TESTWIKI_BOT_PASSWORD,
+                    "lgtoken": login_token,
+                    "format": "json",
+                    "formatversion": 2,
+                },
+                timeout=25,
+            )
+            login_response.raise_for_status()
+            login_data = login_response.json().get("login", {})
+            if login_data.get("result") != "Success":
+                raise RuntimeError(
+                    "login na Test Wikipedia falhou: "
+                    + str(login_data.get("reason") or login_data.get("result"))
+                )
+
+            user_response = testwiki_session.get(
+                WIKIPEDIA_WRITE_API,
+                params={
+                    "action": "query", "meta": "userinfo",
+                    "format": "json", "formatversion": 2,
+                },
+                timeout=25,
+            )
+            user_response.raise_for_status()
+            userinfo = user_response.json().get("query", {}).get("userinfo", {})
+            if userinfo.get("anon"):
+                raise RuntimeError("sessão da Test Wikipedia permaneceu anônima")
+
+            testwiki_authenticated = True
+            testwiki_authenticated_user = userinfo.get("name")
+            print("✅ Test Wikipedia autenticada como:", testwiki_authenticated_user)
+            return True
+        except Exception as exc:
+            testwiki_authenticated = False
+            testwiki_authenticated_user = None
+            print("❌ Falha no login da Test Wikipedia:", safe_exception(exc))
+            return False
+
+
+def get_testwiki_csrf_token():
+    if not testwiki_authenticated and not testwiki_login():
+        raise RuntimeError("sessão da Test Wikipedia não autenticada")
+
+    response = testwiki_session.get(
+        WIKIPEDIA_WRITE_API,
+        params={
+            "action": "query",
+            "meta": "tokens",
+            "type": "csrf",
+            "format": "json",
+            "formatversion": 2,
+        },
+        timeout=25,
+    )
+    response.raise_for_status()
+    token = (
+        response.json()
+        .get("query", {})
+        .get("tokens", {})
+        .get("csrftoken")
+    )
+    if not token:
+        raise RuntimeError("token CSRF não retornado")
+    return token
+
+
+def testwiki_page_exists(title):
+    response = testwiki_session.get(
+        WIKIPEDIA_WRITE_API,
+        params={
+            "action": "query", "format": "json", "formatversion": 2,
+            "titles": title,
+        },
+        timeout=25,
+    )
+    response.raise_for_status()
+    pages = (response.json().get("query") or {}).get("pages") or []
+    return bool(pages and not pages[0].get("missing"))
+
+
+def get_latest_testwiki_deletion_log(title):
+    response = testwiki_session.get(
+        WIKIPEDIA_WRITE_API,
+        params={
+            "action": "query", "format": "json", "formatversion": 2,
+            "list": "logevents", "letype": "delete",
+            "leaction": "delete/delete", "letitle": title,
+            "leprop": "title|user|timestamp|type|details",
+            "lelimit": 1, "ledir": "older",
+        },
+        timeout=25,
+    )
+    response.raise_for_status()
+    events = response.json().get("query", {}).get("logevents", [])
+    return events[0] if events else None
+
+
+
+def wiki_safe_text(value):
+    """Escapa caracteres que poderiam alterar o wikitext da lista."""
+    return (
+        str(value or "—")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("[", "&#91;")
+        .replace("]", "&#93;")
+        .replace("|", "&#124;")
+    )
+
+
+def format_high_risk_utc(record):
+    value = record.get("revision_timestamp")
+    try:
+        if isinstance(value, (int, float)):
+            moment = datetime.fromtimestamp(float(value), timezone.utc)
+        elif value:
+            moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            moment = moment.astimezone(timezone.utc)
+        else:
+            moment = datetime.fromtimestamp(
+                float(record.get("posted_at") or 0), timezone.utc
+            )
+    except (TypeError, ValueError, OverflowError):
+        return "data desconhecida"
+    return moment.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def high_risk_record_date(record):
+    value = record.get("revision_timestamp")
+    try:
+        if isinstance(value, (int, float)):
+            moment = datetime.fromtimestamp(float(value), timezone.utc)
+        elif value:
+            moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            moment = moment.astimezone(timezone.utc)
+        else:
+            moment = datetime.fromtimestamp(float(record.get("posted_at") or 0), timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        moment = datetime.now(timezone.utc)
+    return moment.strftime("%Y-%m-%d")
+
+
+def high_risk_account_link(username):
+    username = str(username or "Desconhecido")
+    encoded = quote(username.replace(" ", "_"), safe="")
+    return (
+        f"[https://pt.wikipedia.org/wiki/Usu%C3%A1rio:{encoded} "
+        f"{wiki_safe_text(username)}]"
+    )
+
+
+def high_risk_action(record):
+    status = record.get("status")
+    if status == "reverted":
+        return "Revertido", record.get("reverted_by"), record.get("reverted_at")
+    if status == "self_reverted":
+        return (
+            "Autorrevertido",
+            record.get("reverted_by") or record.get("username"),
+            record.get("reverted_at"),
+        )
+    if status == "patrolled":
+        return "Patrulhado", record.get("patrolled_by"), record.get("patrolled_at")
+    if status == "deleted":
+        return "Eliminado", record.get("deleted_by"), record.get("deleted_at")
+    if status == "resolved_no_action":
+        return "Resolvido sem ação necessária", None, record.get("resolved_at")
+    if status == "false_positive":
+        return "Marcado como falso positivo", None, record.get("false_positive_at")
+    return None, None, None
+
+
+def high_risk_diff_excerpt(record, limit=210):
+    def compact(value):
+        value = re.sub(r"\s+", " ", str(value or "")).strip()
+        return value
+
+    added = compact(record.get("diff_added"))
+    removed = compact(record.get("diff_removed"))
+    parts = []
+    if removed:
+        parts.append("− " + removed)
+    if added:
+        parts.append("+ " + added)
+    if not parts:
+        comment = compact(record.get("edit_comment"))
+        parts.append(comment if comment and comment != "Sem resumo" else "Trecho indisponível")
+    excerpt = " · ".join(parts)
+    if len(excerpt) > limit:
+        excerpt = excerpt[:limit - 1].rstrip() + "…"
+    return wiki_safe_text(excerpt)
+
+
+def high_risk_background(record):
+    if high_risk_action(record)[0] is not None:
+        return "#cfe2ff"  # Revista: azul tem prioridade.
+    return "#f8d7da" if float(record.get("revert_risk") or 0) > 0.95 else "#fff3cd"
+
+
+def build_high_risk_edit_line(record):
+    revision_id = int(record["revision_id"])
+    username = str(record.get("username") or "Desconhecido")
+    title = str(record.get("title") or "Sem título")
+    risk = float(record.get("revert_risk") or 0)
+
+    encoded_user = quote(username.replace(" ", "_"), safe="")
+    encoded_title = quote(title.replace(" ", "_"), safe="/:()")
+    article_link = (
+        f"[https://pt.wikipedia.org/wiki/{encoded_title} "
+        f"{wiki_safe_text(title)}]"
+    )
+    diff_url = f"https://pt.wikipedia.org/w/index.php?diff={revision_id}"
+    history_url = f"https://pt.wikipedia.org/w/index.php?title={encoded_title}&action=history"
+    contributions_url = f"https://pt.wikipedia.org/wiki/Especial:Contribui%C3%A7%C3%B5es/{encoded_user}"
+    first_line = (
+        f"'''{article_link}''' · [{diff_url} Ver diferenças] · "
+        f"[{history_url} Histórico] · [{contributions_url} Contribuições] · "
+        f"<span style=\"font-size:115%\">'''{risk:.0%}'''</span>"
+    )
+    second_line = f"<small>{high_risk_diff_excerpt(record)}</small>"
+
+    action, actor, _ = high_risk_action(record)
+    if action:
+        status_text = f"{action} por {high_risk_account_link(actor)}" if actor else action
+    else:
+        status_text = "Pendente de revisão"
+    background = high_risk_background(record)
+    return (
+        f'<div style="background:{background}; border:1px solid #a2a9b1; '
+        f'padding:0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
+        f"{first_line}<br>{second_line}<br>"
+        f"<small>'''Estado:''' {status_text}</small></div>"
+    )
+
+
+def select_high_risk_records(records):
+    eligible = []
+    for record in records:
+        try:
+            risk = float(record.get("revert_risk"))
+            revision_id = int(record.get("revision_id"))
+        except (TypeError, ValueError):
+            continue
+        if risk < WIKI_HIGH_RISK_THRESHOLD:
+            continue
+        record["revert_risk"] = risk
+        record["revision_id"] = revision_id
+        eligible.append(record)
+
+    eligible.sort(
+        key=lambda item: (
+            float(item.get("revert_risk") or 0),
+            float(item.get("posted_at") or 0),
+        ),
+        reverse=True,
+    )
+
+    return eligible
+
+
+def high_risk_header_transclusion():
+    return "{{" + WIKI_HIGH_RISK_HEADER_TITLE + "}}"
+
+
+def build_high_risk_page(records, heading, introduction):
+    eligible = select_high_risk_records(records)
+    lines = [
+        "__NOINDEX__",
+        high_risk_header_transclusion(),
+        f"= {heading} =",
+        introduction,
+        "",
+        "Amarelo: pendente (85–95%); vermelho: pendente (acima de 95%); "
+        "azul: edição revista.",
+        "",
+    ]
+    if eligible:
+        lines.extend(build_high_risk_edit_line(record) for record in eligible)
+    else:
+        lines.append("''Não há edições que atendam ao limiar neste momento.''")
+    return "\n".join(lines) + "\n"
+
+
+def load_high_risk_archive():
+    global high_risk_archive
+    loaded = load_json(HIGH_RISK_ARCHIVE_FILE, {})
+    if not isinstance(loaded, dict):
+        loaded = {}
+    with high_risk_archive_lock:
+        high_risk_archive = {
+            str(key): value for key, value in loaded.items() if isinstance(value, dict)
+        }
+
+
+def save_high_risk_archive():
+    with high_risk_archive_lock:
+        snapshot = dict(high_risk_archive)
+    atomic_write_json(HIGH_RISK_ARCHIVE_FILE, snapshot)
+
+
+def sync_high_risk_archive():
+    with posted_edits_lock:
+        current = [dict(item) for item in posted_edits.values()]
+    changed = False
+    with high_risk_archive_lock:
+        for record in select_high_risk_records(current):
+            revision_id = str(record["revision_id"])
+            archived = {
+                key: record.get(key)
+                for key in (
+                    "revision_id", "username", "title", "revert_risk",
+                    "revision_timestamp", "posted_at", "status", "edit_comment",
+                    "diff_added", "diff_removed",
+                    "reverted_by", "reverted_at", "patrolled_by", "patrolled_at",
+                    "deleted_by", "deleted_at", "resolved_at", "false_positive_at",
+                )
+            }
+            archived["archive_date"] = high_risk_record_date(archived)
+            if high_risk_archive.get(revision_id) != archived:
+                high_risk_archive[revision_id] = archived
+                changed = True
+    if changed:
+        save_high_risk_archive()
+    return changed
+
+
+def build_high_risk_wikitext(now=None):
+    with high_risk_archive_lock:
+        records = [dict(item) for item in high_risk_archive.values()]
+    visible = [record for record in records if high_risk_action(record)[0] is None]
+    return build_high_risk_page(
+        visible,
+        "Edições com alto risco de vandalismo",
+        "Esta lista inclui edições da Wikipédia em português com risco "
+        f"igual ou superior a {WIKI_HIGH_RISK_THRESHOLD:.0%}.",
+    )
+
+
+def build_high_risk_daily_wikitext(day, records):
+    return build_high_risk_page(
+        records,
+        f"Edições com alto risco de vandalismo — {day}",
+        f"Arquivo permanente das edições detectadas em {day} (UTC).",
+    )
+
+
+HIGH_RISK_MONTH_NAMES = (
+    "", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+)
+HIGH_RISK_MONTH_ABBREVIATIONS = (
+    "", "jan", "fev", "mar", "abr", "mai", "jun",
+    "jul", "ago", "set", "out", "nov", "dez",
+)
+
+
+def high_risk_archive_days(records):
+    return sorted({
+        str(item.get("archive_date"))
+        for item in records
+        if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", str(item.get("archive_date") or ""))
+    })
+
+
+def build_high_risk_header_wikitext(records):
+    days = high_risk_archive_days(records)
+    months = sorted({day[:7] for day in days})
+    years = sorted({day[:4] for day in days}, reverse=True)
+    lines = [
+        "__NOINDEX__",
+        '<div style="border:1px solid #a2a9b1; background:#f8f9fa; padding:0.6em; margin-bottom:0.8em">',
+        "'''Navegação:''' "
+        f"[[{WIKI_HIGH_RISK_TITLE}|avisos pendentes]] · "
+        f"[[{WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE}|arquivo por data]]",
+    ]
+    for year in years:
+        links = []
+        for month in range(1, 13):
+            key = f"{year}-{month:02d}"
+            label = HIGH_RISK_MONTH_ABBREVIATIONS[month]
+            links.append(
+                f"[[{WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE}#"
+                f"{HIGH_RISK_MONTH_NAMES[month].capitalize()}_{year}|{label}]]"
+                if key in months else label
+            )
+        lines.append(f"<small>'''{year}:''' " + " · ".join(links) + "</small>")
+    if not years:
+        lines.append("<small>''Ainda não há arquivos diários.''</small>")
+    lines.append("</div><noinclude>Cabeçalho automático dos avisos e arquivos do TelesGramBot.</noinclude>")
+    return "\n".join(lines) + "\n"
+
+
+def build_high_risk_archive_index_wikitext(records):
+    days = high_risk_archive_days(records)
+    available = set(days)
+    months = sorted({day[:7] for day in days}, reverse=True)
+    lines = [
+        "__NOINDEX__",
+        high_risk_header_transclusion(),
+        "= Arquivo de edições de alto risco =",
+        "Os dias com arquivo disponível aparecem como links. As semanas começam na segunda-feira.",
+    ]
+    if not months:
+        lines.append("''Ainda não há arquivos diários.''")
+        return "\n\n".join(lines) + "\n"
+
+    month_calendar = calendar.Calendar(firstweekday=0)
+    for key in months:
+        year, month = (int(part) for part in key.split("-"))
+        lines.extend([
+            f"== {HIGH_RISK_MONTH_NAMES[month].capitalize()} {year} ==",
+            '{| class="wikitable" style="text-align:center; width:100%; max-width:42em"',
+            "! Seg !! Ter !! Qua !! Qui !! Sex !! Sáb !! Dom",
+        ])
+        for week in month_calendar.monthdayscalendar(year, month):
+            cells = []
+            for day_number in week:
+                if not day_number:
+                    cells.append("")
+                    continue
+                day = f"{year:04d}-{month:02d}-{day_number:02d}"
+                cells.append(
+                    f"[[{WIKI_HIGH_RISK_ARCHIVE_PREFIX}{day}|'''{day_number}''']]"
+                    if day in available else str(day_number)
+                )
+            lines.extend(["|-", "| " + " || ".join(cells)])
+        lines.append("|}")
+    return "\n".join(lines) + "\n"
+
+
+
+
+def testwiki_allowed_title(title):
+    if title in (WIKI_HIGH_RISK_TITLE, WIKI_HIGH_RISK_HEADER_TITLE, WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE):
+        return True
+    if title.startswith(WIKI_HIGH_RISK_ARCHIVE_PREFIX):
+        suffix = title[len(WIKI_HIGH_RISK_ARCHIVE_PREFIX):]
+        try:
+            return datetime.strptime(suffix, "%Y-%m-%d").strftime("%Y-%m-%d") == suffix
+        except ValueError:
+            return False
+    return False
+
+
+def queue_testwiki_edit(title, text, summary):
+    if not testwiki_allowed_title(title):
+        raise PermissionError("Título não autorizado na Test Wikipedia")
+    with TESTWIKI_LOCK:
+        state = load_json(TESTWIKI_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+        if not isinstance(state, dict):
+            state = {"pending": [], "last_attempt": 0}
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        pending = state.get("pending", [])
+        if state.get("published_hashes", {}).get(title) == digest and not any(x.get("title") == title for x in pending):
+            return False
+        existing = next((x for x in pending if x.get("title") == title), None)
+        if existing and existing.get("digest") == digest:
+            return False
+        item = {"title": title, "text": text, "summary": summary, "digest": digest}
+        if existing:
+            pending[pending.index(existing)] = item
+        else:
+            pending.append(item)
+        state["pending"] = pending
+        atomic_write_json(TESTWIKI_QUEUE_FILE, state)
+        return True
+
+
+def queue_high_risk_wiki_pages():
+    sync_high_risk_archive()
+    with high_risk_archive_lock:
+        archived = [dict(x) for x in high_risk_archive.values()]
+    queue_testwiki_edit(WIKI_HIGH_RISK_TITLE, build_high_risk_wikitext(), "Atualizando lista de edições de alto risco")
+    queue_testwiki_edit(WIKI_HIGH_RISK_HEADER_TITLE, build_high_risk_header_wikitext(archived), "Atualizando cabeçalho")
+    queue_testwiki_edit(WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE, build_high_risk_archive_index_wikitext(archived), "Atualizando índice do arquivo")
+    for day in high_risk_archive_days(archived):
+        queue_testwiki_edit(WIKI_HIGH_RISK_ARCHIVE_PREFIX + day, build_high_risk_daily_wikitext(day, [x for x in archived if x.get("archive_date") == day]), "Atualizando arquivo de " + day)
+
+
+def testwiki_write_once():
+    with TESTWIKI_LOCK:
+        state = load_json(TESTWIKI_QUEUE_FILE, {"pending": [], "last_attempt": 0})
+        pending = state.get("pending", [])
+        if not pending or time.time() - float(state.get("last_attempt") or 0) < TESTWIKI_WRITE_INTERVAL_SECONDS:
+            return False
+        item = pending[0]
+        if not testwiki_allowed_title(item["title"]):
+            raise PermissionError("Destino de escrita não autorizado")
+        state["last_attempt"] = time.time()
+        atomic_write_json(TESTWIKI_QUEUE_FILE, state)
+        if not testwiki_authenticated and not testwiki_login():
+            raise RuntimeError("Falha na autenticação da Test Wikipedia")
+        exists = testwiki_page_exists(item["title"])
+        if not exists and get_latest_testwiki_deletion_log(item["title"]):
+            raise PermissionError("Página eliminada: recriação automática proibida")
+        payload = {"action":"edit", "format":"json", "formatversion":2, "title":item["title"], "text":item["text"], "summary":item["summary"], "token":get_testwiki_csrf_token(), "assert":"user", "bot":1}
+        payload["nocreate" if exists else "createonly"] = 1
+        response = testwiki_session.post(TESTWIKI_API, data=payload, timeout=35)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("error") or result.get("edit", {}).get("result") != "Success":
+            raise RuntimeError("Publicação não confirmada: " + safe_log_text(result))
+        state = load_json(TESTWIKI_QUEUE_FILE, state)
+        if state.get("pending") and state["pending"][0] == item:
+            state["pending"].pop(0)
+            state.setdefault("published_hashes", {})[item["title"]] = item["digest"]
+            atomic_write_json(TESTWIKI_QUEUE_FILE, state)
+        return True
+
+
+def testwiki_high_risk_worker():
+    while True:
+        try:
+            queue_high_risk_wiki_pages()
+            testwiki_write_once()
+        except Exception as exc:
+            print("⚠️ Test Wikipedia:", safe_exception(exc))
+        time.sleep(30)
+
 def main():
     print("========================================")
     print("Detector de vandalismo ptwiki")
@@ -12094,6 +12677,7 @@ def main():
     load_abuse_filters()
     load_abuse_filter_state()
     load_posted_edits()
+    load_high_risk_archive()
     load_detection_stats()
     load_pending_summary_state()
     load_reversible_actions()
@@ -12192,6 +12776,7 @@ def main():
         ("daily-detection-report", daily_detection_report_scheduler),
         ("pending-alerts-summary", pending_alerts_summary_scheduler),
         ("pending-resolution-reconciliation", pending_resolution_reconciliation_scheduler),
+        ("testwiki-high-risk", testwiki_high_risk_worker),
     ]
 
     for name, target in threads:
