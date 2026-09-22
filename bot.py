@@ -25,8 +25,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.51"
-BOT_BUILD = "2.51-reference-removal-wikilinks-version-post"
+BOT_VERSION = "2.52"
+BOT_BUILD = "2.52-independent-wiki-pause-controls"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2346,6 +2346,7 @@ WIKI_RELEASE_NOTES = {
     "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
     "2.50": "Calibração de traduções equivalentes de datas em referências e mudanças exclusivamente de espaços/linhas vazias.",
     "2.51": "Calibração de inclusão isolada de wikilinks e remoção de referências conforme justificativa; correção das notas de versão e atualização do anúncio no Telegram.",
+    "2.52": "Controles independentes de pausa e retomada da escrita na Wikipédia em português e na Test Wikipedia, com estado persistente e filas preservadas.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -9957,8 +9958,10 @@ def commands_message():
         "🔎 /falsonegativo ID ou LINK — registra uma revisão que o detector deixou passar.\n"
         "🧪 /falsosnegativos — mostra a base de calibração de falsos negativos.\n"
         "📡 /status — mostra o estado do bot.\n"
-        "⏸ /pausarwiki — suspende a escrita na Wikipédia.\n"
-        "▶️ /reiniciarwiki — retoma a escrita respeitando o limite horário.\n\n"
+        "⏸ /pausarwiki — pausa somente a escrita na Wikipédia em português.\n"
+        "▶️ /reiniciarwiki — retoma somente a escrita na Wikipédia em português.\n"
+        "⏸ /pausarteste — pausa somente a escrita na Test Wikipedia.\n"
+        "▶️ /reiniciarteste — retoma somente a escrita na Test Wikipedia.\n\n"
         "👁 Vigilância de páginas\n"
         "👁 /vigiar Página — vigia uma página permanentemente.\n"
         "🙈 /desvigiar Página — encerra a vigilância.\n"
@@ -10101,6 +10104,8 @@ def process_telegram_command(message, from_channel=False):
         "/resolverfalsonegativo",
         "/pausarwiki",
         "/reiniciarwiki",
+        "/pausarteste",
+        "/reiniciarteste",
     }
 
     if command in mutating_commands and (
@@ -10117,13 +10122,27 @@ def process_telegram_command(message, from_channel=False):
             pause = command == "/pausarwiki"
             set_wiki_writing_paused(pause)
             send_telegram_message(
-                "⏸ Escrita na Wikipédia pausada por tempo indeterminado. A fila foi preservada."
+                "⏸ Escrita na Wikipédia em português pausada. A fila foi preservada; a Test Wikipedia não foi afetada."
                 if pause else
-                "▶️ Escrita na Wikipédia retomada. Fila e limite de uma tentativa por hora preservados.",
+                "▶️ Escrita na Wikipédia em português retomada. Fila e limite de uma tentativa por hora preservados; a Test Wikipedia não foi afetada.",
                 chat_id=chat_id,
             )
         except Exception as exc:
             send_telegram_message("❌ Não foi possível alterar escrita wiki: " + safe_exception(exc), chat_id=chat_id)
+        return
+
+    if command in ("/pausarteste", "/reiniciarteste"):
+        try:
+            pause = command == "/pausarteste"
+            set_testwiki_writing_paused(pause)
+            send_telegram_message(
+                "⏸ Escrita na Test Wikipedia pausada. A fila foi preservada; a Wikipédia em português não foi afetada."
+                if pause else
+                "▶️ Escrita na Test Wikipedia retomada. Fila e intervalo mínimo de 121 segundos preservados; a Wikipédia em português não foi afetada.",
+                chat_id=chat_id,
+            )
+        except Exception as exc:
+            send_telegram_message("❌ Não foi possível alterar a escrita na Test Wikipedia: " + safe_exception(exc), chat_id=chat_id)
         return
 
     if command == "/start":
@@ -12280,6 +12299,7 @@ WIKI_HIGH_RISK_THRESHOLD = 0.85
 WIKI_HIGH_RISK_RESOLVED_TTL_SECONDS = 30 * 60
 HIGH_RISK_ARCHIVE_FILE = "/data/ptwiki_high_risk_archive.json"
 TESTWIKI_QUEUE_FILE = "/data/ptwiki_testwiki_queue.json"
+TESTWIKI_CONTROL_FILE = "/data/ptwiki_testwiki_control.json"
 TESTWIKI_WRITE_INTERVAL_SECONDS = 121
 TESTWIKI_LOCK = threading.RLock()
 testwiki_session = requests.Session()
@@ -13047,8 +13067,28 @@ def queue_high_risk_wiki_pages():
         queue_testwiki_edit(WIKI_HIGH_RISK_ARCHIVE_PREFIX + day, build_high_risk_daily_wikitext(day, [x for x in archived if x.get("archive_date") == day]), "Atualizando arquivo de " + day)
 
 
+def testwiki_writing_paused():
+    """Independent persistent switch; fail closed on invalid state."""
+    try:
+        with open(TESTWIKI_CONTROL_FILE, "r", encoding="utf-8") as control:
+            state = json.load(control)
+        return not isinstance(state, dict) or not isinstance(state.get("paused"), bool) or state["paused"]
+    except FileNotFoundError:
+        return False
+    except Exception as exc:
+        print("⚠️ Controle da Test Wikipedia indisponível:", safe_exception(exc))
+        return True
+
+
+def set_testwiki_writing_paused(paused):
+    with TESTWIKI_LOCK:
+        atomic_write_json(TESTWIKI_CONTROL_FILE, {"paused": bool(paused)})
+
+
 def testwiki_write_once():
     with TESTWIKI_LOCK:
+        if testwiki_writing_paused():
+            return False
         state = load_json(TESTWIKI_QUEUE_FILE, {"pending": [], "last_attempt": 0})
         pending = state.get("pending", [])
         if not pending or time.time() - float(state.get("last_attempt") or 0) < TESTWIKI_WRITE_INTERVAL_SECONDS:
