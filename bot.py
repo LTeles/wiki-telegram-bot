@@ -24,8 +24,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.47"
-BOT_BUILD = "2.47-testwiki-high-risk"
+BOT_VERSION = "2.48"
+BOT_BUILD = "2.48-testwiki-diff-preview"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -4955,6 +4955,9 @@ def register_posted_edit(item, telegram_message):
             if isinstance(item.get("stats_payload"), dict)
             else None
         ),
+        "diff_added": item.get("stats_payload", {}).get("diff_added", ""),
+        "diff_removed": item.get("stats_payload", {}).get("diff_removed", ""),
+        "risk_reasons": item.get("stats_payload", {}).get("risk_reasons", ""),
         "final_score": (
             item.get("stats_payload", {}).get("score")
             if isinstance(item.get("stats_payload"), dict)
@@ -9735,6 +9738,9 @@ def analysis_worker():
                         title,
                         stats_payload={
                             "score": result["score"],
+                            "diff_added": diff.get("added", "")[:MAX_DIFF_CHARS],
+                            "diff_removed": diff.get("removed", "")[:MAX_DIFF_CHARS],
+                            "risk_reasons": result.get("reason", ""),
                             "revert_risk": result[
                                 "revert_risk"
                             ],
@@ -12305,25 +12311,37 @@ def high_risk_action(record):
     return None, None, None
 
 
-def high_risk_diff_excerpt(record, limit=210):
+def high_risk_diff_excerpt(record, limit=360):
+    """Prévia textual; o modelo Revert Risk não fornece atribuição por palavra."""
     def compact(value):
-        value = re.sub(r"\s+", " ", str(value or "")).strip()
-        return value
+        return re.sub(r"\s+", " ", str(value or "")).strip()
 
-    added = compact(record.get("diff_added"))
-    removed = compact(record.get("diff_removed"))
-    parts = []
-    if removed:
-        parts.append("− " + removed)
-    if added:
-        parts.append("+ " + added)
-    if not parts:
-        comment = compact(record.get("edit_comment"))
-        parts.append(comment if comment and comment != "Sem resumo" else "Trecho indisponível")
-    excerpt = " · ".join(parts)
-    if len(excerpt) > limit:
-        excerpt = excerpt[:limit - 1].rstrip() + "…"
-    return wiki_safe_text(excerpt)
+    old = compact(record.get("diff_removed"))
+    new = compact(record.get("diff_added"))
+    if not old and not new:
+        return "<small>Prévia indisponível; consulte o diferencial completo.</small>"
+
+    # Prioriza o ponto de divergência em vez de cortar sempre o começo do texto.
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    changes = [op for op in matcher.get_opcodes() if op[0] != "equal"]
+    if changes:
+        _, i1, i2, j1, j2 = max(changes, key=lambda op: max(op[2]-op[1], op[4]-op[3]))
+        before = old[max(0, i1-65):min(len(old), i2+65)]
+        after = new[max(0, j1-65):min(len(new), j2+65)]
+    else:
+        before, after = old[:limit//2], new[:limit//2]
+    before = before[:limit]
+    after = after[:limit]
+    old_line = wiki_safe_text(before) if before else "(sem texto anterior)"
+    new_line = wiki_safe_text(after) if after else "(texto removido)"
+    reasons = compact(record.get("risk_reasons"))
+    # Os motivos são heurísticas identificadas, não explicações causais do modelo.
+    reasons_line = ("<br><small>Sinais detectados: " + wiki_safe_text(reasons[:240]) + "</small>") if reasons else ""
+    return ("<div style=\"margin:0.3em 0; padding:0.35em; border:1px solid #a2a9b1; background:#ffffff\">"
+            "<small>Prévia das alterações (trecho aproximado):</small><br>"
+            "<small>Antes: <del>" + old_line + "</del></small><br>"
+            "<small>Depois: <ins>" + new_line + "</ins></small>"
+            + reasons_line + "</div>")
 
 
 def high_risk_background(record):
@@ -12352,7 +12370,7 @@ def build_high_risk_edit_line(record):
         f"[{history_url} Histórico] · [{contributions_url} Contribuições] · "
         f"<span style=\"font-size:115%\">'''{risk:.0%}'''</span>"
     )
-    second_line = f"<small>{high_risk_diff_excerpt(record)}</small>"
+    second_line = high_risk_diff_excerpt(record)
 
     action, actor, _ = high_risk_action(record)
     if action:
@@ -12445,7 +12463,7 @@ def sync_high_risk_archive():
                 for key in (
                     "revision_id", "username", "title", "revert_risk",
                     "revision_timestamp", "posted_at", "status", "edit_comment",
-                    "diff_added", "diff_removed",
+                    "diff_added", "diff_removed", "risk_reasons",
                     "reverted_by", "reverted_at", "patrolled_by", "patrolled_at",
                     "deleted_by", "deleted_at", "resolved_at", "false_positive_at",
                 )
