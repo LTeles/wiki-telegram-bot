@@ -25,8 +25,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.49"
-BOT_BUILD = "2.49-testwiki-reviewed-patterns"
+BOT_VERSION = "2.51"
+BOT_BUILD = "2.51-reference-removal-wikilinks-version-post"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2344,6 +2344,8 @@ def build_wiki_observations_wikitext():
 WIKI_RELEASE_NOTES = {
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
     "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
+    "2.50": "Calibração de traduções equivalentes de datas em referências e mudanças exclusivamente de espaços/linhas vazias.",
+    "2.51": "Calibração de inclusão isolada de wikilinks e remoção de referências conforme justificativa; correção das notas de versão e atualização do anúncio no Telegram.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -2357,7 +2359,7 @@ def wiki_record_release():
             releases = []
         if not any(isinstance(x, dict) and x.get("build") == BOT_BUILD for x in releases):
             releases.append({"version": BOT_VERSION, "build": BOT_BUILD,
-                             "timestamp": time.time(), "notes": WIKI_RELEASE_NOTES[BOT_VERSION]})
+                             "timestamp": time.time(), "notes": WIKI_RELEASE_NOTES.get(BOT_VERSION, "Alterações não descritas para esta versão.")})
             atomic_write_json(WIKI_RELEASE_HISTORY_FILE, {"releases": releases[-150:]})
 
 
@@ -2649,33 +2651,41 @@ def save_bot_version(version, build=None):
 
 
 def announce_new_version_if_needed():
-    announced_build = load_saved_bot_version()
-
-    if announced_build == BOT_BUILD:
+    """Atualiza o anúncio anterior; só registra versão após sucesso no Telegram."""
+    state = load_json(BOT_VERSION_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    if load_saved_bot_version() == BOT_BUILD:
         print("ℹ️ Versão já anunciada. Nenhuma mensagem enviada.")
         return
-
+    notes = WIKI_RELEASE_NOTES.get(BOT_VERSION, "Alterações desta versão não registradas.")
     message = (
-        f"🤖 <b>TelesGramBot {BOT_VERSION}</b>\n"
-        f"🔧 Build: <code>{BOT_BUILD}</code>\n\n"
-        "<b>Novidade desta build</b>\n"
-        "• Métricas de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões; sem identidades do Telegram."
+        f"🤖 <b>TelesGramBot {html.escape(BOT_VERSION)}</b>\n"
+        f"🔧 Build: <code>{html.escape(BOT_BUILD)}</code>\n\n"
+        f"<b>Novidades desta versão</b>\n• {html.escape(notes)}"
     )
-
-    sent = send_telegram_message(message, parse_mode="HTML")
-
-    if not sent:
-        print("⚠️ Não foi possível anunciar a nova versão.")
-        return
-
-    try:
-        save_bot_version(BOT_VERSION, BOT_BUILD)
-        print("✅ Nova versão anunciada e registrada.")
-    except Exception as e:
-        print(
-            "⚠️ Mensagem enviada, mas houve erro ao registrar a versão:",
-            safe_exception(e)
-        )
+    previous_id = state.get("announcement_message_id")
+    updated = False
+    if previous_id:
+        try:
+            updated = edit_telegram_message(int(previous_id), message, parse_mode="HTML")
+        except (TypeError, ValueError) as exc:
+            print("⚠️ ID do anúncio anterior inválido:", safe_exception(exc))
+    if updated:
+        message_id = int(previous_id)
+    else:
+        sent = send_telegram_message(message, parse_mode="HTML")
+        if not sent or not sent.get("message_id"):
+            print("⚠️ Não foi possível atualizar ou publicar o anúncio da versão.")
+            return
+        message_id = int(sent["message_id"])
+        if previous_id:
+            print("⚠️ Edição do anúncio anterior falhou; novo anúncio publicado:", message_id)
+    state.update({"version": BOT_VERSION, "build": BOT_BUILD,
+                  "updated_at": datetime.now(timezone.utc).isoformat(),
+                  "announcement_message_id": message_id})
+    atomic_write_json(BOT_VERSION_FILE, state)
+    print("✅ Anúncio da versão atualizado e ID persistido:", message_id)
 
 
 # =========================================================
@@ -8703,6 +8713,8 @@ def get_revision_diff(old_revision, new_revision):
     return {
         "added": added[:MAX_DIFF_CHARS],
         "removed": removed[:MAX_DIFF_CHARS],
+        "has_diff_cells": bool(added_matches or removed_matches),
+        "whitespace_changed": bool(added_matches or removed_matches) and added == removed,
     }
 
 
@@ -8849,6 +8861,156 @@ def normalized_diff_lines(value):
         if line:
             lines.append(line)
     return lines
+
+
+# Calibração conservadora: mudanças cosméticas e tradução de datas em fontes.
+# Nenhuma destas regras modifica a previsão original do modelo Revert Risk.
+_REFERENCE_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+    "june": 6, "july": 7, "august": 8, "september": 9,
+    "october": 10, "november": 11, "december": 12,
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3,
+    "abril": 4, "maio": 5, "junho": 6, "julho": 7, "agosto": 8,
+    "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
+}
+
+
+def _canonical_reference_dates(text):
+    """Substitui SOMENTE datas de acesso e datas bibliográficas válidas."""
+    text = str(text or "")
+    found = []
+
+    def canonical(year, month, day):
+        try:
+            return datetime(int(year), int(month), int(day)).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return None
+
+    def access_iso(match):
+        date = canonical(match.group(1), match.group(2), match.group(3))
+        if date is None:
+            return match.group(0)
+        found.append(("access", date))
+        return "__ACCESS_DATE_" + date + "__"
+
+    def access_br(match):
+        date = canonical(match.group(3), match.group(2), match.group(1))
+        if date is None:
+            return match.group(0)
+        found.append(("access", date))
+        return "__ACCESS_DATE_" + date + "__"
+
+    text = re.sub(r"\bRetrieved\s+(\d{4})-(\d{1,2})-(\d{1,2})\b", access_iso, text, flags=re.I)
+    text = re.sub(r"\bAcessad[oa]\s+em\s+(\d{1,2})/(\d{1,2})/(\d{4})\b", access_br, text, flags=re.I)
+
+    def textual_date(match):
+        first, month_name, year = match.group(1), match.group(2), match.group(3)
+        date = canonical(year, _REFERENCE_MONTHS[month_name.casefold()], first)
+        if date is None:
+            return match.group(0)
+        found.append(("bibliographic", date))
+        return "__BIB_DATE_" + date + "__"
+
+    months = "|".join(sorted(map(re.escape, _REFERENCE_MONTHS), key=len, reverse=True))
+    # Datas textuais: "July 15, 2014" ou "15 de julho de 2014".
+    def english_date(match):
+        date = canonical(match.group(3), _REFERENCE_MONTHS[match.group(1).casefold()], match.group(2))
+        if date is None:
+            return match.group(0)
+        found.append(("bibliographic", date))
+        return "__BIB_DATE_" + date + "__"
+
+    text = re.sub(rf"\b({months})\s+(\d{{1,2}}),?\s+(\d{{4}})\b", english_date, text, flags=re.I)
+    text = re.sub(rf"\b(\d{{1,2}})\s+de\s+({months})\s+de\s+(\d{{4}})\b", textual_date, text, flags=re.I)
+    return text, found
+
+
+def reference_date_priority_adjustment(diff):
+    """Desconto apenas se TODAS as mudanças forem traduções de datas equivalentes.
+
+    Exige evidência bibliográfica, datas válidas e ao menos uma data traduzida;
+    datas alteradas, remoção de fontes e alterações adicionais não se beneficiam.
+    """
+    old = " ".join(normalized_diff_lines(diff.get("removed", "")))
+    new = " ".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > MAX_DIFF_CHARS:
+        return None
+    old_canonical, old_dates = _canonical_reference_dates(old)
+    new_canonical, new_dates = _canonical_reference_dates(new)
+    if not old_dates or not new_dates or old == new or old_dates != new_dates:
+        return None
+    if not any(kind == "access" for kind, _ in old_dates + new_dates):
+        return None
+    if not (re.search(r"<ref\b|\{\{\s*(?:citar|cite|refer[êe]ncia)", old + new, re.I)
+            or re.search(r"\b(?:Retrieved|Acessad[oa]\s+em)\b", old + new, re.I)):
+        return None
+    # Só tolera espaços adjacentes aos marcadores de datas, não reescreve prosa.
+    def compact(value):
+        return re.sub(r"\s+", " ", value).strip()
+    if compact(old_canonical) != compact(new_canonical):
+        return None
+    return {"factor": 0.55, "reason": "tradução de datas equivalentes em referência; conteúdo preservado"}
+
+
+def isolated_wikilink_priority_adjustment(diff):
+    """Desconto apenas para envolver texto existente em um wikilink simples."""
+    old = " ".join(normalized_diff_lines(diff.get("removed", "")))
+    new = " ".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or len(old) > MAX_DIFF_CHARS or len(new) > MAX_DIFF_CHARS:
+        return None
+    # Apenas um wikilink novo, sem âncoras, pipes, namespaces ou alteração de texto.
+    matches = list(re.finditer(r"\[\[([^\[\]\n|#:{}<>]{3,100})\]\]", new))
+    if len(matches) != 1 or "[[" in old or "]]" in old:
+        return None
+    target = matches[0].group(1)
+    if not target.strip() or target != target.strip() or ":" in target:
+        return None
+    restored = new[:matches[0].start()] + target + new[matches[0].end():]
+    if restored != old:
+        return None
+    return {"factor": 0.55, "reason": "inclusão isolada de link interno; texto preservado"}
+
+
+def reference_removal_priority_adjustment(change, diff):
+    """Sinal contextual, não prova de vandalismo; só referências inteiras removidas."""
+    if change.get("type") == "new":
+        return None
+    removed = str(diff.get("removed") or "")
+    added = str(diff.get("added") or "")
+    refs_removed = re.findall(r"<ref\b[^>]*>.*?</ref\s*>|<ref\b[^>]*/\s*>", removed, re.I | re.S)
+    if not refs_removed:
+        return None
+    # Não penalizar referência movida ou substituída no mesmo diferencial.
+    if re.search(r"<ref\b", added, re.I):
+        return None
+    # Sem sumário explicativo há suspeita adicional; sumário não garante legitimidade.
+    comment = str(change.get("comment") or "").strip()
+    generic = bool(re.fullmatch(r"(?:ajustes?|ediç(?:ão|ões)|edit|fix|correç(?:ão|ões)|update|atualizaç(?:ão|ões)|minor|pequena edição|/*[^*]*\*/)?[.! ]*", comment, re.I))
+    if not comment or generic:
+        return {"bonus": 0.12, "reason": "referência removida sem sumário explicativo; verificar fonte e contexto"}
+    explanatory = bool(re.search(r"(?:refer[êe]ncia|fonte|link|url|citaç|duplicad|inválid|inval|quebrad|mort[oa]|substitu|remov|retir|desatualiz)", comment, re.I))
+    if explanatory:
+        return {"bonus": 0.025, "reason": "referência removida com justificativa no sumário; conferir justificativa"}
+    return {"bonus": 0.08, "reason": "referência removida; sumário não explica a remoção"}
+
+
+def whitespace_only_priority_adjustment(diff):
+    """Confirma mudança exclusivamente de linhas vazias/espaços, sem texto removido."""
+    if not diff.get("has_diff_cells"):
+        return None
+    old = str(diff.get("removed") or "")
+    new = str(diff.get("added") or "")
+    if old == new and not diff.get("whitespace_changed"):
+        return None
+    if re.sub(r"\s+", "", old) != re.sub(r"\s+", "", new):
+        return None
+    # Não remover espaços dentro de palavras ou parâmetros: apenas linhas vazias
+    # e diferenças de indentação/espaçamento no começo/fim das linhas.
+    old_lines = [line.strip() for line in old.splitlines() if line.strip()]
+    new_lines = [line.strip() for line in new.splitlines() if line.strip()]
+    if old_lines != new_lines:
+        return None
+    return {"factor": 0.30, "reason": "alteração exclusivamente cosmética de linhas vazias/espaçamento"}
 
 
 def orthographic_priority_adjustment(diff):
@@ -9227,15 +9389,23 @@ def analyze_vandalism(change, diff, revert_risk):
     if strong_signals >= 2:
         score += 0.05
 
-    benign = benign_technical_change(diff)
+    # Regras novas não são cumulativas com redutores já existentes.
+    cosmetic_adjustment = None
+    if change.get("type") != "new" and max(signals) < 0.75:
+        cosmetic_adjustment = (whitespace_only_priority_adjustment(diff)
+                               or reference_date_priority_adjustment(diff)
+                               or isolated_wikilink_priority_adjustment(diff))
+    benign = None if cosmetic_adjustment else benign_technical_change(diff)
 
     # O redutor técnico atua apenas em mudanças mínimas reconhecidas.
     if benign:
         score *= float(benign.get("factor", 1.0))
+    if cosmetic_adjustment:
+        score *= float(cosmetic_adjustment["factor"])
 
     minimal_adjustment = None
     contextual_calibration = contextual_priority_calibration(change, diff, strong_signals)
-    if not benign and not change.get("type") == "new" and max(signals) < 0.75:
+    if not benign and not cosmetic_adjustment and not change.get("type") == "new" and max(signals) < 0.75:
         minimal_adjustment = (equivalent_wikimarkup_priority_adjustment(diff)
                               or orthographic_priority_adjustment(diff)
                               or minimal_text_priority_adjustment(diff))
@@ -9250,6 +9420,8 @@ def analyze_vandalism(change, diff, revert_risk):
         strong_signals,
     )
 
+    if cosmetic_adjustment:
+        context_adjustment = None  # Não acumular descontos para a mesma edição.
     if context_adjustment and contextual_calibration and context_adjustment.get("kind") == "talk_signed_append":
         context_adjustment = None  # One contextual discount, never multiply 0.70 by 0.45.
     if context_adjustment:
@@ -9259,6 +9431,10 @@ def analyze_vandalism(change, diff, revert_risk):
     promotional_adjustment = new_page_promotional_signals(change, diff)
     if promotional_adjustment["bonus"] > 0:
         score += promotional_adjustment["bonus"]
+
+    reference_removal = reference_removal_priority_adjustment(change, diff)
+    if reference_removal:
+        score += reference_removal["bonus"]
 
     # Aplicar uma única vez após os redutores existentes; Revert Risk original intacto.
     score = min(max(score * GENERAL_PRIORITY_FACTOR, 0.0), 1.0)
@@ -9298,6 +9474,8 @@ def analyze_vandalism(change, diff, revert_risk):
         reasons.append(
             str(benign.get("reason") or "alteração técnica mínima")
         )
+    if cosmetic_adjustment:
+        reasons.append(cosmetic_adjustment["reason"])
 
     if minimal_adjustment:
         reasons.append(minimal_adjustment["reason"])
@@ -9310,6 +9488,9 @@ def analyze_vandalism(change, diff, revert_risk):
             )
         )
 
+    if reference_removal:
+        reasons.append(reference_removal["reason"])
+
     reasons.extend(promotional_adjustment.get("signals", []))
 
     if not reasons:
@@ -9320,9 +9501,11 @@ def analyze_vandalism(change, diff, revert_risk):
         "revert_risk": revert_risk,
         "reason": ", ".join(reasons),
         "benign_reduction": benign,
+        "cosmetic_adjustment": cosmetic_adjustment,
         "minimal_adjustment": minimal_adjustment,
         "context_adjustment": context_adjustment,
         "promotional_adjustment": promotional_adjustment,
+        "reference_removal_adjustment": reference_removal,
     }
 
 
