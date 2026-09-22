@@ -25,8 +25,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.54"
-BOT_BUILD = "2.54-biography-children-contextual-additions"
+BOT_VERSION = "2.55"
+BOT_BUILD = "2.55-new-announcement-per-version"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2349,6 +2349,7 @@ WIKI_RELEASE_NOTES = {
     "2.52": "Controles independentes de pausa e retomada da escrita na Wikipédia em português e na Test Wikipedia, com estado persistente e filas preservadas.",
     "2.53": "Correção do anúncio de versão no Telegram: confirmação de entrega, recuperação de estado incompleto e novas tentativas automáticas após falhas.",
     "2.54": "Calibração de alterações isoladas no número de filhos (+1 com cautela; saltos maiores suspeitos) e acréscimos curtos de prosa contextual, sem validar automaticamente fatos.",
+    "2.55": "Cada nova versão publica um anúncio novo no Telegram, preservando mensagens anteriores; confirmação persistente e novas tentativas após falhas, sem republicação retroativa.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -2657,7 +2658,7 @@ _version_announcement_lock = threading.Lock()
 
 
 def announce_new_version_if_needed():
-    """Publica/edita anúncio; registra build apenas após confirmação da API."""
+    """Publica anúncio NOVO por build, sem editar anúncios de versões anteriores."""
     if not _version_announcement_lock.acquire(blocking=False):
         print("ℹ️ Anúncio de versão já em andamento; tentativa simultânea ignorada.")
         return False
@@ -2665,8 +2666,9 @@ def announce_new_version_if_needed():
         state = load_json(BOT_VERSION_FILE, {})
         if not isinstance(state, dict):
             state = {}
+        # O ID é a confirmação persistente da build registrada. Não republicar
+        # builds já anunciadas nem tentar recuperar anúncios de versões antigas.
         previous_id = state.get("announcement_message_id")
-        # Uma build sem ID confirmado é estado incompleto, não anúncio entregue.
         if load_saved_bot_version() == BOT_BUILD and previous_id:
             print("ℹ️ Anúncio desta build já confirmado; ID:", previous_id)
             return True
@@ -2676,22 +2678,16 @@ def announce_new_version_if_needed():
             f"🔧 Build: <code>{html.escape(BOT_BUILD)}</code>\n\n"
             f"<b>Novidades desta versão</b>\n• {html.escape(notes)}"
         )
-        message_id = None
-        if previous_id:
-            try:
-                if edit_telegram_message(int(previous_id), message, parse_mode="HTML"):
-                    message_id = int(previous_id)
-                    print("✅ Anúncio anterior editado:", message_id)
-            except (TypeError, ValueError) as exc:
-                print("⚠️ ID do anúncio anterior inválido:", safe_exception(exc))
-        if message_id is None:
-            sent = send_telegram_message(message, parse_mode="HTML")
-            if not isinstance(sent, dict) or not sent.get("message_id"):
-                print("⚠️ Anúncio não confirmado pelo Telegram; nova tentativa em 5 minutos.")
-                return False
-            message_id = int(sent["message_id"])
-            print("✅ Novo anúncio publicado:", message_id)
-        # Preserva outros campos do estado e só confirma após resposta da API.
+        # Uma build nova deve sempre usar sendMessage: editMessageText altera
+        # o anúncio antigo sem criar postagem visível no final do canal.
+        sent = send_telegram_message(message, parse_mode="HTML")
+        if not isinstance(sent, dict) or not sent.get("message_id"):
+            print("⚠️ Novo anúncio não confirmado pelo Telegram; nova tentativa em 5 minutos.")
+            return False
+        message_id = int(sent["message_id"])
+        print("✅ Novo anúncio publicado:", message_id)
+        # Persistir apenas após confirmação da API. Se a persistência falhar,
+        # o worker poderá repetir; a mensagem anterior nunca será modificada.
         state.update({"version": BOT_VERSION, "build": BOT_BUILD,
                       "updated_at": datetime.now(timezone.utc).isoformat(),
                       "announcement_message_id": message_id})
