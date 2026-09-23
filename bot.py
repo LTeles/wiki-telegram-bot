@@ -25,8 +25,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.55"
-BOT_BUILD = "2.55-new-announcement-per-version"
+BOT_VERSION = "2.57"
+BOT_BUILD = "2.57-testwiki-diff-fallback"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1357,10 +1357,18 @@ def false_positive_list_message(page=0):
 def load_community_stats():
     global community_stats
 
-    data = load_json(
-        COMMUNITY_STATS_FILE,
-        {"events": [], "last_preview_date": None},
-    )
+    if not os.path.isfile(COMMUNITY_STATS_FILE):
+        print("⛔ Arquivo de estatísticas comunitárias ausente:", COMMUNITY_STATS_FILE,
+              "— não criar arquivo vazio automaticamente; conferir volume persistente.")
+        return
+    try:
+        with open(COMMUNITY_STATS_FILE, "r", encoding="utf-8") as source:
+            data = json.load(source)
+        if not isinstance(data, dict) or not isinstance(data.get("events"), list):
+            raise ValueError("formato inválido: campo events não é lista")
+    except (OSError, ValueError, TypeError) as exc:
+        print("⛔ Falha ao carregar estatísticas; arquivo original preservado:", safe_exception(exc))
+        return
 
     loaded = []
     if isinstance(data, dict):
@@ -1384,6 +1392,11 @@ def load_community_stats():
             ),
         }
 
+    if data["events"] and not loaded:
+        print("⛔ Eventos comunitários inválidos: arquivo original preservado; publicação bloqueada.")
+        with community_stats_lock:
+            community_stats["events"] = []
+        return
     cleanup_community_stats(save=False)
     try:
         save_community_stats()
@@ -1650,12 +1663,30 @@ def mark_wiki_page_published(title):
         atomic_write_json(WIKI_PENDING_PAGES_FILE, {"titles": sorted(titles)})
 
 
+def wiki_statistics_publication_safe(wikitext):
+    """Fail closed: never replace a populated wiki report with empty local data."""
+    if not isinstance(wikitext, str) or not wikitext.strip():
+        return False
+    with community_stats_lock:
+        events_count = len(community_stats.get("events", []))
+    if events_count == 0:
+        print("⛔ Estatísticas wiki bloqueadas: nenhum evento comunitário carregado; verificar volume /data e COMMUNITY_STATS_FILE.")
+        return False
+    # Also reject a stale zeroed payload already persisted in the write queue.
+    if "* Reversões identificadas: 0" in wikitext and "* Patrulhamentos identificados: 0" in wikitext and "* Eliminações identificadas: 0" in wikitext and "Sem alertas suficientes para as distribuições." in wikitext:
+        print("⛔ Estatísticas wiki bloqueadas: relatório zerado/incompleto.")
+        return False
+    return True
+
+
 def queue_wiki_edit(title, wikitext, summary):
     """Coalesce pending writes by title; no network access here."""
     if not wiki_title_is_allowed(title):
         raise PermissionError("Título fora das subpáginas autorizadas")
     if not isinstance(wikitext, str) or not wikitext.strip():
         raise ValueError("Conteúdo wiki vazio")
+    if title == WIKI_STATISTICS_TITLE and not wiki_statistics_publication_safe(wikitext):
+        return False
     mark_wiki_page_pending(title)
     with WIKI_WRITE_LOCK:
         state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
@@ -1726,6 +1757,12 @@ def process_wiki_write_queue_once():
         if wiki_writing_paused() or not pending or time.time() - float(state.get("last_attempt") or 0) < WIKI_WRITE_INTERVAL_SECONDS:
             return False
         item = pending[0]
+        if item.get("title") == WIKI_STATISTICS_TITLE and not wiki_statistics_publication_safe(item.get("text")):
+            # Discard stale unsafe report; preserve all other queued writes.
+            state["pending"].pop(0)
+            atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+            print("⛔ Relatório de estatísticas inseguro removido da fila; demais publicações preservadas.")
+            return False
         try:
             success = wiki_edit_page(item["title"], item["text"], item["summary"])
         except Exception as exc:
@@ -2350,6 +2387,8 @@ WIKI_RELEASE_NOTES = {
     "2.53": "Correção do anúncio de versão no Telegram: confirmação de entrega, recuperação de estado incompleto e novas tentativas automáticas após falhas.",
     "2.54": "Calibração de alterações isoladas no número de filhos (+1 com cautela; saltos maiores suspeitos) e acréscimos curtos de prosa contextual, sem validar automaticamente fatos.",
     "2.55": "Cada nova versão publica um anúncio novo no Telegram, preservando mensagens anteriores; confirmação persistente e novas tentativas após falhas, sem republicação retroativa.",
+    "2.56": "Proteção contra publicação de estatísticas vazias, descarte de relatórios zerados na fila e preservação do arquivo original quando a leitura falha.",
+    "2.57": "Correção da captura das diferenças para a lista de alto risco na Test Wikipedia, com parser compatível com classes adicionais do MediaWiki e fallback pelo conteúdo das revisões.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -8684,63 +8723,50 @@ def get_new_revision_content(revision_id):
         return {"added": "", "removed": ""}
 
 
-def get_revision_diff(old_revision, new_revision):
-    response = requests.get(
-        WIKIPEDIA_API,
-        params={
-            "action": "compare",
-            "format": "json",
-            "formatversion": 2,
-            "fromrev": old_revision,
-            "torev": new_revision,
-            "prop": "diff",
-        },
-        headers=HEADERS,
-        timeout=30
-    )
-
+def _revision_content_for_diff(revision_id):
+    """Obtém wikitext de uma revisão para fallback da comparação."""
+    response = requests.get(WIKIPEDIA_API, params={"action":"query","format":"json","formatversion":2,"prop":"revisions","revids":int(revision_id),"rvprop":"content","rvslots":"main"}, headers=HEADERS, timeout=30)
     response.raise_for_status()
+    pages = response.json().get("query", {}).get("pages", [])
+    if not pages: return ""
+    revisions = pages[0].get("revisions", [])
+    if not revisions: return ""
+    return str(revisions[0].get("slots", {}).get("main", {}).get("content", "") or "")
 
-    diff_html = (
-        response.json()
-        .get("compare", {})
-        .get("body", "")
-    )
 
-    if not diff_html:
-        return {
-            "added": "",
-            "removed": ""
-        }
+def _content_diff_fallback(old_revision, new_revision):
+    """Reconstrói trechos adicionados/removidos quando o HTML de compare muda."""
+    try:
+        old_text = _revision_content_for_diff(old_revision); new_text = _revision_content_for_diff(new_revision)
+        old_lines, new_lines = old_text.splitlines(), new_text.splitlines()
+        matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+        removed, added = [], []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag in ("delete", "replace"): removed.extend(old_lines[i1:i2])
+            if tag in ("insert", "replace"): added.extend(new_lines[j1:j2])
+        added_text = "\n".join(added)[:MAX_DIFF_CHARS]; removed_text = "\n".join(removed)[:MAX_DIFF_CHARS]
+        print("🧩 Diff reconstruído pelo conteúdo das revisões:", old_revision, "→", new_revision, "| adicionados:", len(added_text), "| removidos:", len(removed_text))
+        return {"added":added_text,"removed":removed_text,"has_diff_cells":bool(added_text or removed_text),"whitespace_changed":bool(added_text or removed_text) and added_text == removed_text}
+    except Exception as exc:
+        print("⚠️ Falha ao reconstruir diff pelo conteúdo:", old_revision, "→", new_revision, "|", safe_exception(exc))
+        return {"added":"","removed":"","has_diff_cells":False,"whitespace_changed":False}
 
-    added_matches = re.findall(
-        r'<td class="diff-addedline"[^>]*>(.*?)</td>',
-        diff_html,
-        flags=re.I | re.S
-    )
 
-    removed_matches = re.findall(
-        r'<td class="diff-deletedline"[^>]*>(.*?)</td>',
-        diff_html,
-        flags=re.I | re.S
-    )
-
-    added = "\n".join(
-        clean_html(x)
-        for x in added_matches
-    )
-
-    removed = "\n".join(
-        clean_html(x)
-        for x in removed_matches
-    )
-
-    return {
-        "added": added[:MAX_DIFF_CHARS],
-        "removed": removed[:MAX_DIFF_CHARS],
-        "has_diff_cells": bool(added_matches or removed_matches),
-        "whitespace_changed": bool(added_matches or removed_matches) and added == removed,
-    }
+def get_revision_diff(old_revision, new_revision):
+    try:
+        response = requests.get(WIKIPEDIA_API, params={"action":"compare","format":"json","formatversion":2,"fromrev":old_revision,"torev":new_revision,"prop":"diff"}, headers=HEADERS, timeout=30)
+        response.raise_for_status()
+        diff_html = response.json().get("compare", {}).get("body", "") or ""
+        added_matches = re.findall(r"<td\b[^>]*class=[\"'][^\"']*\bdiff-addedline\b[^\"']*[\"'][^>]*>(.*?)</td>", diff_html, flags=re.I|re.S)
+        removed_matches = re.findall(r"<td\b[^>]*class=[\"'][^\"']*\bdiff-deletedline\b[^\"']*[\"'][^>]*>(.*?)</td>", diff_html, flags=re.I|re.S)
+        added = "\n".join(clean_html(x) for x in added_matches); removed = "\n".join(clean_html(x) for x in removed_matches)
+        if added_matches or removed_matches:
+            return {"added":added[:MAX_DIFF_CHARS],"removed":removed[:MAX_DIFF_CHARS],"has_diff_cells":True,"whitespace_changed":added == removed}
+        print("⚠️ Compare sem células de diff reconhecíveis; usando fallback:", old_revision, "→", new_revision, "| html:", len(diff_html))
+        return _content_diff_fallback(old_revision, new_revision)
+    except Exception as exc:
+        print("⚠️ Erro na API compare; usando fallback:", old_revision, "→", new_revision, "|", safe_exception(exc))
+        return _content_diff_fallback(old_revision, new_revision)
 
 
 def get_revert_risk(revision_id):
