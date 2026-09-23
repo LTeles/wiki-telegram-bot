@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.58"
+BOT_VERSION = "2.59"
 BOT_BUILD = "2.57-testwiki-diff-fallback"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -2390,6 +2390,7 @@ WIKI_RELEASE_NOTES = {
     "2.56": "Proteção contra publicação de estatísticas vazias, descarte de relatórios zerados na fila e preservação do arquivo original quando a leitura falha.",
     "2.57": "Correção da captura das diferenças para a lista de alto risco na Test Wikipedia, com parser compatível com classes adicionais do MediaWiki e fallback pelo conteúdo das revisões.",
     "2.58": "Visualização lado a lado do diferencial, destaque dos trechos alterados e variação em bytes.",
+    "2.59": "Saldo de bytes em destaque na segunda linha e reforço da recuperação das atualizações de estado no Telegram.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -5906,8 +5907,8 @@ def message_with_status(record, status, reverter=None, deleter=None, patroller=N
 
 # Estado da entrega visual é independente da resolução lógica da revisão.
 # Só avisos marcados explicitamente após esta versão entram na recuperação.
-TELEGRAM_STATUS_RETRY_LIMIT = 5
-TELEGRAM_STATUS_RETRY_DELAYS = (60, 180, 600, 1800, 3600)
+TELEGRAM_STATUS_RETRY_LIMIT = 8
+TELEGRAM_STATUS_RETRY_DELAYS = (15, 60, 180, 600, 1800, 3600, 3600, 3600)
 TERMINAL_ALERT_STATUSES = ("reverted", "self_reverted", "patrolled", "deleted")
 
 
@@ -12902,12 +12903,12 @@ def build_high_risk_edit_line(record, pattern_model=None):
     if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool):
         byte_delta = int(byte_delta)
         byte_color = "#14866d" if byte_delta > 0 else "#b32424" if byte_delta < 0 else "#54595d"
-        byte_text = f'<span style="float:right; font-weight:bold; color:{byte_color}">{byte_delta:+d} bytes</span>'
+        byte_text = (f'<div style="text-align:right; font-size:175%; font-weight:bold; '\
+                    f'line-height:1.05; color:{byte_color}">{byte_delta:+d} bytes</div>')
     first_line = (
         f"'''{article_link}''' · [{diff_url} Ver diferenças] · "
         f"[{history_url} Histórico] · [{contributions_url} Contribuições] · "
         f"<span style=\"font-size:115%\">'''{risk:.0%}'''</span>"
-        + (" " + byte_text if byte_text else "")
     )
     second_line = high_risk_diff_excerpt(record)
 
@@ -12921,7 +12922,9 @@ def build_high_risk_edit_line(record, pattern_model=None):
     return (
         f'<div style="background:{background}; border:1px solid #a2a9b1; '
         f'padding:0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
-        f"{first_line}<br>{second_line}<br>"
+        f"{first_line}<br>"
+        + (byte_text if byte_text else "")
+        + f"{second_line}<br>"
         f"<small>'''Estado:''' {status_text}</small>"
         + ("<br>" + pattern_line if pattern_line else "")
         + "</div>"
