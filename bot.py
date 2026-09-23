@@ -25,7 +25,7 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.57"
+BOT_VERSION = "2.58"
 BOT_BUILD = "2.57-testwiki-diff-fallback"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -2389,6 +2389,7 @@ WIKI_RELEASE_NOTES = {
     "2.55": "Cada nova versão publica um anúncio novo no Telegram, preservando mensagens anteriores; confirmação persistente e novas tentativas após falhas, sem republicação retroativa.",
     "2.56": "Proteção contra publicação de estatísticas vazias, descarte de relatórios zerados na fila e preservação do arquivo original quando a leitura falha.",
     "2.57": "Correção da captura das diferenças para a lista de alto risco na Test Wikipedia, com parser compatível com classes adicionais do MediaWiki e fallback pelo conteúdo das revisões.",
+    "2.58": "Visualização lado a lado do diferencial, destaque dos trechos alterados e variação em bytes.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -5034,6 +5035,7 @@ def register_posted_edit(item, telegram_message):
         "diff_added": item.get("stats_payload", {}).get("diff_added", ""),
         "diff_removed": item.get("stats_payload", {}).get("diff_removed", ""),
         "risk_reasons": item.get("stats_payload", {}).get("risk_reasons", ""),
+        "byte_delta": item.get("stats_payload", {}).get("byte_delta"),
         "final_score": (
             item.get("stats_payload", {}).get("score")
             if isinstance(item.get("stats_payload"), dict)
@@ -10049,6 +10051,7 @@ def analysis_worker():
                             "revert_risk": result[
                                 "revert_risk"
                             ],
+                            "byte_delta": ((change.get("length") or {}).get("new", 0) - (change.get("length") or {}).get("old", 0) if isinstance(change.get("length"), dict) and isinstance((change.get("length") or {}).get("new"), int) and isinstance((change.get("length") or {}).get("old"), int) else None),
                         }
                     )
                 )
@@ -12636,36 +12639,34 @@ def high_risk_action(record):
 
 
 def high_risk_diff_excerpt(record, limit=360):
-    """Prévia textual; o modelo Revert Risk não fornece atribuição por palavra."""
-    def compact(value):
-        return re.sub(r"\s+", " ", str(value or "")).strip()
-
-    old = compact(record.get("diff_removed"))
-    new = compact(record.get("diff_added"))
-    if not old and not new:
-        return "<small>Prévia indisponível; consulte o diferencial completo.</small>"
-
-    # Prioriza o ponto de divergência em vez de cortar sempre o começo do texto.
-    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
-    changes = [op for op in matcher.get_opcodes() if op[0] != "equal"]
+    """Prévia lado a lado, destacando somente os trechos alterados."""
+    def compact(value): return re.sub(r"\s+", " ", str(value or "")).strip()
+    def highlighted_pair(before_text, after_text):
+        token_re = re.compile(r"\s+|[^\W_]+|[^\w\s]", flags=re.UNICODE)
+        left_tokens, right_tokens = token_re.findall(before_text), token_re.findall(after_text)
+        matcher = difflib.SequenceMatcher(None, left_tokens, right_tokens, autojunk=False); left_parts, right_parts = [], []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            left, right = wiki_safe_text("".join(left_tokens[i1:i2])), wiki_safe_text("".join(right_tokens[j1:j2]))
+            if tag == "equal": left_parts.append(left); right_parts.append(right)
+            else:
+                if left: left_parts.append('<span style="background:#ffe49c; font-weight:bold">' + left + '</span>')
+                if right: right_parts.append('<span style="background:#a7d8ff; font-weight:bold">' + right + '</span>')
+        return "".join(left_parts), "".join(right_parts)
+    old, new = compact(record.get("diff_removed")), compact(record.get("diff_added"))
+    if not old and not new: return "<small>Prévia indisponível; consulte o diferencial completo.</small>"
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False); changes = [op for op in matcher.get_opcodes() if op[0] != "equal"]
     if changes:
-        _, i1, i2, j1, j2 = max(changes, key=lambda op: max(op[2]-op[1], op[4]-op[3]))
-        before = old[max(0, i1-65):min(len(old), i2+65)]
-        after = new[max(0, j1-65):min(len(new), j2+65)]
+        _, i1, i2, j1, j2 = max(changes, key=lambda op: max(op[2]-op[1], op[4]-op[3])); before = old[max(0,i1-65):min(len(old),i2+65)][:limit]; after = new[max(0,j1-65):min(len(new),j2+65)][:limit]
+    else: before, after = old[:limit//2], new[:limit//2]
+    if before and after: old_line, new_line = highlighted_pair(before, after)
     else:
-        before, after = old[:limit//2], new[:limit//2]
-    before = before[:limit]
-    after = after[:limit]
-    old_line = wiki_safe_text(before) if before else "(sem texto anterior)"
-    new_line = wiki_safe_text(after) if after else "(texto removido)"
-    reasons = compact(record.get("risk_reasons"))
-    # Os motivos são heurísticas identificadas, não explicações causais do modelo.
-    reasons_line = ("<br><small>Sinais detectados: " + wiki_safe_text(reasons[:240]) + "</small>") if reasons else ""
-    return ("<div style=\"margin:0.3em 0; padding:0.35em; border:1px solid #a2a9b1; background:#ffffff\">"
-            "<small>Prévia das alterações (trecho aproximado):</small><br>"
-            "<small>Antes: <del>" + old_line + "</del></small><br>"
-            "<small>Depois: <ins>" + new_line + "</ins></small>"
-            + reasons_line + "</div>")
+        old_line = wiki_safe_text(before) if before else "(sem texto anterior)"; new_line = wiki_safe_text(after) if after else "(texto removido)"
+        if before: old_line = '<span style="background:#ffe49c; font-weight:bold">' + old_line + '</span>'
+        if after: new_line = '<span style="background:#a7d8ff; font-weight:bold">' + new_line + '</span>'
+    reasons = compact(record.get("risk_reasons")); reasons_line = ("<br><small>Sinais detectados: " + wiki_safe_text(reasons[:240]) + "</small>") if reasons else ""
+    return ('<div style="margin:0.3em 0; padding:0.35em; border:1px solid #a2a9b1; background:#ffffff"><small>Prévia das alterações (trecho aproximado):</small><br>'
+            '<table style="width:100%; border-collapse:separate; border-spacing:0.35em 0.2em"><tr><td style="width:50%; vertical-align:top; border:1px solid #f0c36d; padding:0.35em; background:#fffdf5"><small>− <b>Antes:</b> ' + old_line + '</small></td>'
+            '<td style="width:50%; vertical-align:top; border:1px solid #8ec5e8; padding:0.35em; background:#f7fcff"><small>+ <b>Depois:</b> ' + new_line + '</small></td></tr></table>' + reasons_line + '</div>')
 
 
 HIGH_RISK_PATTERN_MIN_PER_CLASS = 3
@@ -12896,10 +12897,17 @@ def build_high_risk_edit_line(record, pattern_model=None):
     diff_url = f"https://pt.wikipedia.org/w/index.php?diff={revision_id}"
     history_url = f"https://pt.wikipedia.org/w/index.php?title={encoded_title}&action=history"
     contributions_url = f"https://pt.wikipedia.org/wiki/Especial:Contribui%C3%A7%C3%B5es/{encoded_user}"
+    byte_delta = record.get("byte_delta")
+    byte_text = ""
+    if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool):
+        byte_delta = int(byte_delta)
+        byte_color = "#14866d" if byte_delta > 0 else "#b32424" if byte_delta < 0 else "#54595d"
+        byte_text = f'<span style="float:right; font-weight:bold; color:{byte_color}">{byte_delta:+d} bytes</span>'
     first_line = (
         f"'''{article_link}''' · [{diff_url} Ver diferenças] · "
         f"[{history_url} Histórico] · [{contributions_url} Contribuições] · "
         f"<span style=\"font-size:115%\">'''{risk:.0%}'''</span>"
+        + (" " + byte_text if byte_text else "")
     )
     second_line = high_risk_diff_excerpt(record)
 
@@ -13019,7 +13027,7 @@ def sync_high_risk_archive():
                 for key in (
                     "revision_id", "username", "title", "revert_risk",
                     "revision_timestamp", "posted_at", "status", "edit_comment",
-                    "diff_added", "diff_removed", "risk_reasons",
+                    "diff_added", "diff_removed", "risk_reasons", "byte_delta",
                     "reverted_by", "reverted_at", "patrolled_by", "patrolled_at",
                     "deleted_by", "deleted_at", "resolved_at", "false_positive_at",
                 )
