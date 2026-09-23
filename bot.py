@@ -25,8 +25,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.59"
-BOT_BUILD = "2.57-testwiki-diff-fallback"
+BOT_VERSION = "2.60"
+BOT_BUILD = "2.60-testwiki-threshold-release"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2391,6 +2391,7 @@ WIKI_RELEASE_NOTES = {
     "2.57": "Correção da captura das diferenças para a lista de alto risco na Test Wikipedia, com parser compatível com classes adicionais do MediaWiki e fallback pelo conteúdo das revisões.",
     "2.58": "Visualização lado a lado do diferencial, destaque dos trechos alterados e variação em bytes.",
     "2.59": "Saldo de bytes em destaque na segunda linha e reforço da recuperação das atualizações de estado no Telegram.",
+    "2.60": "Lista de alto risco da Test Wikipedia passa a aceitar edições acima de 80%; mantém amarelo até 95%, vermelho acima de 95% e azul para revisadas. Corrige a identificação persistente do anúncio de cada nova versão no Telegram.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -2710,8 +2711,14 @@ def announce_new_version_if_needed():
         # O ID é a confirmação persistente da build registrada. Não republicar
         # builds já anunciadas nem tentar recuperar anúncios de versões antigas.
         previous_id = state.get("announcement_message_id")
-        if load_saved_bot_version() == BOT_BUILD and previous_id:
-            print("ℹ️ Anúncio desta build já confirmado; ID:", previous_id)
+        # A identidade do anúncio inclui versão + build. Assim, mesmo que uma
+        # build seja reutilizada por engano em uma versão futura, a nova versão
+        # ainda gera uma postagem própria. Reinícios da mesma versão/build não
+        # duplicam o anúncio.
+        release_key = f"{BOT_VERSION}|{BOT_BUILD}"
+        saved_release_key = state.get("announcement_release_key")
+        if saved_release_key == release_key and previous_id:
+            print("ℹ️ Anúncio desta versão/build já confirmado; ID:", previous_id)
             return True
         notes = WIKI_RELEASE_NOTES.get(BOT_VERSION, "Alterações desta versão não registradas.")
         message = (
@@ -2730,6 +2737,7 @@ def announce_new_version_if_needed():
         # Persistir apenas após confirmação da API. Se a persistência falhar,
         # o worker poderá repetir; a mensagem anterior nunca será modificada.
         state.update({"version": BOT_VERSION, "build": BOT_BUILD,
+                      "announcement_release_key": release_key,
                       "updated_at": datetime.now(timezone.utc).isoformat(),
                       "announcement_message_id": message_id})
         try:
@@ -12418,7 +12426,7 @@ WIKI_HIGH_RISK_TITLE = "User:TelesGramBot/Edições de alto risco"
 WIKI_HIGH_RISK_ARCHIVE_PREFIX = WIKI_HIGH_RISK_TITLE + "/"
 WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Arquivo"
 WIKI_HIGH_RISK_HEADER_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Cabeçalho"
-WIKI_HIGH_RISK_THRESHOLD = 0.85
+WIKI_HIGH_RISK_THRESHOLD = 0.80
 WIKI_HIGH_RISK_RESOLVED_TTL_SECONDS = 30 * 60
 HIGH_RISK_ARCHIVE_FILE = "/data/ptwiki_high_risk_archive.json"
 TESTWIKI_QUEUE_FILE = "/data/ptwiki_testwiki_queue.json"
@@ -12939,7 +12947,8 @@ def select_high_risk_records(records):
             revision_id = int(record.get("revision_id"))
         except (TypeError, ValueError):
             continue
-        if risk < WIKI_HIGH_RISK_THRESHOLD:
+        # O limiar é estrito: 80% exatos não entram; somente risco > 80%.
+        if risk <= WIKI_HIGH_RISK_THRESHOLD:
             continue
         record["revert_risk"] = risk
         record["revision_id"] = revision_id
@@ -12970,7 +12979,7 @@ def build_high_risk_page(records, heading, introduction):
         f"= {heading} =",
         introduction,
         "",
-        "Amarelo: pendente (85–95%); vermelho: pendente (acima de 95%); "
+        "Amarelo: pendente (acima de 80% até 95%); vermelho: pendente (acima de 95%); "
         "azul: edição revista.",
         "Treino de padrões: revertida/eliminada = vandalismo; patrulhada/falso positivo = sem vandalismo. "
         "Autorrevertidas e outros estados ficam fora do treino.",
