@@ -25,8 +25,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.61"
-BOT_BUILD = "2.61-testwiki-manual-review"
+BOT_VERSION = "2.63"
+BOT_BUILD = "2.63-testwiki-manual-review-archives-cleanup"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2393,6 +2393,8 @@ WIKI_RELEASE_NOTES = {
     "2.59": "Saldo de bytes em destaque na segunda linha e reforço da recuperação das atualizações de estado no Telegram.",
     "2.60": "Lista de alto risco da Test Wikipedia passa a aceitar edições acima de 80%; mantém amarelo até 95%, vermelho acima de 95% e azul para revisadas. Corrige a identificação persistente do anúncio de cada nova versão no Telegram.",
     "2.61": "Revisão manual das edições de alto risco por usuários autorizados, com validação de grupos na ptwiki, resolução por revid e opção de desfazer.",
+    "2.62": "Revisões manuais consolidadas em uma única página na Test Wiki, usando novas seções para reduzir criação de subpáginas e evitar regravação concorrente; teste temporariamente liberado a todos os usuários.",
+    "2.63": "Revisão manual também nos arquivos dos últimos 30 dias, carregamento silencioso fora das páginas de alto risco, atualização prioritária após decisão e limpeza semanal da página única de revisões manuais.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -12427,9 +12429,11 @@ WIKI_HIGH_RISK_TITLE = "User:TelesGramBot/Edições de alto risco"
 WIKI_HIGH_RISK_ARCHIVE_PREFIX = WIKI_HIGH_RISK_TITLE + "/"
 WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Arquivo"
 WIKI_HIGH_RISK_HEADER_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Cabeçalho"
-WIKI_HIGH_RISK_MANUAL_PREFIX = "User:TelesGramBot/Revisões manuais/"
+WIKI_HIGH_RISK_MANUAL_TITLE = "User:TelesGramBot/Revisões manuais"
 WIKI_HIGH_RISK_THRESHOLD = 0.80
 HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS = 60
+HIGH_RISK_MANUAL_CLEANUP_SECONDS = 7 * 24 * 60 * 60
+HIGH_RISK_MANUAL_CLEANUP_FILE = "/data/ptwiki_high_risk_manual_cleanup.json"
 HIGH_RISK_MANUAL_AUTHORIZED_GROUPS = frozenset((
     "autoreviewer", "rollbacker", "eliminator", "bureaucrat", "sysop", "interface-admin",
 ))
@@ -13175,7 +13179,7 @@ def build_high_risk_archive_index_wikitext(records):
 
 
 def testwiki_allowed_title(title):
-    if title in (WIKI_HIGH_RISK_TITLE, WIKI_HIGH_RISK_HEADER_TITLE, WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE):
+    if title in (WIKI_HIGH_RISK_TITLE, WIKI_HIGH_RISK_HEADER_TITLE, WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE, WIKI_HIGH_RISK_MANUAL_TITLE):
         return True
     if title.startswith(WIKI_HIGH_RISK_ARCHIVE_PREFIX):
         suffix = title[len(WIKI_HIGH_RISK_ARCHIVE_PREFIX):]
@@ -13186,7 +13190,7 @@ def testwiki_allowed_title(title):
     return False
 
 
-def queue_testwiki_edit(title, text, summary):
+def queue_testwiki_edit(title, text, summary, priority=False):
     if not testwiki_allowed_title(title):
         raise PermissionError("Título não autorizado na Test Wikipedia")
     with TESTWIKI_LOCK:
@@ -13204,32 +13208,43 @@ def queue_testwiki_edit(title, text, summary):
         if existing:
             pending[pending.index(existing)] = item
         else:
-            pending.append(item)
+            if priority:
+                pending.insert(0, item)
+            else:
+                pending.append(item)
+        if priority and existing:
+            pending.remove(item)
+            pending.insert(0, item)
         state["pending"] = pending
         atomic_write_json(TESTWIKI_QUEUE_FILE, state)
         return True
 
 
 def high_risk_manual_user_authorized(username):
-    """Valida os grupos da conta na ptwiki; a interface da Test Wiki não é autoridade."""
-    try:
-        info = get_user_info(str(username or ""), use_cache=False, raise_on_error=True)
-        groups = set((info or {}).get("groups") or [])
-        return bool(groups & HIGH_RISK_MANUAL_AUTHORIZED_GROUPS)
-    except Exception as exc:
-        print("⚠️ Revisão manual: falha ao validar grupos:", safe_exception(exc))
-        return False
+    """Modo de teste 2.62: qualquer conta autenticada pode classificar.
+
+    A lista HIGH_RISK_MANUAL_AUTHORIZED_GROUPS fica preservada para a futura
+    reativação do controle por grupos. A autoria real vem do histórico da
+    Test Wiki, nunca do JSON enviado pelo navegador.
+    """
+    return bool(str(username or "").strip())
 
 
 def fetch_testwiki_manual_decisions():
-    """Obtém a decisão mais recente de User:TelesGramBot/Revisões manuais/<revid>."""
-    prefix = WIKI_HIGH_RISK_MANUAL_PREFIX.split(":", 1)[1]
+    """Lê decisões da página única de revisões manuais.
+
+    Cada clique usa section=new e grava no comentário da edição um marcador
+    estruturado. O comentário e o autor são obtidos do histórico da Test Wiki,
+    evitando confiar no campo reviewer enviado pelo JavaScript.
+    """
     params = {
-        "action":"query", "format":"json", "formatversion":2,
-        "generator":"allpages", "gapnamespace":2, "gapprefix":prefix, "gaplimit":"max",
-        "prop":"revisions", "rvprop":"ids|timestamp|user|content", "rvslots":"main", "rvlimit":20,
+        "action": "query", "format": "json", "formatversion": 2,
+        "prop": "revisions", "titles": WIKI_HIGH_RISK_MANUAL_TITLE,
+        "rvprop": "ids|timestamp|user|comment", "rvlimit": "max",
+        "rvdir": "newer",
     }
     decisions = []
+    marker = re.compile(r"TelesGramBot:manual\s+revid=(\d+)\s+action=(vandalism|clean|undo)\b", re.I)
     while True:
         response = requests.get(TESTWIKI_API, params=params, headers=HEADERS, timeout=30)
         response.raise_for_status()
@@ -13237,32 +13252,22 @@ def fetch_testwiki_manual_decisions():
         if data.get("error"):
             raise RuntimeError("API Test Wiki: " + safe_log_text(data.get("error")))
         for page in data.get("query", {}).get("pages", []) or []:
-            title = str(page.get("title") or "")
-            suffix = title[len(WIKI_HIGH_RISK_MANUAL_PREFIX):] if title.startswith(WIKI_HIGH_RISK_MANUAL_PREFIX) else ""
-            if not suffix.isdigit() or not page.get("revisions"):
-                continue
-            # Processa do mais antigo para o mais novo. Revisões não autorizadas são
-            # ignoradas pelo servidor e não apagam uma decisão autorizada anterior.
-            for rev in reversed(page["revisions"]):
-                content = (((rev.get("slots") or {}).get("main") or {}).get("content"))
-                if content is None:
-                    content = rev.get("content")
-                try:
-                    payload = json.loads(str(content or ""))
-                except (TypeError, ValueError):
+            for rev in page.get("revisions", []) or []:
+                match = marker.search(str(rev.get("comment") or ""))
+                if not match:
                     continue
-                action = str(payload.get("action") or "").strip().lower() if isinstance(payload, dict) else ""
-                if action not in ("vandalism", "clean", "undo"):
-                    continue
-                decisions.append({"revision_id":int(suffix), "action":action,
-                    "actor":str(rev.get("user") or ""), "decision_revision_id":int(rev.get("revid") or 0),
-                    "timestamp":rev.get("timestamp")})
+                decisions.append({
+                    "revision_id": int(match.group(1)),
+                    "action": match.group(2).lower(),
+                    "actor": str(rev.get("user") or ""),
+                    "decision_revision_id": int(rev.get("revid") or 0),
+                    "timestamp": rev.get("timestamp"),
+                })
         cont = data.get("continue")
         if not cont:
             break
         params.update(cont)
     return decisions
-
 
 def apply_high_risk_manual_decision(decision):
     revision_id = str(int(decision["revision_id"]))
@@ -13281,6 +13286,10 @@ def apply_high_risk_manual_decision(decision):
         save_high_risk_archive()
         print(f"⚠️ Revisão manual ignorada: {actor} sem grupo autorizado (revid {revision_id}).")
         return False
+    with high_risk_archive_lock:
+        archived = high_risk_archive.get(revision_id)
+        if not isinstance(archived, dict):
+            return False
         current_status = archived.get("status")
         previous_status = archived.get("manual_previous_status")
     action = decision["action"]
@@ -13324,7 +13333,61 @@ def apply_high_risk_manual_decision(decision):
             live["manual_decision_revid"] = decision_revid
     save_posted_edits()
     print(f"✅ Revisão manual processada: revid {revision_id} · {action} · {actor}")
+    if changed_status:
+        queue_high_risk_manual_refresh(revision_id)
     return changed_status
+
+
+def queue_high_risk_manual_refresh(revision_id):
+    """Prioriza a página que o revisor acabou de alterar visualmente."""
+    revision_id = str(int(revision_id))
+    with high_risk_archive_lock:
+        record = dict(high_risk_archive.get(revision_id) or {})
+        archived = [dict(x) for x in high_risk_archive.values()]
+    # A lista principal pode deixar de conter o item depois da resolução.
+    queue_testwiki_edit(
+        WIKI_HIGH_RISK_TITLE,
+        build_high_risk_wikitext(),
+        "Atualizando revisão manual na lista de alto risco",
+        priority=True,
+    )
+    day = str(record.get("archive_date") or "")
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", day):
+        day_records = [x for x in archived if x.get("archive_date") == day]
+        queue_testwiki_edit(
+            WIKI_HIGH_RISK_ARCHIVE_PREFIX + day,
+            build_high_risk_daily_wikitext(day, day_records),
+            "Atualizando revisão manual no arquivo de " + day,
+            priority=True,
+        )
+
+
+def maybe_queue_weekly_manual_review_cleanup(now=None):
+    """Limpa semanalmente o conteúdo operacional, preservando o histórico wiki."""
+    now_ts = float(now if now is not None else time.time())
+    state = load_json(HIGH_RISK_MANUAL_CLEANUP_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    last = float(state.get("last_cleanup") or 0)
+    if last <= 0:
+        atomic_write_json(HIGH_RISK_MANUAL_CLEANUP_FILE, {"last_cleanup": now_ts})
+        return False
+    if now_ts - last < HIGH_RISK_MANUAL_CLEANUP_SECONDS:
+        return False
+    text = (
+        "__NOINDEX__\n"
+        "Esta página recebe temporariamente as decisões de revisão manual do TelesGramBot. "
+        "Os registros processados são limpos semanalmente; a auditoria permanece disponível no histórico da página.\n"
+    )
+    queued = queue_testwiki_edit(
+        WIKI_HIGH_RISK_MANUAL_TITLE,
+        text,
+        "Limpando registros de revisões manuais já processados",
+        priority=False,
+    )
+    if queued:
+        atomic_write_json(HIGH_RISK_MANUAL_CLEANUP_FILE, {"last_cleanup": now_ts})
+    return queued
 
 
 def reconcile_high_risk_manual_reviews():
@@ -13405,6 +13468,7 @@ def testwiki_high_risk_worker():
         try:
             if time.time() - last_manual_review_check >= HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS:
                 reconcile_high_risk_manual_reviews()
+                maybe_queue_weekly_manual_review_cleanup()
                 last_manual_review_check = time.time()
             queue_high_risk_wiki_pages()
             testwiki_write_once()
