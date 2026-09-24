@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.02"
-BOT_BUILD = "3.02-oauth-direct-main-only"
+BOT_VERSION = "3.03"
+BOT_BUILD = "3.03-high-risk-metadata-timer"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -12695,7 +12695,7 @@ def high_risk_diff_excerpt(record, limit=360):
                 if right: right_parts.append('<span style="background:#a7d8ff; font-weight:bold">' + right + '</span>')
         return "".join(left_parts), "".join(right_parts)
     old, new = compact(record.get("diff_removed")), compact(record.get("diff_added"))
-    if not old and not new: return "<small>Prévia indisponível; consulte o diferencial completo.</small>"
+    if not old and not new: return ""
     matcher = difflib.SequenceMatcher(None, old, new, autojunk=False); changes = [op for op in matcher.get_opcodes() if op[0] != "equal"]
     if changes:
         _, i1, i2, j1, j2 = max(changes, key=lambda op: max(op[2]-op[1], op[4]-op[3])); before = old[max(0,i1-65):min(len(old),i2+65)][:limit]; after = new[max(0,j1-65):min(len(new),j2+65)][:limit]
@@ -12929,51 +12929,71 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     username = str(record.get("username") or "Desconhecido")
     title = str(record.get("title") or "Sem título")
     risk = float(record.get("revert_risk") or 0)
-
     encoded_user = quote(username.replace(" ", "_"), safe="")
     encoded_title = quote(title.replace(" ", "_"), safe="/:()")
-    article_link = (
-        f"[https://pt.wikipedia.org/wiki/{encoded_title} "
-        f"{wiki_safe_text(title)}]"
-    )
+    article_link = f"[https://pt.wikipedia.org/wiki/{encoded_title} {wiki_safe_text(title)}]"
     diff_url = f"https://pt.wikipedia.org/w/index.php?diff={revision_id}"
     history_url = f"https://pt.wikipedia.org/w/index.php?title={encoded_title}&action=history"
+    user_url = f"https://pt.wikipedia.org/wiki/Usu%C3%A1rio:{encoded_user}"
+    talk_url = f"https://pt.wikipedia.org/wiki/Usu%C3%A1rio_Discuss%C3%A3o:{encoded_user}"
     contributions_url = f"https://pt.wikipedia.org/wiki/Especial:Contribui%C3%A7%C3%B5es/{encoded_user}"
+    block_url = f"https://pt.wikipedia.org/wiki/Especial:Bloquear/{encoded_user}"
+    utc_text = format_high_risk_utc(record)
+    revision_timestamp = record.get("revision_timestamp")
+    try:
+        if isinstance(revision_timestamp, (int, float)):
+            revision_moment = datetime.fromtimestamp(float(revision_timestamp), timezone.utc)
+        elif revision_timestamp:
+            revision_moment = datetime.fromisoformat(str(revision_timestamp).replace("Z", "+00:00")).astimezone(timezone.utc)
+        else:
+            revision_moment = datetime.fromtimestamp(float(record.get("posted_at") or 0), timezone.utc)
+        revision_iso = revision_moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+        revision_mw = revision_moment.strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError):
+        revision_iso = ""
+        revision_mw = ""
     byte_delta = record.get("byte_delta")
     byte_text = ""
     if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool):
         byte_delta = int(byte_delta)
         byte_color = "#14866d" if byte_delta > 0 else "#b32424" if byte_delta < 0 else "#54595d"
-        byte_text = (f'<div style="text-align:right; font-size:175%; font-weight:bold; '\
-                    f'line-height:1.05; color:{byte_color}">{byte_delta:+d} bytes</div>')
+        byte_text = (f'<div style="text-align:right; font-size:175%; font-weight:bold; '
+                     f'line-height:1.05; color:{byte_color}">{byte_delta:+d} bytes</div>')
     first_line = (
+        f"<small>'''{wiki_safe_text(utc_text)}'''</small> · "
         f"'''{article_link}''' · [{diff_url} Ver diferenças] · "
-        f"[{history_url} Histórico] · [{contributions_url} Contribuições] · "
-        f"<span style=\"font-size:115%\">'''{risk:.0%}'''</span>"
+        f"[{history_url} Histórico] · <span style=\"font-size:115%\">'''{risk:.0%}'''</span>"
     )
-    second_line = high_risk_diff_excerpt(record)
-
+    user_line = (
+        f'<small>[{user_url} {wiki_safe_text(username)}] · [{talk_url} discussão] · '
+        f'[{contributions_url} contribuições] · [{block_url} bloquear]</small>'
+    )
+    preview = high_risk_diff_excerpt(record)
     action, actor, _ = high_risk_action(record)
-    if action:
-        status_text = f"{action} por {high_risk_account_link(actor)}" if actor else action
-    else:
-        status_text = "Pendente de revisão"
+    status_text = (f"{action} por {high_risk_account_link(actor)}" if actor else action) if action else "Pendente de revisão"
     pattern_line = high_risk_pattern_annotation(record, pattern_model or {}) if include_pattern else ""
     background = high_risk_background(record)
+    timer_wikitext = ""
+    if not action and revision_mw:
+        timer_wikitext = (
+            '<span class="telesgram-age-timer" '
+            f'data-telesgram-timestamp="{revision_iso}">'
+            '{{#expr:floor(({{#time:U}}-{{#time:U|' + revision_mw + '}})/60)}} min</span>'
+        )
     return (
         f'<div class="telesgram-high-risk-entry" data-telesgram-revid="{revision_id}" '
         f'data-telesgram-status="{wiki_safe_text(record.get("status") or "pending")}" '
         f'data-telesgram-reviewer="{wiki_safe_text(record.get("manual_reviewer") or "")}" '
-        f'style="background:{background}; border:1px solid #a2a9b1; '
-        f'padding:0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
-        f"{first_line}<br>"
+        f'data-telesgram-timestamp="{revision_iso}" '
+        f'style="background:{background}; border:1px solid #a2a9b1; padding:0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
+        f"{first_line}<br>{user_line}<br>"
         + (byte_text if byte_text else "")
-        + f"{second_line}<br>"
-        f"<small>'''Estado:''' {status_text}</small>"
+        + (preview + "<br>" if preview else "")
+        + f"<small>'''Estado:''' {status_text}</small>"
         + ("<br>" + pattern_line if pattern_line else "")
+        + (f'<div class="telesgram-timer-source" style="display:none">{timer_wikitext}</div>' if timer_wikitext else "")
         + "</div>"
     )
-
 
 def select_high_risk_records(records):
     eligible = []
