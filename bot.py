@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.0"
-BOT_BUILD = "3.0-oauth-secure-manual-review"
+BOT_VERSION = "3.01"
+BOT_BUILD = "3.01-oauth-profile-fix"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -13600,7 +13600,15 @@ def _new_confirm_state(state_item, username, groups):
 
 
 def _verified_oauth_reviewer(profile):
-    username, groups = _verified_oauth_reviewer(profile)
+    """Valida a identidade devolvida pelo OAuth e consulta os grupos locais na ptwiki."""
+    username = str((profile or {}).get("username") or "").strip()
+    if not username or (profile or {}).get("blocked"):
+        raise PermissionError("Conta Wikimedia inválida ou bloqueada")
+    groups, blocked = ptwiki_groups_for_user(username)
+    if blocked:
+        raise PermissionError("Conta bloqueada na Wikipédia em português")
+    if not high_risk_manual_user_authorized(username, groups):
+        raise PermissionError("Conta sem grupo autorizado na Wikipédia em português")
     return username, groups
 
 
@@ -13670,7 +13678,7 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         q = parse_qs(parsed.query)
         if parsed.path == "/health":
-            return self._html(200, "TelesGramBot 3.0", "Servidor de revisão manual ativo.")
+            return self._html(200, "TelesGramBot 3.01", "Servidor de revisão manual ativo.")
         if parsed.path == "/oauth/login":
             if not (OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REDIRECT_URI):
                 return self._html(503, "OAuth indisponível", "Variáveis OAuth não configuradas.")
