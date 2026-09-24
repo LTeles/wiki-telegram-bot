@@ -10,11 +10,13 @@ import html
 import ipaddress
 import secrets
 import math
+import base64
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from datetime import datetime, timezone, timedelta
 from statistics import median
 from collections import Counter, defaultdict
-from urllib.parse import quote, parse_qs, urlparse
+from urllib.parse import quote, parse_qs, urlparse, urlencode
 from zoneinfo import ZoneInfo
 
 import requests
@@ -25,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "2.63"
-BOT_BUILD = "2.63-testwiki-manual-review-archives-cleanup"
+BOT_VERSION = "3.0"
+BOT_BUILD = "3.0-oauth-secure-manual-review"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2395,6 +2397,7 @@ WIKI_RELEASE_NOTES = {
     "2.61": "Revisão manual das edições de alto risco por usuários autorizados, com validação de grupos na ptwiki, resolução por revid e opção de desfazer.",
     "2.62": "Revisões manuais consolidadas em uma única página na Test Wiki, usando novas seções para reduzir criação de subpáginas e evitar regravação concorrente; teste temporariamente liberado a todos os usuários.",
     "2.63": "Revisão manual também nos arquivos dos últimos 30 dias, carregamento silencioso fora das páginas de alto risco, atualização prioritária após decisão e limpeza semanal da página única de revisões manuais.",
+    "3.0": "Revisão manual segura via OAuth 2.0 Wikimedia: o revisor é autenticado no servidor, grupos da ptwiki são validados no backend, e o TelesGramBot executa as atualizações técnicas na Wiki e no Telegram.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -12437,6 +12440,22 @@ HIGH_RISK_MANUAL_CLEANUP_FILE = "/data/ptwiki_high_risk_manual_cleanup.json"
 HIGH_RISK_MANUAL_AUTHORIZED_GROUPS = frozenset((
     "autoreviewer", "rollbacker", "eliminator", "bureaucrat", "sysop", "interface-admin",
 ))
+
+# Revisão manual 3.0: OAuth autentica a identidade; a conta do bot faz as escritas.
+OAUTH_CLIENT_ID = os.environ.get("WIKIMEDIA_OAUTH_CLIENT_ID", "").strip()
+OAUTH_CLIENT_SECRET = os.environ.get("WIKIMEDIA_OAUTH_CLIENT_SECRET", "").strip()
+OAUTH_REDIRECT_URI = os.environ.get("WIKIMEDIA_OAUTH_REDIRECT_URI", "").strip()
+OAUTH_AUTHORIZE_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/authorize"
+OAUTH_TOKEN_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/access_token"
+OAUTH_PROFILE_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/resource/profile"
+MANUAL_REVIEW_PUBLIC_BASE = os.environ.get(
+    "MANUAL_REVIEW_PUBLIC_BASE", "https://wiki-telegram-bot-production.up.railway.app"
+).rstrip("/")
+MANUAL_REVIEW_STATE_FILE = "/data/ptwiki_oauth_review_states.json"
+MANUAL_REVIEW_STATE_TTL = 10 * 60
+MANUAL_REVIEW_HTTP_PORT = int(os.environ.get("PORT", "8080"))
+MANUAL_REVIEW_ALLOWED_RETURN_HOSTS = frozenset(("test.wikipedia.org",))
+manual_review_state_lock = threading.Lock()
 WIKI_HIGH_RISK_RESOLVED_TTL_SECONDS = 30 * 60
 HIGH_RISK_ARCHIVE_FILE = "/data/ptwiki_high_risk_archive.json"
 TESTWIKI_QUEUE_FILE = "/data/ptwiki_testwiki_queue.json"
@@ -13220,14 +13239,30 @@ def queue_testwiki_edit(title, text, summary, priority=False):
         return True
 
 
-def high_risk_manual_user_authorized(username):
-    """Modo de teste 2.62: qualquer conta autenticada pode classificar.
+def high_risk_manual_user_authorized(username, groups=None):
+    """Autoriza somente os grupos definidos, validando no servidor."""
+    if not str(username or "").strip():
+        return False
+    return bool(set(groups or ()) & HIGH_RISK_MANUAL_AUTHORIZED_GROUPS)
 
-    A lista HIGH_RISK_MANUAL_AUTHORIZED_GROUPS fica preservada para a futura
-    reativação do controle por grupos. A autoria real vem do histórico da
-    Test Wiki, nunca do JSON enviado pelo navegador.
-    """
-    return bool(str(username or "").strip())
+
+def ptwiki_groups_for_user(username):
+    """Consulta grupos locais da ptwiki para uma identidade já autenticada via OAuth."""
+    response = requests.get(
+        WIKIPEDIA_API,
+        params={
+            "action": "query", "format": "json", "formatversion": 2,
+            "list": "users", "ususers": username, "usprop": "groups|blockinfo",
+        },
+        headers=HEADERS, timeout=25,
+    )
+    response.raise_for_status()
+    users = response.json().get("query", {}).get("users", [])
+    if not users or users[0].get("missing"):
+        return set(), True
+    user = users[0]
+    blocked = bool(user.get("blockedby") or user.get("blockid"))
+    return set(user.get("groups") or ()), blocked
 
 
 def fetch_testwiki_manual_decisions():
@@ -13279,7 +13314,7 @@ def apply_high_risk_manual_decision(decision):
             int(archived.get("manual_decision_revid") or 0), int(archived.get("manual_seen_revid") or 0)
         ):
             return False
-    if not high_risk_manual_user_authorized(actor):
+    if not high_risk_manual_user_authorized(actor, decision.get("groups")):
         with high_risk_archive_lock:
             if isinstance(high_risk_archive.get(revision_id), dict):
                 high_risk_archive[revision_id]["manual_seen_revid"] = decision_revid
@@ -13335,8 +13370,39 @@ def apply_high_risk_manual_decision(decision):
     print(f"✅ Revisão manual processada: revid {revision_id} · {action} · {actor}")
     if changed_status:
         queue_high_risk_manual_refresh(revision_id)
+        update_manual_review_telegram(revision_id)
     return changed_status
 
+
+def manual_review_telegram_text(record):
+    status = record.get("status")
+    reviewer = html.escape(str(record.get("manual_reviewer") or ""))
+    base = message_with_status(record, "pending") or record.get("base_message", "").rstrip()
+    if status == "manual_vandalism":
+        return base + " — 🚨 <b>Resolvido manualmente: vandalismo</b> — Revisor: " + reviewer
+    if status == "manual_clean":
+        return base + " — ✅ <b>Resolvido manualmente: sem vandalismo</b> — Revisor: " + reviewer
+    return base
+
+
+def update_manual_review_telegram(revision_id):
+    revision_id = str(int(revision_id))
+    with posted_edits_lock:
+        live = posted_edits.get(revision_id)
+        if not isinstance(live, dict) or not live.get("message_id"):
+            return False
+        current = dict(live)
+    status = current.get("status")
+    if status in ("manual_vandalism", "manual_clean"):
+        text = manual_review_telegram_text(current)
+        markup = tracked_edit_reply_markup(int(revision_id), current.get("alert_kind", "normal"), include_resolution_buttons=False)
+    else:
+        text = current.get("base_message", "").rstrip()
+        markup = current.get("reply_markup") or tracked_edit_reply_markup(int(revision_id), current.get("alert_kind", "normal"), include_resolution_buttons=True)
+    success = edit_telegram_message(current["message_id"], text, parse_mode="HTML", reply_markup=markup)
+    if not success:
+        print("⚠️ Revisão manual persistida, mas o post do Telegram não pôde ser atualizado:", revision_id)
+    return success
 
 def queue_high_risk_manual_refresh(revision_id):
     """Prioriza a página que o revisor acabou de alterar visualmente."""
@@ -13467,7 +13533,7 @@ def testwiki_high_risk_worker():
     while True:
         try:
             if time.time() - last_manual_review_check >= HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS:
-                reconcile_high_risk_manual_reviews()
+                # 3.0: decisões chegam pelo backend OAuth; a página wiki não é mais a fila.
                 maybe_queue_weekly_manual_review_cleanup()
                 last_manual_review_check = time.time()
             queue_high_risk_wiki_pages()
@@ -13475,6 +13541,217 @@ def testwiki_high_risk_worker():
         except Exception as exc:
             print("⚠️ Test Wikipedia:", safe_exception(exc))
         time.sleep(30)
+
+
+def _load_oauth_states():
+    data = load_json(MANUAL_REVIEW_STATE_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _save_oauth_states(data):
+    atomic_write_json(MANUAL_REVIEW_STATE_FILE, data)
+
+
+def _safe_return_url(value):
+    try:
+        parsed = urlparse(str(value or ""))
+        if parsed.scheme == "https" and parsed.hostname in MANUAL_REVIEW_ALLOWED_RETURN_HOSTS:
+            return value
+    except Exception:
+        pass
+    return "https://test.wikipedia.org/wiki/User:TelesGramBot/Edi%C3%A7%C3%B5es_de_alto_risco"
+
+
+def _new_oauth_state(revid, action, return_to):
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with manual_review_state_lock:
+        states = _load_oauth_states()
+        states = {k:v for k,v in states.items() if now - float(v.get("created_at", 0)) < MANUAL_REVIEW_STATE_TTL}
+        states[token] = {"revid": int(revid), "action": action, "return_to": _safe_return_url(return_to), "created_at": now}
+        _save_oauth_states(states)
+    return token
+
+
+def _consume_oauth_state(token):
+    now = time.time()
+    with manual_review_state_lock:
+        states = _load_oauth_states()
+        item = states.pop(str(token or ""), None)
+        states = {k:v for k,v in states.items() if now - float(v.get("created_at", 0)) < MANUAL_REVIEW_STATE_TTL}
+        _save_oauth_states(states)
+    if not item or now - float(item.get("created_at", 0)) >= MANUAL_REVIEW_STATE_TTL:
+        return None
+    return item
+
+
+def _new_confirm_state(state_item, username, groups):
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with manual_review_state_lock:
+        states = _load_oauth_states()
+        states[token] = {
+            "stage": "confirm", "revid": int(state_item["revid"]),
+            "action": str(state_item["action"]), "return_to": _safe_return_url(state_item.get("return_to")),
+            "username": str(username), "groups": sorted(groups), "created_at": now,
+        }
+        _save_oauth_states(states)
+    return token
+
+
+def _verified_oauth_reviewer(profile):
+    username, groups = _verified_oauth_reviewer(profile)
+    return username, groups
+
+
+def _oauth_exchange(code):
+    response = requests.post(OAUTH_TOKEN_URL, data={
+        "grant_type": "authorization_code", "code": code,
+        "client_id": OAUTH_CLIENT_ID, "client_secret": OAUTH_CLIENT_SECRET,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+    }, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError("OAuth não retornou access_token")
+    profile = requests.get(OAUTH_PROFILE_URL, headers={**HEADERS, "Authorization": "Bearer " + token}, timeout=30)
+    profile.raise_for_status()
+    return profile.json()
+
+
+def process_oauth_manual_review(state_item, profile):
+    username = str(profile.get("username") or "").strip()
+    if not username or profile.get("blocked"):
+        raise PermissionError("Conta Wikimedia inválida ou bloqueada")
+    groups, blocked = ptwiki_groups_for_user(username)
+    if blocked or not high_risk_manual_user_authorized(username, groups):
+        raise PermissionError("Conta sem grupo autorizado na Wikipédia em português")
+    revid = int(state_item["revid"])
+    action = str(state_item["action"])
+    if action not in ("clean", "vandalism", "undo"):
+        raise ValueError("Ação inválida")
+    decision = {
+        "revision_id": revid, "action": action, "actor": username,
+        "groups": sorted(groups), "decision_revision_id": int(time.time() * 1000),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    # Evita colisão com um clique no mesmo milissegundo.
+    with high_risk_archive_lock:
+        old = high_risk_archive.get(str(revid)) or {}
+        decision["decision_revision_id"] = max(decision["decision_revision_id"], int(old.get("manual_decision_revid") or 0) + 1)
+    changed = apply_high_risk_manual_decision(decision)
+    if not changed:
+        raise RuntimeError("A revisão já possui um desfecho mais recente ou a ação não é aplicável")
+    return username
+
+
+class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
+    server_version = "TelesGramBot/3.0"
+
+    def log_message(self, fmt, *args):
+        print("🌐 Revisão manual:", safe_log_text(fmt % args))
+
+    def _redirect(self, url):
+        self.send_response(302)
+        self.send_header("Location", url)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _html(self, status, title, message):
+        body = ("<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+                "<title>" + html.escape(title) + "</title><body style='font-family:system-ui;padding:2rem'>"
+                "<h2>" + html.escape(title) + "</h2><p>" + html.escape(message) + "</p></body>").encode()
+        self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store")
+        self.end_headers(); self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        q = parse_qs(parsed.query)
+        if parsed.path == "/health":
+            return self._html(200, "TelesGramBot 3.0", "Servidor de revisão manual ativo.")
+        if parsed.path == "/oauth/login":
+            if not (OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REDIRECT_URI):
+                return self._html(503, "OAuth indisponível", "Variáveis OAuth não configuradas.")
+            try:
+                revid = int((q.get("revid") or [""])[0]); action = (q.get("action") or [""])[0]
+                if action not in ("clean", "vandalism", "undo"): raise ValueError()
+            except Exception:
+                return self._html(400, "Pedido inválido", "Revisão ou ação inválida.")
+            state = _new_oauth_state(revid, action, (q.get("return_to") or [""])[0])
+            auth_url = OAUTH_AUTHORIZE_URL + "?" + urlencode({
+                "client_id": OAUTH_CLIENT_ID, "response_type": "code",
+                "redirect_uri": OAUTH_REDIRECT_URI, "state": state,
+            })
+            return self._redirect(auth_url)
+        if parsed.path == "/oauth/callback":
+            state = _consume_oauth_state((q.get("state") or [""])[0])
+            if not state:
+                return self._html(400, "Sessão expirada", "O pedido OAuth é inválido, expirou ou já foi utilizado.")
+            if q.get("error"):
+                return self._redirect(state["return_to"] + ("&" if "?" in state["return_to"] else "?") + "telesgram_review=cancelled")
+            code = (q.get("code") or [""])[0]
+            try:
+                profile = _oauth_exchange(code)
+                username, groups = _verified_oauth_reviewer(profile)
+                confirm_token = _new_confirm_state(state, username, groups)
+                action_label = {"clean":"Sem vandalismo", "vandalism":"Vandalismo", "undo":"Desfazer revisão manual"}[state["action"]]
+                body = ("<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+                        "<title>Confirmar revisão</title><body style='font-family:system-ui;padding:2rem;max-width:40rem;margin:auto'>"
+                        "<h2>Confirmar revisão manual</h2><p>Conta autenticada: <b>" + html.escape(username) + "</b></p>"
+                        "<p>Revisão: <b>" + str(int(state["revid"])) + "</b><br>Decisão: <b>" + html.escape(action_label) + "</b></p>"
+                        "<form method='post' action='/review/confirm'><input type='hidden' name='token' value='" + html.escape(confirm_token, quote=True) + "'>"
+                        "<button style='font-size:1rem;padding:.7rem 1rem' type='submit'>Confirmar decisão</button></form>"
+                        "<p><a href='" + html.escape(state["return_to"], quote=True) + "'>Cancelar</a></p></body>").encode()
+                self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store")
+                self.end_headers(); self.wfile.write(body); return
+            except PermissionError as exc:
+                return self._html(403, "Revisão não autorizada", str(exc))
+            except Exception as exc:
+                print("❌ OAuth/revisão manual:", safe_exception(exc))
+                return self._html(500, "Falha na autenticação", "Não foi possível validar a conta. Tente novamente.")
+        return self._html(404, "Não encontrado", "Endpoint inexistente.")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/review/confirm":
+            return self._html(404, "Não encontrado", "Endpoint inexistente.")
+        try:
+            length = min(int(self.headers.get("Content-Length", "0")), 4096)
+            form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+            state = _consume_oauth_state((form.get("token") or [""])[0])
+            if not state or state.get("stage") != "confirm":
+                return self._html(400, "Confirmação expirada", "A confirmação é inválida, expirou ou já foi utilizada.")
+            # Revalida o grupo na ptwiki no instante da decisão.
+            groups, blocked = ptwiki_groups_for_user(state["username"])
+            if blocked or not high_risk_manual_user_authorized(state["username"], groups):
+                return self._html(403, "Revisão não autorizada", "A conta não possui mais um grupo autorizado.")
+            decision = {
+                "revision_id": int(state["revid"]), "action": state["action"], "actor": state["username"],
+                "groups": sorted(groups), "decision_revision_id": int(time.time() * 1000),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            with high_risk_archive_lock:
+                old = high_risk_archive.get(str(state["revid"])) or {}
+                decision["decision_revision_id"] = max(decision["decision_revision_id"], int(old.get("manual_decision_revid") or 0) + 1)
+            if not apply_high_risk_manual_decision(decision):
+                return self._html(409, "Decisão não aplicada", "A revisão já possui um desfecho mais recente ou esta ação não é aplicável.")
+            target = state["return_to"] + ("&" if "?" in state["return_to"] else "?") + urlencode({"telesgram_review":"ok"})
+            return self._redirect(target)
+        except Exception as exc:
+            print("❌ Confirmação de revisão manual:", safe_exception(exc))
+            return self._html(500, "Falha na revisão", "A decisão não foi aplicada. Tente novamente.")
+
+
+def manual_review_http_server():
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", MANUAL_REVIEW_HTTP_PORT), ManualReviewHTTPHandler)
+        print("🌐 Revisão manual OAuth: servidor HTTP ativo na porta", MANUAL_REVIEW_HTTP_PORT)
+        server.serve_forever()
+    except Exception as exc:
+        print("❌ Servidor OAuth:", safe_exception(exc))
 
 def main():
     print("========================================")
@@ -13601,6 +13878,7 @@ def main():
         ("pending-alerts-summary", pending_alerts_summary_scheduler),
         ("pending-resolution-reconciliation", pending_resolution_reconciliation_scheduler),
         ("testwiki-high-risk", testwiki_high_risk_worker),
+        ("manual-review-http", manual_review_http_server),
     ]
 
     for name, target in threads:
