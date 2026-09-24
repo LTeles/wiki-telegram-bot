@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.09"
-BOT_BUILD = "3.09-persistent-posted-edits-guard"
+BOT_VERSION = "3.10"
+BOT_BUILD = "3.10-calendar-status-stable-card-layout"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -13004,7 +13004,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
             revision_moment = datetime.fromtimestamp(float(record.get("posted_at") or 0), timezone.utc)
         revision_iso = revision_moment.strftime("%Y-%m-%dT%H:%M:%SZ")
         revision_mw = revision_moment.strftime("%Y-%m-%d %H:%M:%S")
-        compact_time = revision_moment.strftime("%H:%M:%S %d/%m/%Y UTC")
+        compact_time = revision_moment.strftime("%d/%m/%Y<br>%H:%M:%S UTC")
     except (TypeError, ValueError, OverflowError):
         revision_iso = ""
         revision_mw = ""
@@ -13019,11 +13019,16 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
 
     risk_badge_bg = "#b32424" if risk > 0.95 else "#ac6600"
     risk_badge = (
-        f'<span class="telesgram-risk-badge" style="position:absolute; top:0.45em; right:0.55em; '
-        f'width:3.65em; height:3.65em; display:flex; align-items:center; justify-content:center; '
-        f'box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; '
-        f'background:{risk_badge_bg}; color:#fff; font-weight:bold; font-size:110%; '
-        f'line-height:1">{risk:.0%}</span>'
+        f'<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.55em; '
+        f'width:5.2em; text-align:center">'
+        f'<span class="telesgram-risk-badge" style="width:4.25em; height:4.25em; margin:0 auto; '
+        f'display:flex; align-items:center; justify-content:center; box-sizing:border-box; '
+        f'border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{risk_badge_bg}; '
+        f'color:#fff; font-weight:bold; font-size:116%; line-height:1">{risk:.0%}</span>'
+        + (f'<span class="telesgram-card-date" style="display:block; margin-top:0.38em; '
+           f'color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">'
+           f'{compact_time}</span>' if compact_time else "")
+        + '</div>'
     )
 
     first_line = (
@@ -13031,9 +13036,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     )
     user_line = (
         f'<small>Conta: [{user_url} {wiki_safe_text(username)}] · [{talk_url} discussão] · '
-        f'[{contributions_url} contribuições] · [{block_url} bloquear]'
-        + (f' <span style="float:right; margin-right:4.8em; color:#54595d">{wiki_safe_text(compact_time)}</span>' if compact_time else "")
-        + '</small>'
+        f'[{contributions_url} contribuições] · [{block_url} bloquear]</small>'
     )
 
     preview = high_risk_diff_excerpt(record)
@@ -13055,7 +13058,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         f'data-telesgram-reviewer="{wiki_safe_text(record.get("manual_reviewer") or "")}" '
         f'data-telesgram-timestamp="{revision_iso}" '
         f'style="position:relative; background:{background}; border:1px solid #a2a9b1; '
-        f'padding:0.45em 5.0em 0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
+        f'padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0; line-height:1.35">'
         + risk_badge + f"{first_line}<br>{user_line}<br>"
         + (preview + "<br>" if preview else "")
         + f"<small>'''Estado:''' {status_text}</small>"
@@ -13273,12 +13276,18 @@ def build_high_risk_header_wikitext(records):
 def build_high_risk_archive_index_wikitext(records):
     days = high_risk_archive_days(records)
     available = set(days)
+    pending_days = {
+        str(record.get("archive_date") or "")
+        for record in records
+        if str(record.get("archive_date") or "") in available
+        and high_risk_action(record)[0] is None
+    }
     months = sorted({day[:7] for day in days}, reverse=True)
     lines = [
         "__NOINDEX__",
         high_risk_header_transclusion(),
         "= Arquivo de edições de alto risco =",
-        "Os dias com arquivo disponível aparecem como links. As semanas começam na segunda-feira.",
+        "Os dias com arquivo disponível aparecem como links. Amarelo indica que ainda há revisão pendente; azul indica que não há pendências. As semanas começam na segunda-feira.",
     ]
     if not months:
         lines.append("''Ainda não há arquivos diários.''")
@@ -13299,10 +13308,14 @@ def build_high_risk_archive_index_wikitext(records):
                     cells.append("")
                     continue
                 day = f"{year:04d}-{month:02d}-{day_number:02d}"
-                cells.append(
-                    f"[[{WIKI_HIGH_RISK_ARCHIVE_PREFIX}{day}|'''{day_number}''']]"
-                    if day in available else str(day_number)
-                )
+                if day in available:
+                    day_bg = "#fff3cd" if day in pending_days else "#d8ecff"
+                    cells.append(
+                        f'style="background:{day_bg}" | '
+                        + f"[[{WIKI_HIGH_RISK_ARCHIVE_PREFIX}{day}|'''{day_number}''']]"
+                    )
+                else:
+                    cells.append(str(day_number))
             lines.extend(["|-", "| " + " || ".join(cells)])
         lines.append("|}")
     return "\n".join(lines) + "\n"
