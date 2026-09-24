@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.04"
-BOT_BUILD = "3.04-form-post-risk-badge"
+BOT_VERSION = "3.05"
+BOT_BUILD = "3.05-visual-labels-valid-edit"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -12960,8 +12960,8 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool):
         byte_delta = int(byte_delta)
         byte_color = "#14866d" if byte_delta > 0 else "#b32424" if byte_delta < 0 else "#54595d"
-        byte_text = (f'<div style="text-align:right; font-size:175%; font-weight:bold; '
-                     f'line-height:1.05; color:{byte_color}">{byte_delta:+d} bytes</div>')
+        byte_text = (f'<div style="text-align:right; font-size:100%; font-weight:normal; '
+                     f'line-height:1.05; color:{byte_color}">Variação do tamanho: {byte_delta:+d} bytes</div>')
 
     risk_badge_bg = "#b32424" if risk > 0.95 else "#ac6600"
     risk_badge = (
@@ -12973,16 +12973,21 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     )
 
     first_line = (
-        f"'''{article_link}''' · [{diff_url} Ver diferenças] · [{history_url} Histórico]"
+        f"<small>Artigo:</small> '''{article_link}''' · [{diff_url} Ver diferenças] · [{history_url} Histórico]"
     )
     user_line = (
-        f'<small>[{user_url} {wiki_safe_text(username)}] · [{talk_url} discussão] · '
+        f'<small>Conta: [{user_url} {wiki_safe_text(username)}] · [{talk_url} discussão] · '
         f'[{contributions_url} contribuições] · [{block_url} bloquear]'
         + (f' <span style="float:right; margin-right:4.2em; color:#54595d">{wiki_safe_text(compact_time)}</span>' if compact_time else "")
         + '</small>'
     )
 
     preview = high_risk_diff_excerpt(record)
+    if preview:
+        preview = "\n".join(
+            line for line in preview.splitlines()
+            if "sinais detectados:" not in line.lower()
+        ).strip()
     action, actor, _ = high_risk_action(record)
     status_text = (f"{action} por {high_risk_account_link(actor)}" if actor else action) if action else "Pendente de revisão"
     pattern_line = high_risk_pattern_annotation(record, pattern_model or {}) if include_pattern else ""
