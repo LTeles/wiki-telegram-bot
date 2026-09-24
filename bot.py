@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.01"
-BOT_BUILD = "3.01-oauth-profile-fix"
+BOT_VERSION = "3.02"
+BOT_BUILD = "3.02-oauth-direct-main-only"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -12924,7 +12924,7 @@ def high_risk_background(record):
     return "#f8d7da" if float(record.get("revert_risk") or 0) > 0.95 else "#fff3cd"
 
 
-def build_high_risk_edit_line(record, pattern_model=None):
+def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     revision_id = int(record["revision_id"])
     username = str(record.get("username") or "Desconhecido")
     title = str(record.get("title") or "Sem título")
@@ -12958,7 +12958,7 @@ def build_high_risk_edit_line(record, pattern_model=None):
         status_text = f"{action} por {high_risk_account_link(actor)}" if actor else action
     else:
         status_text = "Pendente de revisão"
-    pattern_line = high_risk_pattern_annotation(record, pattern_model or {})
+    pattern_line = high_risk_pattern_annotation(record, pattern_model or {}) if include_pattern else ""
     background = high_risk_background(record)
     return (
         f'<div class="telesgram-high-risk-entry" data-telesgram-revid="{revision_id}" '
@@ -13005,9 +13005,9 @@ def high_risk_header_transclusion():
     return "{{" + WIKI_HIGH_RISK_HEADER_TITLE + "}}"
 
 
-def build_high_risk_page(records, heading, introduction):
+def build_high_risk_page(records, heading, introduction, include_dynamic_learning=True):
     eligible = select_high_risk_records(records)
-    pattern_model = train_high_risk_pattern_model()
+    pattern_model = train_high_risk_pattern_model() if include_dynamic_learning else {}
     pattern_counts = pattern_model.get("counts", {})
     lines = [
         "__NOINDEX__",
@@ -13017,28 +13017,31 @@ def build_high_risk_page(records, heading, introduction):
         "",
         "Amarelo: pendente (acima de 80% até 95%); vermelho: pendente (acima de 95%); "
         "azul: edição revista.",
-        "Treino de padrões: revertida/eliminada = vandalismo; patrulhada/falso positivo = sem vandalismo. "
-        "Autorrevertidas e outros estados ficam fora do treino.",
-        "A semelhança de padrões é informativa; não altera o risco calculado nem confirma sozinha o caso.",
-        "",
     ]
-    if pattern_model.get("ready"):
-        lines.append(
-            "''Base de padrões: "
-            f"{pattern_counts.get('vandalismo', 0)} exemplos de vandalismo e "
-            f"{pattern_counts.get('sem_vandalismo', 0)} exemplos sem vandalismo.''"
-        )
-    else:
-        lines.append(
-            "''Aprendizagem em fase inicial: "
-            f"{pattern_counts.get('vandalismo', 0)} exemplos de vandalismo e "
-            f"{pattern_counts.get('sem_vandalismo', 0)} sem vandalismo; "
-            f"mínimo de {HIGH_RISK_PATTERN_MIN_PER_CLASS} por classe para exibir semelhanças.''"
-        )
-    lines.append("")
+    if include_dynamic_learning:
+        lines.extend([
+            "Treino de padrões: revertida/eliminada = vandalismo; patrulhada/falso positivo = sem vandalismo. "
+            "Autorrevertidas e outros estados ficam fora do treino.",
+            "A semelhança de padrões é informativa; não altera o risco calculado nem confirma sozinha o caso.",
+            "",
+        ])
+        if pattern_model.get("ready"):
+            lines.append(
+                "''Base de padrões: "
+                f"{pattern_counts.get('vandalismo', 0)} exemplos de vandalismo e "
+                f"{pattern_counts.get('sem_vandalismo', 0)} exemplos sem vandalismo.''"
+            )
+        else:
+            lines.append(
+                "''Aprendizagem em fase inicial: "
+                f"{pattern_counts.get('vandalismo', 0)} exemplos de vandalismo e "
+                f"{pattern_counts.get('sem_vandalismo', 0)} sem vandalismo; "
+                f"mínimo de {HIGH_RISK_PATTERN_MIN_PER_CLASS} por classe para exibir semelhanças.''"
+            )
+        lines.append("")
     if eligible:
         lines.extend(
-            build_high_risk_edit_line(record, pattern_model)
+            build_high_risk_edit_line(record, pattern_model, include_pattern=include_dynamic_learning)
             for record in eligible
         )
     else:
@@ -13108,6 +13111,7 @@ def build_high_risk_daily_wikitext(day, records):
         records,
         f"Edições com alto risco de vandalismo — {day}",
         f"Arquivo permanente das edições detectadas em {day} (UTC).",
+        include_dynamic_learning=False,
     )
 
 
@@ -13473,8 +13477,17 @@ def queue_high_risk_wiki_pages():
     queue_testwiki_edit(WIKI_HIGH_RISK_TITLE, build_high_risk_wikitext(), "Atualizando lista de edições de alto risco")
     queue_testwiki_edit(WIKI_HIGH_RISK_HEADER_TITLE, build_high_risk_header_wikitext(archived), "Atualizando cabeçalho")
     queue_testwiki_edit(WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE, build_high_risk_archive_index_wikitext(archived), "Atualizando índice do arquivo")
-    for day in high_risk_archive_days(archived):
-        queue_testwiki_edit(WIKI_HIGH_RISK_ARCHIVE_PREFIX + day, build_high_risk_daily_wikitext(day, [x for x in archived if x.get("archive_date") == day]), "Atualizando arquivo de " + day)
+    # Arquivos históricos não são reescritos por mudanças globais da aprendizagem.
+    # A sincronização periódica toca apenas o arquivo do dia atual. Arquivos antigos
+    # continuam sendo atualizados de forma direcionada quando uma edição daquele dia
+    # realmente muda de estado (por exemplo, revisão manual).
+    current_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if current_day in high_risk_archive_days(archived):
+        queue_testwiki_edit(
+            WIKI_HIGH_RISK_ARCHIVE_PREFIX + current_day,
+            build_high_risk_daily_wikitext(current_day, [x for x in archived if x.get("archive_date") == current_day]),
+            "Atualizando arquivo de " + current_day,
+        )
 
 
 def testwiki_writing_paused():
@@ -13680,19 +13693,7 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             return self._html(200, "TelesGramBot 3.01", "Servidor de revisão manual ativo.")
         if parsed.path == "/oauth/login":
-            if not (OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REDIRECT_URI):
-                return self._html(503, "OAuth indisponível", "Variáveis OAuth não configuradas.")
-            try:
-                revid = int((q.get("revid") or [""])[0]); action = (q.get("action") or [""])[0]
-                if action not in ("clean", "vandalism", "undo"): raise ValueError()
-            except Exception:
-                return self._html(400, "Pedido inválido", "Revisão ou ação inválida.")
-            state = _new_oauth_state(revid, action, (q.get("return_to") or [""])[0])
-            auth_url = OAUTH_AUTHORIZE_URL + "?" + urlencode({
-                "client_id": OAUTH_CLIENT_ID, "response_type": "code",
-                "redirect_uri": OAUTH_REDIRECT_URI, "state": state,
-            })
-            return self._redirect(auth_url)
+            return self._html(410, "Fluxo antigo desativado", "Inicie a revisão pelos botões da página de alto risco.")
         if parsed.path == "/oauth/callback":
             state = _consume_oauth_state((q.get("state") or [""])[0])
             if not state:
@@ -13702,28 +13703,62 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
             code = (q.get("code") or [""])[0]
             try:
                 profile = _oauth_exchange(code)
-                username, groups = _verified_oauth_reviewer(profile)
-                confirm_token = _new_confirm_state(state, username, groups)
-                action_label = {"clean":"Sem vandalismo", "vandalism":"Vandalismo", "undo":"Desfazer revisão manual"}[state["action"]]
-                body = ("<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
-                        "<title>Confirmar revisão</title><body style='font-family:system-ui;padding:2rem;max-width:40rem;margin:auto'>"
-                        "<h2>Confirmar revisão manual</h2><p>Conta autenticada: <b>" + html.escape(username) + "</b></p>"
-                        "<p>Revisão: <b>" + str(int(state["revid"])) + "</b><br>Decisão: <b>" + html.escape(action_label) + "</b></p>"
-                        "<form method='post' action='/review/confirm'><input type='hidden' name='token' value='" + html.escape(confirm_token, quote=True) + "'>"
-                        "<button style='font-size:1rem;padding:.7rem 1rem' type='submit'>Confirmar decisão</button></form>"
-                        "<p><a href='" + html.escape(state["return_to"], quote=True) + "'>Cancelar</a></p></body>").encode()
-                self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store")
-                self.end_headers(); self.wfile.write(body); return
+                username = process_oauth_manual_review(state, profile)
+                target = state["return_to"] + ("&" if "?" in state["return_to"] else "?") + urlencode({"telesgram_review":"ok", "reviewer":username})
+                return self._redirect(target)
             except PermissionError as exc:
                 return self._html(403, "Revisão não autorizada", str(exc))
             except Exception as exc:
                 print("❌ OAuth/revisão manual:", safe_exception(exc))
-                return self._html(500, "Falha na autenticação", "Não foi possível validar a conta. Tente novamente.")
+                return self._html(500, "Falha na revisão", "A decisão não foi aplicada. Tente novamente.")
         return self._html(404, "Não encontrado", "Endpoint inexistente.")
+
+    def _cors_origin(self):
+        origin = str(self.headers.get("Origin") or "")
+        return origin if origin == "https://test.wikipedia.org" else None
+
+    def do_OPTIONS(self):
+        if urlparse(self.path).path != "/review/start":
+            return self._html(404, "Não encontrado", "Endpoint inexistente.")
+        origin = self._cors_origin()
+        if not origin:
+            return self._html(403, "Origem não autorizada", "Origem não autorizada.")
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/review/start":
+            origin = self._cors_origin()
+            if not origin:
+                return self._html(403, "Origem não autorizada", "Origem não autorizada.")
+            try:
+                length = min(int(self.headers.get("Content-Length", "0")), 4096)
+                payload = json.loads(self.rfile.read(length).decode("utf-8", "replace") or "{}")
+                revid = int(payload.get("revid")); action = str(payload.get("action") or "")
+                if action not in ("clean", "vandalism", "undo"):
+                    raise ValueError("Ação inválida")
+                state = _new_oauth_state(revid, action, payload.get("return_to"))
+                auth_url = OAUTH_AUTHORIZE_URL + "?" + urlencode({
+                    "client_id": OAUTH_CLIENT_ID, "response_type": "code",
+                    "redirect_uri": OAUTH_REDIRECT_URI, "state": state,
+                })
+                body = json.dumps({"authorize_url": auth_url}, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers(); self.wfile.write(body); return
+            except Exception as exc:
+                print("❌ Início de revisão manual:", safe_exception(exc))
+                return self._html(400, "Pedido inválido", "Não foi possível iniciar a revisão.")
         if parsed.path != "/review/confirm":
             return self._html(404, "Não encontrado", "Endpoint inexistente.")
         try:
