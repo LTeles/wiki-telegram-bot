@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.03"
-BOT_BUILD = "3.03-high-risk-metadata-timer"
+BOT_VERSION = "3.04"
+BOT_BUILD = "3.04-form-post-risk-badge"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -12938,7 +12938,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     talk_url = f"https://pt.wikipedia.org/wiki/Usu%C3%A1rio_Discuss%C3%A3o:{encoded_user}"
     contributions_url = f"https://pt.wikipedia.org/wiki/Especial:Contribui%C3%A7%C3%B5es/{encoded_user}"
     block_url = f"https://pt.wikipedia.org/wiki/Especial:Bloquear/{encoded_user}"
-    utc_text = format_high_risk_utc(record)
+
     revision_timestamp = record.get("revision_timestamp")
     try:
         if isinstance(revision_timestamp, (int, float)):
@@ -12949,9 +12949,12 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
             revision_moment = datetime.fromtimestamp(float(record.get("posted_at") or 0), timezone.utc)
         revision_iso = revision_moment.strftime("%Y-%m-%dT%H:%M:%SZ")
         revision_mw = revision_moment.strftime("%Y-%m-%d %H:%M:%S")
+        compact_time = revision_moment.strftime("%H:%M:%S %d/%m/%Y UTC")
     except (TypeError, ValueError, OverflowError):
         revision_iso = ""
         revision_mw = ""
+        compact_time = ""
+
     byte_delta = record.get("byte_delta")
     byte_text = ""
     if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool):
@@ -12959,15 +12962,26 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         byte_color = "#14866d" if byte_delta > 0 else "#b32424" if byte_delta < 0 else "#54595d"
         byte_text = (f'<div style="text-align:right; font-size:175%; font-weight:bold; '
                      f'line-height:1.05; color:{byte_color}">{byte_delta:+d} bytes</div>')
+
+    risk_badge_bg = "#b32424" if risk > 0.95 else "#ac6600"
+    risk_badge = (
+        f'<span class="telesgram-risk-badge" style="position:absolute; top:0.45em; right:0.55em; '
+        f'width:3.15em; height:3.15em; display:flex; align-items:center; justify-content:center; '
+        f'box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; '
+        f'background:{risk_badge_bg}; color:#fff; font-weight:bold; font-size:105%; '
+        f'line-height:1">{risk:.0%}</span>'
+    )
+
     first_line = (
-        f"<small>'''{wiki_safe_text(utc_text)}'''</small> · "
-        f"'''{article_link}''' · [{diff_url} Ver diferenças] · "
-        f"[{history_url} Histórico] · <span style=\"font-size:115%\">'''{risk:.0%}'''</span>"
+        f"'''{article_link}''' · [{diff_url} Ver diferenças] · [{history_url} Histórico]"
     )
     user_line = (
         f'<small>[{user_url} {wiki_safe_text(username)}] · [{talk_url} discussão] · '
-        f'[{contributions_url} contribuições] · [{block_url} bloquear]</small>'
+        f'[{contributions_url} contribuições] · [{block_url} bloquear]'
+        + (f' <span style="float:right; margin-right:4.2em; color:#54595d">{wiki_safe_text(compact_time)}</span>' if compact_time else "")
+        + '</small>'
     )
+
     preview = high_risk_diff_excerpt(record)
     action, actor, _ = high_risk_action(record)
     status_text = (f"{action} por {high_risk_account_link(actor)}" if actor else action) if action else "Pendente de revisão"
@@ -12980,13 +12994,15 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
             f'data-telesgram-timestamp="{revision_iso}">'
             '{{#expr:floor(({{#time:U}}-{{#time:U|' + revision_mw + '}})/60)}} min</span>'
         )
+
     return (
         f'<div class="telesgram-high-risk-entry" data-telesgram-revid="{revision_id}" '
         f'data-telesgram-status="{wiki_safe_text(record.get("status") or "pending")}" '
         f'data-telesgram-reviewer="{wiki_safe_text(record.get("manual_reviewer") or "")}" '
         f'data-telesgram-timestamp="{revision_iso}" '
-        f'style="background:{background}; border:1px solid #a2a9b1; padding:0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
-        f"{first_line}<br>{user_line}<br>"
+        f'style="position:relative; background:{background}; border:1px solid #a2a9b1; '
+        f'padding:0.45em 4.4em 0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
+        + risk_badge + f"{first_line}<br>{user_line}<br>"
         + (byte_text if byte_text else "")
         + (preview + "<br>" if preview else "")
         + f"<small>'''Estado:''' {status_text}</small>"
@@ -13754,28 +13770,31 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/review/start":
-            origin = self._cors_origin()
-            if not origin:
+            # POST de navegação normal: evita fetch/CORS entre a Test Wiki e o Railway.
+            origin = str(self.headers.get("Origin") or "")
+            if origin and origin != "https://test.wikipedia.org":
                 return self._html(403, "Origem não autorizada", "Origem não autorizada.")
             try:
                 length = min(int(self.headers.get("Content-Length", "0")), 4096)
-                payload = json.loads(self.rfile.read(length).decode("utf-8", "replace") or "{}")
-                revid = int(payload.get("revid")); action = str(payload.get("action") or "")
+                raw = self.rfile.read(length).decode("utf-8", "replace")
+                content_type = str(self.headers.get("Content-Type") or "").lower()
+                if "application/json" in content_type:
+                    payload = json.loads(raw or "{}")
+                else:
+                    form = parse_qs(raw)
+                    payload = {key: (values[0] if values else "") for key, values in form.items()}
+                revid = int(payload.get("revid"))
+                action = str(payload.get("action") or "")
                 if action not in ("clean", "vandalism", "undo"):
                     raise ValueError("Ação inválida")
                 state = _new_oauth_state(revid, action, payload.get("return_to"))
                 auth_url = OAUTH_AUTHORIZE_URL + "?" + urlencode({
-                    "client_id": OAUTH_CLIENT_ID, "response_type": "code",
-                    "redirect_uri": OAUTH_REDIRECT_URI, "state": state,
+                    "client_id": OAUTH_CLIENT_ID,
+                    "response_type": "code",
+                    "redirect_uri": OAUTH_REDIRECT_URI,
+                    "state": state,
                 })
-                body = json.dumps({"authorize_url": auth_url}, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Access-Control-Allow-Origin", origin)
-                self.send_header("Vary", "Origin")
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers(); self.wfile.write(body); return
+                return self._redirect(auth_url)
             except Exception as exc:
                 print("❌ Início de revisão manual:", safe_exception(exc))
                 return self._html(400, "Pedido inválido", "Não foi possível iniciar a revisão.")
