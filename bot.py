@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.12"
-BOT_BUILD = "3.12-purge-language-risk-font"
+BOT_VERSION = "3.13"
+BOT_BUILD = "3.13-recent-seven-day-header"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2439,6 +2439,7 @@ WIKI_RELEASE_NOTES = {
     "3.10": "Calendário por data com amarelo para dias com revisões pendentes e azul para dias sem pendências; cartões com layout mais estável, percentual maior e data/hora sob o indicador de risco.",
     "3.11": "Correção definitiva das notas de versão no Telegram e registro das mudanças recentes, preservando as melhorias da 3.10.",
     "3.12": "Purge automático da página principal após publicação, percentual de risco mais legível e terminologia pública revisada para edição válida, edição incorreta e risco de erro.",
+    "3.13": "Cabeçalho com atalhos centralizados para os sete dias mais recentes, caixas amarelas para dias com pendências e azuis para dias sem pendências.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -13217,7 +13218,7 @@ def build_high_risk_wikitext(now=None):
     ]
     return build_high_risk_page(
         visible,
-        "Edições com alto risco de vandalismo",
+        "Edições com alto risco de erro",
         "Esta lista inclui edições da Wikipédia em português com risco "
         f"igual ou superior a {WIKI_HIGH_RISK_THRESHOLD:.0%}.",
     )
@@ -13226,7 +13227,7 @@ def build_high_risk_wikitext(now=None):
 def build_high_risk_daily_wikitext(day, records):
     return build_high_risk_page(
         records,
-        f"Edições com alto risco de vandalismo — {day}",
+        f"Edições com alto risco de erro — {day}",
         f"Arquivo permanente das edições detectadas em {day} (UTC).",
         include_dynamic_learning=False,
     )
@@ -13252,8 +13253,20 @@ def high_risk_archive_days(records):
 
 def build_high_risk_header_wikitext(records):
     days = high_risk_archive_days(records)
+    available = set(days)
     months = sorted({day[:7] for day in days})
     years = sorted({day[:4] for day in days}, reverse=True)
+    pending_days = {
+        str(record.get("archive_date") or "")
+        for record in records
+        if str(record.get("archive_date") or "") in available
+        and high_risk_action(record)[0] is None
+    }
+
+    # Sete datas mais recentes com arquivo, em ordem crescente da esquerda para a direita.
+    recent_days = sorted(days, reverse=True)[:7]
+    recent_days.sort()
+
     lines = [
         "__NOINDEX__",
         '<div style="border:1px solid #a2a9b1; background:#f8f9fa; padding:0.6em; margin-bottom:0.8em">',
@@ -13274,6 +13287,29 @@ def build_high_risk_header_wikitext(records):
         lines.append(f"<small>'''{year}:''' " + " · ".join(links) + "</small>")
     if not years:
         lines.append("<small>''Ainda não há arquivos diários.''</small>")
+
+    if recent_days:
+        lines.append('<div style="text-align:center; margin-top:0.45em; line-height:1">')
+        lines.append('<span style="display:inline-flex; align-items:stretch; justify-content:center; gap:0">')
+        for day in recent_days:
+            day_bg = "#fff3cd" if day in pending_days else "#d8ecff"
+            try:
+                day_label = datetime.strptime(day, "%Y-%m-%d").strftime("%d/%m")
+            except ValueError:
+                day_label = day
+            lines.append(
+                f'<span style="display:inline-block; min-width:4.6em; padding:0.30em 0.55em; '
+                f'box-sizing:border-box; border:1px solid #a2a9b1; margin-left:-1px; '
+                f'background:{day_bg}; text-align:center; white-space:nowrap">'
+                f"[[{WIKI_HIGH_RISK_ARCHIVE_PREFIX}{day}|'''{day_label}''']]</span>"
+            )
+        lines.append("</span>")
+        lines.append(
+            '<div style="margin-top:0.32em; text-align:center; color:#54595d; line-height:1.2">'
+            "<small>Ajude a azular as caixas resolvendo as pendências</small></div>"
+        )
+        lines.append("</div>")
+
     lines.append("</div><noinclude>Cabeçalho automático dos avisos e arquivos do TelesGramBot.</noinclude>")
     return "\n".join(lines) + "\n"
 
