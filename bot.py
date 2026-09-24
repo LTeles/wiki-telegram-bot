@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.05"
-BOT_BUILD = "3.05-visual-labels-valid-edit"
+BOT_VERSION = "3.06"
+BOT_BUILD = "3.06-restore-diff-preview-regression-guard"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -12705,7 +12705,6 @@ def high_risk_diff_excerpt(record, limit=360):
         old_line = wiki_safe_text(before) if before else "(sem texto anterior)"; new_line = wiki_safe_text(after) if after else "(texto removido)"
         if before: old_line = '<span style="background:#ffe49c; font-weight:bold">' + old_line + '</span>'
         if after: new_line = '<span style="background:#a7d8ff; font-weight:bold">' + new_line + '</span>'
-    reasons = compact(record.get("risk_reasons")); reasons_line = ("<br><small>Sinais detectados: " + wiki_safe_text(reasons[:240]) + "</small>") if reasons else ""
     return ('<div style="margin:0.3em 0; padding:0.35em; border:1px solid #a2a9b1; background:#ffffff"><small>Prévia das alterações (trecho aproximado):</small><br>'
             '<table style="width:100%; border-collapse:separate; border-spacing:0.35em 0.2em"><tr><td style="width:50%; vertical-align:top; border:1px solid #f0c36d; padding:0.35em; background:#fffdf5"><small>− <b>Antes:</b> ' + old_line + '</small></td>'
             '<td style="width:50%; vertical-align:top; border:1px solid #8ec5e8; padding:0.35em; background:#f7fcff"><small>+ <b>Depois:</b> ' + new_line + '</small></td></tr></table>' + reasons_line + '</div>')
@@ -12983,11 +12982,6 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     )
 
     preview = high_risk_diff_excerpt(record)
-    if preview:
-        preview = "\n".join(
-            line for line in preview.splitlines()
-            if "sinais detectados:" not in line.lower()
-        ).strip()
     action, actor, _ = high_risk_action(record)
     status_text = (f"{action} por {high_risk_account_link(actor)}" if actor else action) if action else "Pendente de revisão"
     pattern_line = high_risk_pattern_annotation(record, pattern_model or {}) if include_pattern else ""
