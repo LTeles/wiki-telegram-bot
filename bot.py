@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.11"
-BOT_BUILD = "3.11-release-notes-complete"
+BOT_VERSION = "3.12"
+BOT_BUILD = "3.12-purge-language-risk-font"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1199,7 +1199,7 @@ def false_positive_message(item, fixed=False):
         str(item.get("marked_by") or "administrador do canal")
     )
     return (
-        "⚠️ Possível vandalismo marcado como falso positivo\n"
+        "⚠️ Possível edição incorreta marcada como falso positivo\n"
         "Edição encaminhada para verificação.\n\n"
         f"📝 {title}\n"
         f"👤 {username}\n"
@@ -2206,7 +2206,7 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
     )
 
     return "\n\n".join([
-        f"= Relatório de manutenção e combate a vandalismo — {period_label} =",
+        f"= Relatório de manutenção e análise de edições incorretas — {period_label} =",
         "''Relatório experimental produzido pelo TelesGramBot. "
         "Os rankings descrevem somente eventos observados pelo bot e não devem "
         "ser interpretados como avaliação global de mérito dos editores.''",
@@ -2292,7 +2292,7 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         wikitext_ranking_table("Mais proteções", protections, "Proteções"),
         wikitext_ranking_table("Mais bloqueios", blocks, "Bloqueios"),
         wikitext_ranking_table("Mais eliminações ligadas a alertas", deletions, "Eliminações"),
-        "== Onde o vandalismo confirmado apareceu ==",
+        "== Onde ocorreram edições incorretas confirmadas ==",
         wikitext_counter_table(
             "Páginas com mais ocorrências",
             vandal_pages,
@@ -2315,8 +2315,8 @@ def build_wiki_community_report(start_ts, end_ts, period_label):
         "* Nível de checagem: percentual dos alertas elegíveis que receberam reversão por terceiro, patrulhamento, eliminação ou resolução manual sem ação necessária.",
         "* Patrulhamento: desfecho próprio e separado, indicando que a edição foi marcada como patrulhada na Wikipédia.",
         "* Resolução sem ação necessária: confirmação manual por administrador do canal de que a edição foi vista e não exige intervenção; não é tratada como patrulhamento.",
-        "* Falso positivo: edição marcada por administrador como sem vandalismo; o diff entra como exemplo dessa classe no arquivo de padrões.",
-        "* Padrões de IA: revertidas/eliminadas são exemplos de vandalismo; patrulhadas/falsos positivos são exemplos sem vandalismo. A semelhança é informativa e não altera o risco nem as regras do detector.",
+        "* Falso positivo: edição marcada por administrador como edição válida; o diff entra como exemplo dessa classe no arquivo de padrões.",
+        "* Padrões de IA: revertidas/eliminadas são exemplos de edições incorretas; patrulhadas/falsos positivos são exemplos de edições válidas. A semelhança é informativa e não altera o risco nem as regras do detector.",
         "* Faixas de checagem: muito alto ≥85%; alto 70–84%; moderado 50–69%; baixo 30–49%; muito baixo <30%.",
         "* Capacidade observada: folga quando ≥85% e backlog muito pequeno; adequada ≥70%; pressionada 50–69%; sobrecarregada <50%.",
         "* Autorreversões são retiradas da demanda comunitária e não melhoram artificialmente o índice.",
@@ -2438,6 +2438,7 @@ WIKI_RELEASE_NOTES = {
     "3.09": "Proteção da persistência dos posts acompanhados no Telegram entre deploys e reinícios, com backup e diagnóstico de restauração.",
     "3.10": "Calendário por data com amarelo para dias com revisões pendentes e azul para dias sem pendências; cartões com layout mais estável, percentual maior e data/hora sob o indicador de risco.",
     "3.11": "Correção definitiva das notas de versão no Telegram e registro das mudanças recentes, preservando as melhorias da 3.10.",
+    "3.12": "Purge automático da página principal após publicação, percentual de risco mais legível e terminologia pública revisada para edição válida, edição incorreta e risco de erro.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -2696,12 +2697,12 @@ def build_wiki_daily_and_monthly_previews(now=None):
         queue_wiki_edit(
             daily_title,
             daily_text,
-            "Atualizando relatório diário de manutenção e combate a vandalismo",
+            "Atualizando relatório diário de manutenção e análise de edições incorretas",
         )
         queue_wiki_edit(
             monthly_title,
             monthly_text,
-            "Atualizando painel mensal de manutenção e combate a vandalismo",
+            "Atualizando painel mensal de manutenção e análise de edições incorretas",
         )
 
     return daily_title, monthly_title
@@ -4816,9 +4817,9 @@ def build_daily_detection_report(
     )
 
     return (
-        "📊 Relatório diário — detector de vandalismo\n\n"
+        "📊 Relatório diário — detector de risco de erro\n\n"
         f"🕐 Período: {period_text}\n\n"
-        f"🚨 Alertas de possível vandalismo: {total}\n"
+        f"🚨 Alertas de possível edição incorreta: {total}\n"
         f"↩️ Edições revertidas: "
         f"{reverted} ({format_percent(reverted_pct)})\n"
         f"🛡️ Edições patrulhadas: "
@@ -5896,7 +5897,7 @@ def message_with_status(record, status, reverter=None, deleter=None, patroller=N
             )
 
         return (
-            "↩️ Possível vandalismo revertido\n\n"
+            "↩️ Possível edição incorreta revertida\n\n"
             f"📝 {title}\n"
             f"👤 {username}\n"
             f"💬 {comment}\n"
@@ -5911,7 +5912,7 @@ def message_with_status(record, status, reverter=None, deleter=None, patroller=N
             if patroller else ""
         )
         return (
-            "✅ Possível vandalismo patrulhado\n\n"
+            "✅ Possível edição incorreta patrulhada\n\n"
             f"📝 {title}\n"
             f"👤 {username}\n"
             f"💬 {comment}\n"
@@ -5953,7 +5954,7 @@ def message_with_status(record, status, reverter=None, deleter=None, patroller=N
             f"\nEliminada por: {html.escape(str(deleter))}" if deleter else ""
         )
         return (
-            "🗑️ Página eliminada após alerta de possível vandalismo\n\n"
+            "🗑️ Página eliminada após alerta de possível edição incorreta\n\n"
             f"📝 {title}\n"
             f"👤 {username}\n"
             f"💬 {comment}\n"
@@ -9909,9 +9910,9 @@ def format_message(change, result):
     )
 
     heading = (
-        "🆕 Possível vandalismo — página criada"
+        "🆕 Possível edição incorreta — página criada"
         if change.get("type") == "new"
-        else "🚨 Possível vandalismo"
+        else "🚨 Possível edição incorreta"
     )
 
     return (
@@ -12720,9 +12721,9 @@ def high_risk_action(record):
     if status == "false_positive":
         return "Marcado como falso positivo", None, record.get("false_positive_at")
     if status == "manual_vandalism":
-        return "Resolvido manualmente: vandalismo", record.get("manual_reviewer"), record.get("manual_reviewed_at")
+        return "Resolvido manualmente: edição incorreta", record.get("manual_reviewer"), record.get("manual_reviewed_at")
     if status == "manual_clean":
-        return "Resolvido manualmente: sem vandalismo", record.get("manual_reviewer"), record.get("manual_reviewed_at")
+        return "Resolvido manualmente: edição válida", record.get("manual_reviewer"), record.get("manual_reviewed_at")
     return None, None, None
 
 
@@ -12949,7 +12950,7 @@ def classify_high_risk_pattern(record, model):
 def high_risk_pattern_annotation(record, model):
     label = high_risk_pattern_label(record.get("status"))
     if label:
-        label_text = "vandalismo" if label == "vandalismo" else "sem vandalismo"
+        label_text = "edição incorreta" if label == "vandalismo" else "edição válida"
         return (
             "<small>'''Rótulo registrado para aprendizagem:''' "
             + label_text + "</small>"
@@ -12965,15 +12966,15 @@ def high_risk_pattern_annotation(record, model):
     vandalismo = result["vandalismo_similarity"]
     sem_vandalismo = result["sem_vandalismo_similarity"]
     if result["label"] == "vandalismo":
-        assessment = "mais próximo de padrões rotulados como vandalismo"
+        assessment = "mais próximo de padrões de edições incorretas"
     elif result["label"] == "sem_vandalismo":
-        assessment = "mais próximo de padrões rotulados sem vandalismo"
+        assessment = "mais próximo de padrões de edições válidas"
     else:
         assessment = "sem correspondência clara entre as classes"
     return (
         "<small>'''Padrão IA (sem alterar o risco):''' "
         + assessment
-        + f" · vandalismo {vandalismo:.0%}, sem vandalismo {sem_vandalismo:.0%}</small>"
+        + f" · risco de erro {vandalismo:.0%}, padrão válido {sem_vandalismo:.0%}</small>"
     )
 
 
@@ -13028,7 +13029,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         f'<span class="telesgram-risk-badge" style="width:4.25em; height:4.25em; margin:0 auto; '
         f'display:flex; align-items:center; justify-content:center; box-sizing:border-box; '
         f'border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{risk_badge_bg}; '
-        f'color:#fff; font-weight:bold; font-size:116%; line-height:1">{risk:.0%}</span>'
+        f'color:#fff; font-weight:bold; font-size:145%; line-height:1">{risk:.0%}</span>'
         + (f'<span class="telesgram-card-date" style="display:block; margin-top:0.38em; '
            f'color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">'
            f'{compact_time}</span>' if compact_time else "")
@@ -13116,7 +13117,7 @@ def build_high_risk_page(records, heading, introduction, include_dynamic_learnin
     ]
     if include_dynamic_learning:
         lines.extend([
-            "Treino de padrões: revertida/eliminada = vandalismo; patrulhada/falso positivo = sem vandalismo. "
+            "Treino de padrões: revertida/eliminada = edição incorreta; patrulhada/falso positivo = edição válida. "
             "Autorrevertidas e outros estados ficam fora do treino.",
             "A semelhança de padrões é informativa; não altera o risco calculado nem confirma sozinha o caso.",
             "",
@@ -13124,14 +13125,14 @@ def build_high_risk_page(records, heading, introduction, include_dynamic_learnin
         if pattern_model.get("ready"):
             lines.append(
                 "''Base de padrões: "
-                f"{pattern_counts.get('vandalismo', 0)} exemplos de vandalismo e "
-                f"{pattern_counts.get('sem_vandalismo', 0)} exemplos sem vandalismo.''"
+                f"{pattern_counts.get('vandalismo', 0)} exemplos de edições incorretas e "
+                f"{pattern_counts.get('sem_vandalismo', 0)} exemplos de edições válidas.''"
             )
         else:
             lines.append(
                 "''Aprendizagem em fase inicial: "
-                f"{pattern_counts.get('vandalismo', 0)} exemplos de vandalismo e "
-                f"{pattern_counts.get('sem_vandalismo', 0)} sem vandalismo; "
+                f"{pattern_counts.get('vandalismo', 0)} exemplos de edições incorretas e "
+                f"{pattern_counts.get('sem_vandalismo', 0)} edições válidas; "
                 f"mínimo de {HIGH_RISK_PATTERN_MIN_PER_CLASS} por classe para exibir semelhanças.''"
             )
         lines.append("")
@@ -13509,9 +13510,9 @@ def manual_review_telegram_text(record):
     reviewer = html.escape(str(record.get("manual_reviewer") or ""))
     base = message_with_status(record, "pending") or record.get("base_message", "").rstrip()
     if status == "manual_vandalism":
-        return base + " — 🚨 <b>Resolvido manualmente: vandalismo</b> — Revisor: " + reviewer
+        return base + " — 🚨 <b>Resolvido manualmente: edição incorreta</b> — Revisor: " + reviewer
     if status == "manual_clean":
-        return base + " — ✅ <b>Resolvido manualmente: sem vandalismo</b> — Revisor: " + reviewer
+        return base + " — ✅ <b>Resolvido manualmente: edição válida</b> — Revisor: " + reviewer
     return base
 
 
@@ -13634,6 +13635,38 @@ def set_testwiki_writing_paused(paused):
         atomic_write_json(TESTWIKI_CONTROL_FILE, {"paused": bool(paused)})
 
 
+def purge_testwiki_main_page():
+    """Invalida o cache da página principal; falha de purge não invalida a edição já publicada."""
+    try:
+        response = testwiki_session.post(
+            TESTWIKI_API,
+            data={
+                "action": "purge",
+                "format": "json",
+                "formatversion": 2,
+                "titles": WIKI_HIGH_RISK_TITLE,
+                "forcelinkupdate": 1,
+            },
+            timeout=25,
+        )
+        response.raise_for_status()
+        data = response.json()
+        pages = data.get("purge") or []
+        confirmed = any(
+            isinstance(page, dict)
+            and page.get("title") == WIKI_HIGH_RISK_TITLE
+            and ("purged" in page or page.get("purged") is True)
+            for page in pages
+        )
+        if confirmed:
+            print("♻️ Purge confirmado:", WIKI_HIGH_RISK_TITLE)
+            return True
+        print("⚠️ Purge da página principal não confirmado:", safe_log_text(data))
+    except Exception as exc:
+        print("⚠️ Falha não crítica no purge da página principal:", safe_exception(exc))
+    return False
+
+
 def testwiki_write_once():
     with TESTWIKI_LOCK:
         if testwiki_writing_paused():
@@ -13659,6 +13692,8 @@ def testwiki_write_once():
         result = response.json()
         if result.get("error") or result.get("edit", {}).get("result") != "Success":
             raise RuntimeError("Publicação não confirmada: " + safe_log_text(result))
+        if item["title"] == WIKI_HIGH_RISK_TITLE:
+            purge_testwiki_main_page()
         state = load_json(TESTWIKI_QUEUE_FILE, state)
         if state.get("pending") and state["pending"][0] == item:
             state["pending"].pop(0)
