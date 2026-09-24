@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.06"
-BOT_BUILD = "3.06-restore-diff-preview-regression-guard"
+BOT_VERSION = "3.07"
+BOT_BUILD = "3.07-main-24h-inline-bytes-larger-risk"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -12707,7 +12707,7 @@ def high_risk_diff_excerpt(record, limit=360):
         if after: new_line = '<span style="background:#a7d8ff; font-weight:bold">' + new_line + '</span>'
     return ('<div style="margin:0.3em 0; padding:0.35em; border:1px solid #a2a9b1; background:#ffffff"><small>Prévia das alterações (trecho aproximado):</small><br>'
             '<table style="width:100%; border-collapse:separate; border-spacing:0.35em 0.2em"><tr><td style="width:50%; vertical-align:top; border:1px solid #f0c36d; padding:0.35em; background:#fffdf5"><small>− <b>Antes:</b> ' + old_line + '</small></td>'
-            '<td style="width:50%; vertical-align:top; border:1px solid #8ec5e8; padding:0.35em; background:#f7fcff"><small>+ <b>Depois:</b> ' + new_line + '</small></td></tr></table>' + reasons_line + '</div>')
+            '<td style="width:50%; vertical-align:top; border:1px solid #8ec5e8; padding:0.35em; background:#f7fcff"><small>+ <b>Depois:</b> ' + new_line + '</small></td></tr></table></div>')
 
 
 HIGH_RISK_PATTERN_MIN_PER_CLASS = 3
@@ -12955,29 +12955,28 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         compact_time = ""
 
     byte_delta = record.get("byte_delta")
-    byte_text = ""
+    byte_inline = ""
     if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool):
         byte_delta = int(byte_delta)
         byte_color = "#14866d" if byte_delta > 0 else "#b32424" if byte_delta < 0 else "#54595d"
-        byte_text = (f'<div style="text-align:right; font-size:100%; font-weight:normal; '
-                     f'line-height:1.05; color:{byte_color}">Variação do tamanho: {byte_delta:+d} bytes</div>')
+        byte_inline = f' <span style="color:{byte_color}">({byte_delta:+d} bytes)</span>' 
 
     risk_badge_bg = "#b32424" if risk > 0.95 else "#ac6600"
     risk_badge = (
         f'<span class="telesgram-risk-badge" style="position:absolute; top:0.45em; right:0.55em; '
-        f'width:3.15em; height:3.15em; display:flex; align-items:center; justify-content:center; '
+        f'width:3.65em; height:3.65em; display:flex; align-items:center; justify-content:center; '
         f'box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; '
-        f'background:{risk_badge_bg}; color:#fff; font-weight:bold; font-size:105%; '
+        f'background:{risk_badge_bg}; color:#fff; font-weight:bold; font-size:110%; '
         f'line-height:1">{risk:.0%}</span>'
     )
 
     first_line = (
-        f"<small>Artigo:</small> '''{article_link}''' · [{diff_url} Ver diferenças] · [{history_url} Histórico]"
+        f"<small>Artigo:</small> '''{article_link}''' · [{diff_url} Ver diferenças]{byte_inline} · [{history_url} Histórico]"
     )
     user_line = (
         f'<small>Conta: [{user_url} {wiki_safe_text(username)}] · [{talk_url} discussão] · '
         f'[{contributions_url} contribuições] · [{block_url} bloquear]'
-        + (f' <span style="float:right; margin-right:4.2em; color:#54595d">{wiki_safe_text(compact_time)}</span>' if compact_time else "")
+        + (f' <span style="float:right; margin-right:4.8em; color:#54595d">{wiki_safe_text(compact_time)}</span>' if compact_time else "")
         + '</small>'
     )
 
@@ -13000,9 +12999,8 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         f'data-telesgram-reviewer="{wiki_safe_text(record.get("manual_reviewer") or "")}" '
         f'data-telesgram-timestamp="{revision_iso}" '
         f'style="position:relative; background:{background}; border:1px solid #a2a9b1; '
-        f'padding:0.45em 4.4em 0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
+        f'padding:0.45em 5.0em 0.45em 0.7em; margin:0.35em 0; line-height:1.35">'
         + risk_badge + f"{first_line}<br>{user_line}<br>"
-        + (byte_text if byte_text else "")
         + (preview + "<br>" if preview else "")
         + f"<small>'''Estado:''' {status_text}</small>"
         + ("<br>" + pattern_line if pattern_line else "")
@@ -13132,7 +13130,27 @@ def sync_high_risk_archive():
 def build_high_risk_wikitext(now=None):
     with high_risk_archive_lock:
         records = [dict(item) for item in high_risk_archive.values()]
-    visible = [record for record in records if high_risk_action(record)[0] is None]
+    if now is None:
+        now = time.time()
+    cutoff = float(now) - (24 * 60 * 60)
+
+    def main_page_record_is_recent(record):
+        raw = record.get("revision_timestamp")
+        try:
+            if isinstance(raw, (int, float)):
+                ts = float(raw)
+            elif raw:
+                ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+            else:
+                ts = float(record.get("posted_at") or 0)
+        except (TypeError, ValueError, OverflowError):
+            ts = float(record.get("posted_at") or 0)
+        return ts >= cutoff
+
+    visible = [
+        record for record in records
+        if high_risk_action(record)[0] is None and main_page_record_is_recent(record)
+    ]
     return build_high_risk_page(
         visible,
         "Edições com alto risco de vandalismo",
