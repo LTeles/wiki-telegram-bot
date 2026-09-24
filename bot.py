@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.10"
-BOT_BUILD = "3.10-calendar-status-stable-card-layout"
+BOT_VERSION = "3.11"
+BOT_BUILD = "3.11-release-notes-complete"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2434,6 +2434,10 @@ WIKI_RELEASE_NOTES = {
     "2.62": "Revisões manuais consolidadas em uma única página na Test Wiki, usando novas seções para reduzir criação de subpáginas e evitar regravação concorrente; teste temporariamente liberado a todos os usuários.",
     "2.63": "Revisão manual também nos arquivos dos últimos 30 dias, carregamento silencioso fora das páginas de alto risco, atualização prioritária após decisão e limpeza semanal da página única de revisões manuais.",
     "3.0": "Revisão manual segura via OAuth 2.0 Wikimedia: o revisor é autenticado no servidor, grupos da ptwiki são validados no backend, e o TelesGramBot executa as atualizações técnicas na Wiki e no Telegram.",
+    "3.08": "Proteção contra spamblacklist nas prévias publicadas na Test Wiki, com neutralização segura de domínios e uma única nova tentativa de escrita quando necessário.",
+    "3.09": "Proteção da persistência dos posts acompanhados no Telegram entre deploys e reinícios, com backup e diagnóstico de restauração.",
+    "3.10": "Calendário por data com amarelo para dias com revisões pendentes e azul para dias sem pendências; cartões com layout mais estável, percentual maior e data/hora sob o indicador de risco.",
+    "3.11": "Correção definitiva das notas de versão no Telegram e registro das mudanças recentes, preservando as melhorias da 3.10.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
