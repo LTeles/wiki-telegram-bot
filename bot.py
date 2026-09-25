@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.19"
-BOT_BUILD = "3.19-account-block-status"
+BOT_VERSION = "3.20"
+BOT_BUILD = "3.20-contained-risk-badge"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2446,6 +2446,7 @@ WIKI_RELEASE_NOTES = {
     "3.17": "Aumenta somente o percentual no indicador de risco e consolida reversões por terceiros como exemplos de vandalismo ou erro no aprendizado, mantendo autorreversões excluídas.",
     "3.18": "Amplia novamente o percentual de risco e corrige o alinhamento do indicador para mantê-lo dentro do cartão.",
     "3.19": "Exibe o estado de bloqueio da conta ao lado de Estado enquanto o caso está pendente e congela o último estado após a resolução.",
+    "3.20": "Reduz e contém o indicador percentual dentro do cartão de alto risco, preservando legibilidade e demais funções da 3.19.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -13110,11 +13111,11 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     risk_badge_bg = "#b32424" if risk > 0.95 else "#ac6600"
     risk_badge = (
         f'<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.55em; '
-        f'width:5.2em; text-align:center">'
-        f'<span class="telesgram-risk-badge" style="width:4.25em; height:4.25em; margin:0 auto; '
+        f'width:4.35em; text-align:center; box-sizing:border-box">'
+        f'<span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; '
         f'display:flex; align-items:center; justify-content:center; box-sizing:border-box; '
         f'border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{risk_badge_bg}; '
-        f'color:#fff; font-weight:bold; font-size:200%; line-height:1">{risk:.0%}</span>'
+        f'color:#fff; font-weight:bold; font-size:185%; line-height:1">{risk:.0%}</span>'
         + (f'<span class="telesgram-card-date" style="display:block; margin-top:0.38em; '
            f'color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">'
            f'{compact_time}</span>' if compact_time else "")
