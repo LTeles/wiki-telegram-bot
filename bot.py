@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.13"
-BOT_BUILD = "3.13-recent-seven-day-header"
+BOT_VERSION = "3.14"
+BOT_BUILD = "3.14-sender-state-and-wiki-auto-resolve"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2440,6 +2440,7 @@ WIKI_RELEASE_NOTES = {
     "3.11": "Correção definitiva das notas de versão no Telegram e registro das mudanças recentes, preservando as melhorias da 3.10.",
     "3.12": "Purge automático da página principal após publicação, percentual de risco mais legível e terminologia pública revisada para edição válida, edição incorreta e risco de erro.",
     "3.13": "Cabeçalho com atalhos centralizados para os sete dias mais recentes, caixas amarelas para dias com pendências e azuis para dias sem pendências.",
+    "3.14": "Corrige falha NoneType no registro de alertas do sender e faz decisões manuais na página de revisão resolverem automaticamente a pendência sem ação adicional no Telegram.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -5083,6 +5084,14 @@ def register_posted_edit(item, telegram_message):
 
     posted_at = time.time()
 
+    # stats_payload pode existir explicitamente como None em alguns tipos de
+    # alerta (por exemplo, observação/vigilância). Nunca chamar .get() nele
+    # sem normalização: a mensagem já pode ter sido enviada ao Telegram e o
+    # registro em posted_edits não pode falhar depois do envio.
+    stats_payload = item.get("stats_payload")
+    if not isinstance(stats_payload, dict):
+        stats_payload = {}
+
     record = {
         "revision_id": revision_id,
         "rcid": item.get("rcid"),
@@ -5090,20 +5099,12 @@ def register_posted_edit(item, telegram_message):
         "username": item.get("username"),
         "edit_comment": item.get("edit_comment"),
         "diff_url": item.get("diff_url"),
-        "revert_risk": (
-            item.get("stats_payload", {}).get("revert_risk")
-            if isinstance(item.get("stats_payload"), dict)
-            else None
-        ),
-        "diff_added": item.get("stats_payload", {}).get("diff_added", ""),
-        "diff_removed": item.get("stats_payload", {}).get("diff_removed", ""),
-        "risk_reasons": item.get("stats_payload", {}).get("risk_reasons", ""),
-        "byte_delta": item.get("stats_payload", {}).get("byte_delta"),
-        "final_score": (
-            item.get("stats_payload", {}).get("score")
-            if isinstance(item.get("stats_payload"), dict)
-            else None
-        ),
+        "revert_risk": stats_payload.get("revert_risk"),
+        "diff_added": stats_payload.get("diff_added", ""),
+        "diff_removed": stats_payload.get("diff_removed", ""),
+        "risk_reasons": stats_payload.get("risk_reasons", ""),
+        "byte_delta": stats_payload.get("byte_delta"),
+        "final_score": stats_payload.get("score"),
         "message_id": message_id,
         "base_message": item.get("message", ""),
         "parse_mode": item.get("parse_mode"),
@@ -5145,11 +5146,7 @@ def register_posted_edit(item, telegram_message):
             safe_exception(e)
         )
 
-    stats_payload = item.get(
-        "stats_payload"
-    )
-
-    if isinstance(stats_payload, dict):
+    if stats_payload:
         register_detection_stat(
             revision_id=revision_id,
             title=item.get("page_title"),
@@ -13528,12 +13525,49 @@ def apply_high_risk_manual_decision(decision):
                 live["status"] = new_status
                 live["manual_reviewer"] = actor
                 live["manual_reviewed_at"] = reviewed_at
+                # A decisão na própria Wiki encerra a pendência: não é
+                # necessário clicar em Resolver no Telegram. Mantemos o
+                # status manual para preservar a classificação válida/incorreta.
+                live["resolved_at"] = time.time()
+                live["resolved_by"] = actor
+                live["resolution"] = "wiki_manual_review_no_action_required"
+                live["reply_markup"] = reply_markup_without_resolution_buttons(
+                    live.get("reply_markup"), int(revision_id)
+                )
             elif action == "undo" and changed_status:
                 live["status"] = new_status
                 live["manual_reviewer"] = None
                 live["manual_reviewed_at"] = None
+                live["resolved_at"] = None
+                live["resolved_by"] = None
+                live.pop("resolution", None)
             live["manual_decision_revid"] = decision_revid
     save_posted_edits()
+
+    if action in ("vandalism", "clean") and changed_status:
+        resolved_ts = time.time()
+        try:
+            with posted_edits_lock:
+                resolved_record = dict(posted_edits.get(revision_id) or {})
+            if resolved_record.get("resolved_at"):
+                resolved_ts = float(resolved_record["resolved_at"])
+            mark_detection_stat_resolved_no_action(int(revision_id), resolved_ts)
+            record_community_event(
+                "resolved_no_action",
+                actor=actor,
+                title=resolved_record.get("title") or archived.get("title"),
+                timestamp=resolved_ts,
+                revision_id=int(revision_id),
+                latency=max(0, resolved_ts - float(resolved_record.get("posted_at", resolved_ts))),
+                metadata={
+                    "resolution": "wiki_manual_review",
+                    "manual_classification": action,
+                    "decision_revision_id": decision_revid,
+                },
+            )
+        except Exception as exc:
+            print("⚠️ Falha ao registrar resolução automática da revisão Wiki:", safe_exception(exc))
+
     print(f"✅ Revisão manual processada: revid {revision_id} · {action} · {actor}")
     if changed_status:
         queue_high_risk_manual_refresh(revision_id)
