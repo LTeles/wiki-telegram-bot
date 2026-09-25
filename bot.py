@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.16"
-BOT_BUILD = "3.16-wiki-false-positive"
+BOT_VERSION = "3.17"
+BOT_BUILD = "3.17-review-visual-learning"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2442,6 +2442,8 @@ WIKI_RELEASE_NOTES = {
     "3.13": "Cabeçalho com atalhos centralizados para os sete dias mais recentes, caixas amarelas para dias com pendências e azuis para dias sem pendências.",
     "3.14": "Corrige falha NoneType no registro de alertas do sender e faz decisões manuais na página de revisão resolverem automaticamente a pendência sem ação adicional no Telegram.",
     "3.15": "Corrige o layout da prévia Antes/Depois para conter textos, URLs, referências e sequências longas dentro do cartão, sem alterar as demais funcionalidades da 3.14.",
+    "3.16": "Integra o botão Falso positivo da revisão Wiki ao mesmo fluxo de falsos positivos do Telegram, preservando lista e resolução existentes.",
+    "3.17": "Aumenta somente o percentual no indicador de risco e consolida reversões por terceiros como exemplos de vandalismo ou erro no aprendizado, mantendo autorreversões excluídas.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -13036,7 +13038,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         f'<span class="telesgram-risk-badge" style="width:4.25em; height:4.25em; margin:0 auto; '
         f'display:flex; align-items:center; justify-content:center; box-sizing:border-box; '
         f'border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{risk_badge_bg}; '
-        f'color:#fff; font-weight:bold; font-size:145%; line-height:1">{risk:.0%}</span>'
+        f'color:#fff; font-weight:bold; font-size:165%; line-height:1">{risk:.0%}</span>'
         + (f'<span class="telesgram-card-date" style="display:block; margin-top:0.38em; '
            f'color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">'
            f'{compact_time}</span>' if compact_time else "")
