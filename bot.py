@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.15"
-BOT_BUILD = "3.15-high-risk-diff-wrap"
+BOT_VERSION = "3.16"
+BOT_BUILD = "3.16-wiki-false-positive"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -13881,6 +13881,76 @@ def _oauth_exchange(code):
     return profile.json()
 
 
+def apply_wiki_false_positive(revid, actor):
+    """Marca pela Wiki usando a mesma base /falsospositivos do botão do Telegram."""
+    revision_id = int(revid)
+    key = str(revision_id)
+
+    with posted_edits_lock:
+        live = posted_edits.get(key)
+        if not isinstance(live, dict):
+            raise RuntimeError("Não encontrei os dados deste alerta")
+        if live.get("alert_kind", "normal") != "normal":
+            raise RuntimeError("Falso positivo só pode ser marcado em alertas do detector")
+        if live.get("status"):
+            if live.get("status") == "false_positive":
+                raise RuntimeError("Este alerta já está marcado como falso positivo")
+            raise RuntimeError("Este alerta já foi resolvido")
+
+        live["status"] = "false_positive"
+        live["false_positive_at"] = time.time()
+        live["false_positive_by"] = actor
+        live["reply_markup"] = reply_markup_without_resolution_buttons(
+            live.get("reply_markup"), revision_id
+        )
+        record = dict(live)
+
+    save_posted_edits()
+    fp_item = register_false_positive(record, actor)
+    remove_detection_stat(revision_id)
+
+    # Mantém o arquivo da Wiki sincronizado com o mesmo desfecho.
+    with high_risk_archive_lock:
+        archived = high_risk_archive.get(key)
+        if isinstance(archived, dict):
+            archived["status"] = "false_positive"
+            archived["false_positive_at"] = record.get("false_positive_at")
+            archived["false_positive_by"] = actor
+    save_high_risk_archive()
+
+    success = edit_telegram_message(
+        record.get("message_id"),
+        false_positive_message(fp_item, fixed=False),
+        parse_mode="HTML",
+        reply_markup=record.get("reply_markup"),
+    )
+
+    send_telegram_message(
+        (
+            "🏷 <b>Falso positivo encaminhado para verificação.</b>\n"
+            f'🆔 <a href="https://pt.wikipedia.org/w/index.php?diff={revision_id}">{revision_id}</a>\n'
+            f"👤 Marcado por: {html.escape(str(actor))}"
+        ),
+        chat_id=TELEGRAM_CHANNEL,
+        parse_mode="HTML",
+        reply_to_message_id=record.get("message_id"),
+        reply_markup={
+            "inline_keyboard": [[{
+                "text": "↩️ Desmarcar falso positivo",
+                "callback_data": f"unfalsepos:{revision_id}",
+            }]]
+        },
+    )
+
+    queue_high_risk_manual_refresh(revision_id)
+    print(
+        "🏷 Falso positivo registrado pela Wiki:", revision_id,
+        "| por:", actor,
+        "| mensagem atualizada:", bool(success),
+    )
+    return True
+
+
 def process_oauth_manual_review(state_item, profile):
     username = str(profile.get("username") or "").strip()
     if not username or profile.get("blocked"):
@@ -13890,8 +13960,11 @@ def process_oauth_manual_review(state_item, profile):
         raise PermissionError("Conta sem grupo autorizado na Wikipédia em português")
     revid = int(state_item["revid"])
     action = str(state_item["action"])
-    if action not in ("clean", "vandalism", "undo"):
+    if action not in ("clean", "vandalism", "falsepos", "undo"):
         raise ValueError("Ação inválida")
+    if action == "falsepos":
+        apply_wiki_false_positive(revid, username)
+        return username
     decision = {
         "revision_id": revid, "action": action, "actor": username,
         "groups": sorted(groups), "decision_revision_id": int(time.time() * 1000),
@@ -13989,7 +14062,7 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
                     payload = {key: (values[0] if values else "") for key, values in form.items()}
                 revid = int(payload.get("revid"))
                 action = str(payload.get("action") or "")
-                if action not in ("clean", "vandalism", "undo"):
+                if action not in ("clean", "vandalism", "falsepos", "undo"):
                     raise ValueError("Ação inválida")
                 state = _new_oauth_state(revid, action, payload.get("return_to"))
                 auth_url = OAUTH_AUTHORIZE_URL + "?" + urlencode({
