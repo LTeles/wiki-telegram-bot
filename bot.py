@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.14"
-BOT_BUILD = "3.14-sender-state-and-wiki-auto-resolve"
+BOT_VERSION = "3.15"
+BOT_BUILD = "3.15-high-risk-diff-wrap"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2441,6 +2441,7 @@ WIKI_RELEASE_NOTES = {
     "3.12": "Purge automático da página principal após publicação, percentual de risco mais legível e terminologia pública revisada para edição válida, edição incorreta e risco de erro.",
     "3.13": "Cabeçalho com atalhos centralizados para os sete dias mais recentes, caixas amarelas para dias com pendências e azuis para dias sem pendências.",
     "3.14": "Corrige falha NoneType no registro de alertas do sender e faz decisões manuais na página de revisão resolverem automaticamente a pendência sem ação adicional no Telegram.",
+    "3.15": "Corrige o layout da prévia Antes/Depois para conter textos, URLs, referências e sequências longas dentro do cartão, sem alterar as demais funcionalidades da 3.14.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -12764,9 +12765,17 @@ def high_risk_diff_excerpt(record, limit=360):
         old_line = wiki_safe_text(before) if before else "(sem texto anterior)"; new_line = wiki_safe_text(after) if after else "(texto removido)"
         if before: old_line = '<span style="background:#ffe49c; font-weight:bold">' + old_line + '</span>'
         if after: new_line = '<span style="background:#a7d8ff; font-weight:bold">' + new_line + '</span>'
-    return ('<div style="margin:0.3em 0; padding:0.35em; border:1px solid #a2a9b1; background:#ffffff"><small>Prévia das alterações (trecho aproximado):</small><br>'
-            '<table style="width:100%; border-collapse:separate; border-spacing:0.35em 0.2em"><tr><td style="width:50%; vertical-align:top; border:1px solid #f0c36d; padding:0.35em; background:#fffdf5"><small>− <b>Antes:</b> ' + old_line + '</small></td>'
-            '<td style="width:50%; vertical-align:top; border:1px solid #8ec5e8; padding:0.35em; background:#f7fcff"><small>+ <b>Depois:</b> ' + new_line + '</small></td></tr></table></div>')
+    # table-layout:fixed impede que URLs, referências ou sequências sem espaços
+    # alarguem a tabela. overflow-wrap/word-break mantêm o conteúdo dentro
+    # de cada metade do diferencial, inclusive em telas estreitas.
+    cell_common = (
+        "width:50%; max-width:0; min-width:0; vertical-align:top; "
+        "padding:0.35em; box-sizing:border-box; white-space:normal; "
+        "overflow-wrap:anywhere; word-wrap:break-word; word-break:break-word"
+    )
+    return ('<div style="margin:0.3em 0; padding:0.35em; border:1px solid #a2a9b1; background:#ffffff; max-width:100%; box-sizing:border-box; overflow:hidden"><small>Prévia das alterações (trecho aproximado):</small><br>'
+            '<table style="width:100%; max-width:100%; table-layout:fixed; border-collapse:separate; border-spacing:0.35em 0.2em; box-sizing:border-box"><tr><td style="' + cell_common + '; border:1px solid #f0c36d; background:#fffdf5"><small style="white-space:normal; overflow-wrap:anywhere; word-break:break-word">− <b>Antes:</b> ' + old_line + '</small></td>'
+            '<td style="' + cell_common + '; border:1px solid #8ec5e8; background:#f7fcff"><small style="white-space:normal; overflow-wrap:anywhere; word-break:break-word">+ <b>Depois:</b> ' + new_line + '</small></td></tr></table></div>')
 
 
 HIGH_RISK_PATTERN_MIN_PER_CLASS = 3
