@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.17"
-BOT_BUILD = "3.17-review-visual-learning"
+BOT_VERSION = "3.19"
+BOT_BUILD = "3.19-account-block-status"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2444,6 +2444,8 @@ WIKI_RELEASE_NOTES = {
     "3.15": "Corrige o layout da prévia Antes/Depois para conter textos, URLs, referências e sequências longas dentro do cartão, sem alterar as demais funcionalidades da 3.14.",
     "3.16": "Integra o botão Falso positivo da revisão Wiki ao mesmo fluxo de falsos positivos do Telegram, preservando lista e resolução existentes.",
     "3.17": "Aumenta somente o percentual no indicador de risco e consolida reversões por terceiros como exemplos de vandalismo ou erro no aprendizado, mantendo autorreversões excluídas.",
+    "3.18": "Amplia novamente o percentual de risco e corrige o alinhamento do indicador para mantê-lo dentro do cartão.",
+    "3.19": "Exibe o estado de bloqueio da conta ao lado de Estado enquanto o caso está pendente e congela o último estado após a resolução.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -12993,6 +12995,80 @@ def high_risk_background(record):
     return "#f8d7da" if float(record.get("revert_risk") or 0) > 0.95 else "#fff3cd"
 
 
+
+def ptwiki_account_block_state(username):
+    """Retorna o estado atual de bloqueio total da conta na ptwiki.
+
+    Não bloqueada: nenhum bloqueio ativo.
+    Bloqueada temporariamente: bloqueio ativo com expiração definida.
+    Bloqueada por tempo indefinido: bloqueio ativo sem expiração (infinity/indefinite/never).
+    Em falha de consulta, retorna None para não publicar um estado possivelmente incorreto.
+    """
+    username = str(username or "").strip()
+    if not username:
+        return None
+    try:
+        _, data = wikimedia_api_get({
+            "action": "query",
+            "format": "json",
+            "formatversion": 2,
+            "list": "blocks",
+            "bkusers": username,
+            "bklimit": 1,
+            "bkprop": "user|expiry|restrictions",
+        }, timeout=25)
+        if data.get("error"):
+            return None
+        blocks = (data.get("query") or {}).get("blocks") or []
+        if not blocks:
+            return "não bloqueada"
+        block = blocks[0] if isinstance(blocks[0], dict) else {}
+        expiry = str(block.get("expiry") or "").strip().lower()
+        if expiry in ("infinity", "indefinite", "infinite", "never"):
+            return "bloqueada por tempo indefinido"
+        return "bloqueada temporariamente"
+    except Exception as exc:
+        print("⚠️ Falha ao consultar estado de bloqueio para alto risco:",
+              safe_exception(exc))
+        return None
+
+
+def refresh_pending_high_risk_block_states():
+    """Atualiza o estado de bloqueio somente enquanto o caso está pendente.
+
+    Depois de qualquer desfecho, o último valor salvo fica congelado.
+    """
+    with posted_edits_lock:
+        live_snapshot = [dict(x) for x in posted_edits.values()]
+    pending = [
+        x for x in select_high_risk_records(live_snapshot)
+        if high_risk_action(x)[0] is None
+    ]
+    if not pending:
+        return False
+
+    by_user = {}
+    for record in pending:
+        username = str(record.get("username") or "").strip()
+        if username and username not in by_user:
+            by_user[username] = ptwiki_account_block_state(username)
+
+    changed = False
+    with posted_edits_lock:
+        for record in pending:
+            revision_id = str(record.get("revision_id") or "")
+            live = posted_edits.get(revision_id)
+            if not isinstance(live, dict) or high_risk_action(live)[0] is not None:
+                continue
+            state = by_user.get(str(live.get("username") or "").strip())
+            if state is not None and live.get("account_block_state") != state:
+                live["account_block_state"] = state
+                changed = True
+    if changed:
+        save_posted_edits()
+    return changed
+
+
 def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     revision_id = int(record["revision_id"])
     username = str(record.get("username") or "Desconhecido")
@@ -13038,7 +13114,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         f'<span class="telesgram-risk-badge" style="width:4.25em; height:4.25em; margin:0 auto; '
         f'display:flex; align-items:center; justify-content:center; box-sizing:border-box; '
         f'border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{risk_badge_bg}; '
-        f'color:#fff; font-weight:bold; font-size:165%; line-height:1">{risk:.0%}</span>'
+        f'color:#fff; font-weight:bold; font-size:200%; line-height:1">{risk:.0%}</span>'
         + (f'<span class="telesgram-card-date" style="display:block; margin-top:0.38em; '
            f'color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">'
            f'{compact_time}</span>' if compact_time else "")
@@ -13075,7 +13151,16 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         f'padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0; line-height:1.35">'
         + risk_badge + f"{first_line}<br>{user_line}<br>"
         + (preview + "<br>" if preview else "")
-        + f"<small>'''Estado:''' {status_text}</small>"
+        + (
+            '<div style="display:flex; align-items:baseline; justify-content:space-between; '
+            'gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' ' + status_text + '</small>'
+            + (
+                '<small style="margin-left:auto; text-align:right; white-space:nowrap">'
+                "\'\'\'Conta:\'\'\' " + wiki_safe_text(record.get("account_block_state")) + '</small>'
+                if record.get("account_block_state") else ""
+            )
+            + '</div>'
+        )
         + ("<br>" + pattern_line if pattern_line else "")
         + (f'<div class="telesgram-timer-source" style="display:none">{timer_wikitext}</div>' if timer_wikitext else "")
         + "</div>"
@@ -13188,7 +13273,7 @@ def sync_high_risk_archive():
                     "reverted_by", "reverted_at", "patrolled_by", "patrolled_at",
                     "deleted_by", "deleted_at", "resolved_at", "false_positive_at",
                     "manual_reviewer", "manual_reviewed_at", "manual_decision_revid", "manual_seen_revid",
-                    "manual_previous_status",
+                    "manual_previous_status", "account_block_state",
                 )
             }
             archived["archive_date"] = high_risk_record_date(archived)
@@ -13679,6 +13764,7 @@ def reconcile_high_risk_manual_reviews():
 
 
 def queue_high_risk_wiki_pages():
+    refresh_pending_high_risk_block_states()
     sync_high_risk_archive()
     with high_risk_archive_lock:
         archived = [dict(x) for x in high_risk_archive.values()]
