@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.20"
-BOT_BUILD = "3.20-contained-risk-badge"
+BOT_VERSION = "3.21"
+BOT_BUILD = "3.21-new-page-detection"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -5106,6 +5106,7 @@ def register_posted_edit(item, telegram_message):
         "edit_comment": item.get("edit_comment"),
         "diff_url": item.get("diff_url"),
         "revert_risk": stats_payload.get("revert_risk"),
+        "is_new_page": bool(stats_payload.get("is_new_page")),
         "diff_added": stats_payload.get("diff_added", ""),
         "diff_removed": stats_payload.get("diff_removed", ""),
         "risk_reasons": stats_payload.get("risk_reasons", ""),
@@ -9530,6 +9531,67 @@ def contextual_discussion_adjustment(change, diff, strong_signals):
     return None
 
 
+
+def analyze_new_page(change, diff):
+    """
+    Avalia a primeira revisão de uma página sem chamar Revert Risk.
+
+    Os modelos Revert Risk da Wikimedia não devem ser usados na primeira
+    revisão de uma página. Para criações, usamos somente sinais locais já
+    existentes no bot e mantemos o resultado separado do Revert Risk.
+    """
+    added = str(diff.get("added", "") or "")
+    signal_text = (
+        discussion_comment_body(added)
+        if is_discussion_namespace(change)
+        and looks_like_signed_discussion_comment(added)
+        else added
+    )
+
+    profanity = profanity_score(signal_text)
+    repetition = repetition_score(signal_text)
+    nonsense = nonsense_score(signal_text)
+    signals = [profanity, repetition, nonsense]
+
+    # Um sinal local forte pode, por si só, justificar revisão humana.
+    score = max(signals) if signals else 0.0
+    strong_signals = sum(1 for signal in signals if signal >= 0.75)
+    if strong_signals >= 2:
+        score = min(1.0, score + 0.10)
+
+    promotional = new_page_promotional_signals(change, diff)
+
+    # Sinais promocionais/contextuais só elevam uma criação ao limiar quando
+    # aparecem em combinação; um único indício fraco não publica a página.
+    promo_signals = promotional.get("signals", [])
+    promo_bonus = float(promotional.get("bonus") or 0.0)
+    if len(promo_signals) >= 2:
+        score = max(score, min(1.0, 0.35 + promo_bonus))
+
+    reasons = []
+    if profanity >= 0.75:
+        reasons.append("linguagem ofensiva")
+    if repetition >= 0.75:
+        reasons.append("repetição anormal")
+    if nonsense >= 0.75:
+        reasons.append("texto possivelmente sem sentido")
+    reasons.extend(promo_signals)
+
+    if not reasons:
+        reasons.append("página nova sem sinais locais suficientes")
+
+    return {
+        "score": min(max(score, 0.0), 1.0),
+        "revert_risk": None,
+        "reason": ", ".join(reasons),
+        "benign_reduction": None,
+        "cosmetic_adjustment": None,
+        "minimal_adjustment": None,
+        "context_adjustment": None,
+        "promotional_adjustment": promotional,
+        "reference_removal_adjustment": None,
+    }
+
 def analyze_vandalism(change, diff, revert_risk):
     added = diff.get("added", "")
     removed = diff.get("removed", "")
@@ -9909,22 +9971,28 @@ def format_message(change, result):
         result["score"] * 100
     )
 
-    revert_score = round(
-        result["revert_risk"] * 100
-    )
+    is_new_page = change.get("type") == "new"
 
     heading = (
         "🆕 Possível edição incorreta — página criada"
-        if change.get("type") == "new"
+        if is_new_page
         else "🚨 Possível edição incorreta"
     )
+
+    if is_new_page:
+        risk_line = f"🧭 Risco heurístico: {final_score}%"
+    else:
+        revert_score = round(
+            result["revert_risk"] * 100
+        )
+        risk_line = f"🤖 Risco de reversão: {revert_score}%"
 
     return (
         f"{heading}\n\n"
         f"📝 {article_link_html(change.get('title', 'Sem título'))}\n"
         f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
         f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n\n"
-        f"🤖 Risco de reversão: {revert_score}%\n\n"
+        f"{risk_line}\n\n"
         f"{edit_link_html(build_diff_url(change))}"
     )
 
@@ -10025,44 +10093,56 @@ def analysis_worker():
             ):
                 continue
 
-            # 5. Revert Risk
-            revert_risk = get_revert_risk(
-                new_revision
-            )
-
-            if revert_risk is None:
-                continue
-
-            print(
-                "🤖 Revert Risk:",
-                f"{revert_risk:.1%}",
-                "|",
-                title
-            )
-
-            if (
-                revert_risk
-                <
-                REVERT_RISK_THRESHOLD
-            ):
-                continue
-
-            # 6. Diff + heurísticas
+            # 5–6. Classificação.
+            # Criações de página não podem usar Revert Risk: a própria
+            # documentação do modelo exclui a primeira revisão de uma página.
+            # Elas seguem por uma avaliação heurística local independente.
             if is_new_page:
                 diff = get_new_revision_content(
                     new_revision
                 )
+                result = analyze_new_page(
+                    change,
+                    diff
+                )
+                print(
+                    "🆕 Risco heurístico de página nova:",
+                    f"{result['score']:.1%}",
+                    "|",
+                    title
+                )
             else:
+                revert_risk = get_revert_risk(
+                    new_revision
+                )
+
+                if revert_risk is None:
+                    continue
+
+                print(
+                    "🤖 Revert Risk:",
+                    f"{revert_risk:.1%}",
+                    "|",
+                    title
+                )
+
+                if (
+                    revert_risk
+                    <
+                    REVERT_RISK_THRESHOLD
+                ):
+                    continue
+
                 diff = get_revision_diff(
                     old_revision,
                     new_revision
                 )
 
-            result = analyze_vandalism(
-                change,
-                diff,
-                revert_risk
-            )
+                result = analyze_vandalism(
+                    change,
+                    diff,
+                    revert_risk
+                )
 
             print(
                 "📊 Score final:",
@@ -10117,6 +10197,7 @@ def analysis_worker():
                             "revert_risk": result[
                                 "revert_risk"
                             ],
+                            "is_new_page": is_new_page,
                             "byte_delta": ((change.get("length") or {}).get("new", 0) - (change.get("length") or {}).get("old", 0) if isinstance(change.get("length"), dict) and isinstance((change.get("length") or {}).get("new"), int) and isinstance((change.get("length") or {}).get("old"), int) else None),
                         }
                     )
