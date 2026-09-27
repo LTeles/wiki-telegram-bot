@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.21"
-BOT_BUILD = "3.21-new-page-detection"
+BOT_VERSION = "3.22"
+BOT_BUILD = "3.22-abuse-filter-id-fix"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -3969,19 +3969,30 @@ def save_abuse_filter_state(last_log_id):
 
 
 def extract_abuse_filter_id(entry):
-    value = entry.get("filter")
+    # A API atual pode devolver "filter" como a descrição do filtro e
+    # "filter_id" vazio, mesmo quando aflfilter=<id> foi usado.
+    # Quando a consulta foi feita para um filtro específico, o monitor
+    # anota esse ID em "_watched_filter_id".
+    for value in (
+        entry.get("_watched_filter_id"),
+        entry.get("filter_id"),
+        entry.get("filter"),
+    ):
+        if isinstance(value, dict):
+            value = (
+                value.get("id")
+                or
+                value.get("name")
+            )
 
-    if isinstance(value, dict):
-        value = (
-            value.get("id")
-            or
-            value.get("name")
-        )
+        if value is None:
+            continue
 
-    if value is None:
-        return None
+        normalized = normalize_filter_id(value)
+        if normalized:
+            return normalized
 
-    return normalize_filter_id(value)
+    return None
 
 
 def abuse_filter_log_url(log_id):
@@ -4053,9 +4064,16 @@ def format_abuse_filter_message(entry, watched_info):
 def fetch_abuse_log_entries(filter_ids):
     all_entries = []
 
-    # A API aceita no máximo 50 filtros de uma vez para clientes comuns.
-    for start in range(0, len(filter_ids), 50):
-        chunk = filter_ids[start:start + 50]
+    # Consulta cada filtro separadamente. Além de simplificar a associação,
+    # isso contorna uma mudança da API em que o AbuseLog pode devolver
+    # "filter" como descrição e "filter_id" vazio. Como a requisição abaixo
+    # é exclusiva para um ID, podemos associar a entrada com segurança ao
+    # filtro solicitado sem depender desses campos da resposta.
+    for filter_id in filter_ids:
+        filter_id = normalize_filter_id(filter_id)
+
+        if not filter_id:
+            continue
 
         try:
             response, data = wikimedia_api_get(
@@ -4064,7 +4082,7 @@ def fetch_abuse_log_entries(filter_ids):
                     "format": "json",
                     "formatversion": 2,
                     "list": "abuselog",
-                    "aflfilter": "|".join(chunk),
+                    "aflfilter": filter_id,
                     "afllimit": ABUSE_FILTER_BATCH_LIMIT,
                     "afldir": "older",
                     "aflprop": (
@@ -4077,7 +4095,9 @@ def fetch_abuse_log_entries(filter_ids):
 
             if data.get("error"):
                 print(
-                    "⚠️ AbuseLog API:",
+                    "⚠️ AbuseLog API | filtro",
+                    filter_id,
+                    ":",
                     data["error"]
                 )
                 continue
@@ -4088,11 +4108,19 @@ def fetch_abuse_log_entries(filter_ids):
                 .get("abuselog", [])
             )
 
-            all_entries.extend(entries)
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+
+                item = dict(entry)
+                item["_watched_filter_id"] = filter_id
+                all_entries.append(item)
 
         except Exception as e:
             print(
-                "⚠️ Erro ao consultar AbuseLog:",
+                "⚠️ Erro ao consultar AbuseLog | filtro",
+                filter_id,
+                ":",
                 safe_exception(e)
             )
 
