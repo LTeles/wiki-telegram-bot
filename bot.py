@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.22"
-BOT_BUILD = "3.22-abuse-filter-id-fix"
+BOT_VERSION = "3.23"
+BOT_BUILD = "3.23-release-notes-unfalsepos-fix"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2447,6 +2447,9 @@ WIKI_RELEASE_NOTES = {
     "3.18": "Amplia novamente o percentual de risco e corrige o alinhamento do indicador para mantê-lo dentro do cartão.",
     "3.19": "Exibe o estado de bloqueio da conta ao lado de Estado enquanto o caso está pendente e congela o último estado após a resolução.",
     "3.20": "Reduz e contém o indicador percentual dentro do cartão de alto risco, preservando legibilidade e demais funções da 3.19.",
+    "3.21": "Adiciona monitoramento de páginas novas por heurísticas locais, mantendo Revert Risk apenas para edições de páginas existentes.",
+    "3.22": "Corrige o monitoramento de filtros de abuso vigiados, associando cada ocorrência diretamente ao ID do filtro consultado.",
+    "3.23": "Restaura as descrições dos anúncios de versão e torna a desmarcação de falso positivo transacional, sem perder a marcação quando a atualização do Telegram falha.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -11738,116 +11741,99 @@ def process_edit_action_callback(callback):
     if action == "unfalsepos":
         revision_id = int(record.get("revision_id") or revision_text)
 
-        # Registros antigos podem ter sido marcados como falso positivo numa
-        # versão em que o post era atualizado antes de false_positives.json.
-        # Se depois houve reversão, o status terminal substitui "false_positive",
-        # mas os metadados false_positive_* permanecem. Aceitar esses metadados
-        # como prova da marcação permite corrigir também alertas legados.
-        fp = None
+        # Responder imediatamente ao Telegram encerra o spinner do botão.
+        # A sincronização visual pode levar alguns segundos e não deve manter
+        # o callback aberto enquanto editMessageText faz novas tentativas.
+        answer_callback_query(
+            callback_id,
+            "Desmarcando falso positivo…"
+        )
+
         previous_marker = record.get("false_positive_by")
         with false_positives_lock:
             fp = false_positives.get(str(revision_id))
+            fp = dict(fp) if isinstance(fp, dict) else None
 
-            legacy_marked = bool(
-                record.get("false_positive_at")
-                or record.get("false_positive_by")
+        legacy_marked = bool(
+            record.get("false_positive_at")
+            or record.get("false_positive_by")
+        )
+
+        if fp and fp.get("resolved_at"):
+            send_telegram_message(
+                "ℹ️ Este falso positivo já foi encerrado e não pode ser desmarcado.",
+                chat_id=TELEGRAM_CHANNEL,
+                parse_mode="HTML",
+                reply_to_message_id=callback_message.get("message_id"),
             )
+            return
 
-            if fp and fp.get("resolved_at"):
-                answer_callback_query(
-                    callback_id,
-                    "Este falso positivo já foi encerrado e não pode ser desmarcado."
-                )
-                return
+        if not fp and not legacy_marked and record.get("status") != "false_positive":
+            send_telegram_message(
+                "ℹ️ Este alerta não possui marcação de falso positivo ativa.",
+                chat_id=TELEGRAM_CHANNEL,
+                parse_mode="HTML",
+                reply_to_message_id=callback_message.get("message_id"),
+            )
+            return
 
-            if not fp and not legacy_marked and record.get("status") != "false_positive":
-                answer_callback_query(
-                    callback_id,
-                    "Este alerta não possui marcação de falso positivo ativa."
-                )
-                return
-
-            if fp:
-                false_positives.pop(str(revision_id), None)
-
-        if fp:
-            save_false_positives()
-
-        # Pode haver uma corrida: o alerta é marcado Falso + e, quase ao
-        # mesmo tempo, a Wikipédia confirma reversão/patrulhamento/exclusão.
-        # Desmarcar o falso positivo não deve apagar esse desfecho real.
         terminal_statuses = {
             "reverted", "self_reverted", "deleted",
             "patrolled", "resolved_no_action"
         }
 
-        with posted_edits_lock:
-            live = posted_edits.get(str(revision_id))
-            if live:
-                current_status = live.get("status")
-                live.pop("false_positive_at", None)
-                live.pop("false_positive_by", None)
-                if current_status == "false_positive":
-                    live["status"] = None
-                record = dict(live)
-            else:
-                current_status = record.get("status")
+        # Primeiro calculamos como o post original deve ficar, mas ainda NÃO
+        # apagamos false_positives.json nem os marcadores em posted_edits.
+        # A remoção só é confirmada depois que o Telegram aceitar a edição.
+        current_status = record.get("status")
+        effective_status = (
+            None if current_status == "false_positive"
+            else current_status
+        )
 
-        save_posted_edits()
+        preview_record = dict(record)
+        preview_record.pop("false_positive_at", None)
+        preview_record.pop("false_positive_by", None)
+        preview_record["status"] = effective_status
 
-        # Restaurar a participação nas estatísticas sem perder um resultado
-        # terminal que já tenha sido observado.
-        try:
-            register_detection_stat(
+        if effective_status in terminal_statuses:
+            restored_text = message_with_status(
+                preview_record,
+                effective_status,
+                reverter=preview_record.get("reverted_by")
+                if effective_status == "reverted" else None
+            )
+            restored_markup = tracked_edit_reply_markup(
                 revision_id,
-                record.get("revert_risk"),
-                record.get("final_score"),
-                record.get("posted_at")
+                preview_record.get("alert_kind", "normal"),
+                include_resolution_buttons=False
             )
-            if current_status == "reverted":
-                mark_detection_stat_reverted(
-                    revision_id,
-                    record.get("reverted_at") or time.time()
-                )
-            elif current_status == "patrolled":
-                mark_detection_stat_patrolled(
-                    revision_id,
-                    record.get("patrolled_at") or time.time()
-                )
-            elif current_status == "resolved_no_action":
-                mark_detection_stat_resolved_no_action(
-                    revision_id,
-                    record.get("resolved_at") or time.time()
-                )
-            elif current_status == "self_reverted":
-                remove_detection_stat(revision_id)
-        except Exception as exc:
+        else:
+            restored_text = (
+                preview_record.get("base_message")
+                or message_with_status(preview_record, "pending")
+                or ""
+            ).rstrip()
+            restored_markup = tracked_edit_reply_markup(
+                revision_id,
+                preview_record.get("alert_kind", "normal"),
+                include_resolution_buttons=True
+            )
+
+        if not restored_text:
             safe_log(
-                f"Falha ao restaurar estatística após desmarcar falso positivo "
-                f"{revision_id}: {exc}"
+                f"Não foi possível reconstruir o texto original ao desmarcar "
+                f"falso positivo {revision_id}"
             )
+            send_telegram_message(
+                "⚠️ Não consegui reconstruir o post original. A marcação de falso positivo foi mantida.",
+                chat_id=TELEGRAM_CHANNEL,
+                parse_mode="HTML",
+                reply_to_message_id=callback_message.get("message_id"),
+            )
+            return
 
         try:
-            if current_status in terminal_statuses:
-                restored_text = message_with_status(
-                    record,
-                    current_status,
-                    reverter=record.get("reverted_by")
-                    if current_status == "reverted" else None
-                )
-                restored_markup = tracked_edit_reply_markup(
-                    revision_id,
-                    record.get("alert_kind", "normal"),
-                    include_resolution_buttons=False
-                )
-            else:
-                restored_text = record.get("base_message")
-                restored_markup = tracked_edit_reply_markup(
-                    revision_id,
-                    record.get("alert_kind", "normal"),
-                    include_resolution_buttons=True
-                )
-
             restored_ok = edit_telegram_message(
                 record.get("message_id"),
                 restored_text,
@@ -11861,19 +11847,65 @@ def process_edit_action_callback(callback):
                 f"{revision_id}: {exc}"
             )
 
-        # O botão fica numa mensagem auxiliar. Sua edição só é confirmada
-        # depois que o post original foi restaurado no Telegram.
         if not restored_ok:
-            with posted_edits_lock:
-                live = posted_edits.get(str(revision_id))
-                if live and live.get("status") is None:
-                    live["status"] = "false_positive"
-                    live["false_positive_at"] = time.time()
-                    live["false_positive_by"] = previous_marker or actor or "administrador do canal"
-            save_posted_edits()
-            answer_callback_query(callback_id, "Não consegui restaurar o post; tente novamente.")
+            # Nada é removido: o próximo clique continua encontrando a
+            # marcação ativa e pode tentar novamente.
+            send_telegram_message(
+                "⚠️ Não consegui atualizar o post original no Telegram. A marcação de falso positivo foi mantida; tente novamente.",
+                chat_id=TELEGRAM_CHANNEL,
+                parse_mode="HTML",
+                reply_to_message_id=callback_message.get("message_id"),
+            )
             return
-        answer_callback_query(callback_id, "Marcação de falso positivo desfeita.")
+
+        # Commit lógico somente após a confirmação visual no Telegram.
+        with false_positives_lock:
+            false_positives.pop(str(revision_id), None)
+        save_false_positives()
+
+        with posted_edits_lock:
+            live = posted_edits.get(str(revision_id))
+            if live:
+                live.pop("false_positive_at", None)
+                live.pop("false_positive_by", None)
+                if live.get("status") == "false_positive":
+                    live["status"] = None
+                live["reply_markup"] = restored_markup
+                record = dict(live)
+        save_posted_edits()
+
+        # Restaurar a participação nas estatísticas sem perder um resultado
+        # terminal que já tenha sido observado.
+        try:
+            register_detection_stat(
+                revision_id,
+                record.get("revert_risk"),
+                record.get("final_score"),
+                record.get("posted_at")
+            )
+            if effective_status == "reverted":
+                mark_detection_stat_reverted(
+                    revision_id,
+                    record.get("reverted_at") or time.time()
+                )
+            elif effective_status == "patrolled":
+                mark_detection_stat_patrolled(
+                    revision_id,
+                    record.get("patrolled_at") or time.time()
+                )
+            elif effective_status == "resolved_no_action":
+                mark_detection_stat_resolved_no_action(
+                    revision_id,
+                    record.get("resolved_at") or time.time()
+                )
+            elif effective_status == "self_reverted":
+                remove_detection_stat(revision_id)
+        except Exception as exc:
+            safe_log(
+                f"Falha ao restaurar estatística após desmarcar falso positivo "
+                f"{revision_id}: {exc}"
+            )
+
         auxiliary_message_id = callback_message.get("message_id")
         if auxiliary_message_id and auxiliary_message_id != record.get("message_id"):
             auxiliary_ok = edit_telegram_message(
@@ -11883,7 +11915,10 @@ def process_edit_action_callback(callback):
                 reply_markup={"inline_keyboard": []}
             )
             if not auxiliary_ok:
-                safe_log(f"Falha ao sincronizar mensagem auxiliar de falso positivo {revision_id}")
+                safe_log(
+                    f"Falha ao sincronizar mensagem auxiliar de falso positivo "
+                    f"{revision_id}"
+                )
         return
 
     if action == "falsepos":
