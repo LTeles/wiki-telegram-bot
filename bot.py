@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.23"
-BOT_BUILD = "3.23-release-notes-unfalsepos-fix"
+BOT_VERSION = "3.24"
+BOT_BUILD = "3.24-new-page-legitimacy-signals"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2450,6 +2450,7 @@ WIKI_RELEASE_NOTES = {
     "3.21": "Adiciona monitoramento de páginas novas por heurísticas locais, mantendo Revert Risk apenas para edições de páginas existentes.",
     "3.22": "Corrige o monitoramento de filtros de abuso vigiados, associando cada ocorrência diretamente ao ID do filtro consultado.",
     "3.23": "Restaura as descrições dos anúncios de versão e torna a desmarcação de falso positivo transacional, sem perder a marcação quando a atualização do Telegram falha.",
+    "3.24": "Calibra páginas novas com redutores imediatos por interwikis via Wikidata, referências e imagens, exibindo os sinais positivos no alerta.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -5138,6 +5139,8 @@ def register_posted_edit(item, telegram_message):
         "diff_url": item.get("diff_url"),
         "revert_risk": stats_payload.get("revert_risk"),
         "is_new_page": bool(stats_payload.get("is_new_page")),
+        "new_page_legitimacy": stats_payload.get("new_page_legitimacy"),
+        "raw_score": stats_payload.get("raw_score"),
         "diff_added": stats_payload.get("diff_added", ""),
         "diff_removed": stats_payload.get("diff_removed", ""),
         "risk_reasons": stats_payload.get("risk_reasons", ""),
@@ -9563,13 +9566,125 @@ def contextual_discussion_adjustment(change, diff, strong_signals):
 
 
 
+
+def new_page_legitimacy_signals(change, diff):
+    """
+    Sinais positivos avaliados imediatamente na primeira revisão.
+    Eles reduzem risco contextual, mas não neutralizam sinais locais fortes.
+    """
+    added = str(diff.get("added", "") or "")
+    lowered = added.casefold()
+
+    # Referências: conta <ref> e templates de citação; limita o redutor.
+    ref_count = len(re.findall(r"<ref\b", lowered))
+    cite_count = len(re.findall(r"\{\{\s*(?:citar|cite)\b", lowered))
+    source_count = max(ref_count, cite_count)
+
+    if source_count >= 4:
+        reference_reduction = 0.20
+    elif source_count >= 2:
+        reference_reduction = 0.15
+    elif source_count >= 1:
+        reference_reduction = 0.07
+    else:
+        reference_reduction = 0.0
+
+    # Imagem é um sinal leve, pois é fácil de reproduzir artificialmente.
+    has_image = bool(re.search(
+        r"\[\[\s*(?:ficheiro|arquivo|file|imagem)\s*:",
+        lowered,
+        flags=re.I
+    ))
+    image_reduction = 0.05 if has_image else 0.0
+
+    # Interwikis via Wikidata: forte redutor. Consulta imediatamente na criação.
+    interwiki_count = 0
+    wikidata_item = None
+    try:
+        _, page_data = wikimedia_api_get(
+            {
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "prop": "pageprops",
+                "ppprop": "wikibase_item",
+                "titles": change.get("title", ""),
+            },
+            timeout=12,
+        )
+        pages = page_data.get("query", {}).get("pages", [])
+        if pages:
+            wikidata_item = (pages[0].get("pageprops") or {}).get("wikibase_item")
+
+        if wikidata_item:
+            response = requests.get(
+                "https://www.wikidata.org/w/api.php",
+                params={
+                    "action": "wbgetentities",
+                    "format": "json",
+                    "ids": wikidata_item,
+                    "props": "sitelinks",
+                },
+                headers=HEADERS,
+                timeout=12,
+            )
+            response.raise_for_status()
+            entity = response.json().get("entities", {}).get(wikidata_item, {})
+            sitelinks = entity.get("sitelinks", {}) or {}
+            interwiki_count = sum(
+                1 for site in sitelinks
+                if site.endswith("wiki") and site != "ptwiki"
+            )
+    except Exception as exc:
+        safe_log(
+            f"Falha ao consultar interwikis da página nova "
+            f"{change.get('title', '')}: {exc}"
+        )
+
+    if interwiki_count >= 10:
+        interwiki_reduction = 0.35
+    elif interwiki_count >= 3:
+        interwiki_reduction = 0.30
+    elif interwiki_count >= 1:
+        interwiki_reduction = 0.22
+    else:
+        interwiki_reduction = 0.0
+
+    reasons = []
+    if interwiki_count:
+        reasons.append(
+            f"artigo em {interwiki_count} outra"
+            f"{'s' if interwiki_count != 1 else ''} Wikipédia"
+            f"{'s' if interwiki_count != 1 else ''}"
+        )
+    if source_count:
+        reasons.append(
+            f"{source_count} referência"
+            f"{'s' if source_count != 1 else ''}"
+        )
+    if has_image:
+        reasons.append("imagem")
+
+    return {
+        "total_reduction": min(
+            0.55,
+            interwiki_reduction + reference_reduction + image_reduction
+        ),
+        "interwiki_count": interwiki_count,
+        "interwiki_reduction": interwiki_reduction,
+        "reference_count": source_count,
+        "reference_reduction": reference_reduction,
+        "has_image": has_image,
+        "image_reduction": image_reduction,
+        "wikidata_item": wikidata_item,
+        "signals": reasons,
+    }
+
 def analyze_new_page(change, diff):
     """
-    Avalia a primeira revisão de uma página sem chamar Revert Risk.
-
-    Os modelos Revert Risk da Wikimedia não devem ser usados na primeira
-    revisão de uma página. Para criações, usamos somente sinais locais já
-    existentes no bot e mantemos o resultado separado do Revert Risk.
+    Avalia imediatamente a primeira revisão de uma página sem Revert Risk.
+    Sinais positivos de estrutura enciclopédica reduzem risco contextual,
+    preservando um piso quando há sinais locais fortes de vandalismo.
     """
     added = str(diff.get("added", "") or "")
     signal_text = (
@@ -9582,22 +9697,28 @@ def analyze_new_page(change, diff):
     profanity = profanity_score(signal_text)
     repetition = repetition_score(signal_text)
     nonsense = nonsense_score(signal_text)
-    signals = [profanity, repetition, nonsense]
+    local_signals = [profanity, repetition, nonsense]
 
-    # Um sinal local forte pode, por si só, justificar revisão humana.
-    score = max(signals) if signals else 0.0
-    strong_signals = sum(1 for signal in signals if signal >= 0.75)
+    raw_score = max(local_signals) if local_signals else 0.0
+    strong_signals = sum(1 for signal in local_signals if signal >= 0.75)
     if strong_signals >= 2:
-        score = min(1.0, score + 0.10)
+        raw_score = min(1.0, raw_score + 0.10)
 
     promotional = new_page_promotional_signals(change, diff)
-
-    # Sinais promocionais/contextuais só elevam uma criação ao limiar quando
-    # aparecem em combinação; um único indício fraco não publica a página.
     promo_signals = promotional.get("signals", [])
     promo_bonus = float(promotional.get("bonus") or 0.0)
     if len(promo_signals) >= 2:
-        score = max(score, min(1.0, 0.35 + promo_bonus))
+        raw_score = max(raw_score, min(1.0, 0.35 + promo_bonus))
+
+    legitimacy = new_page_legitimacy_signals(change, diff)
+    reduction = float(legitimacy.get("total_reduction") or 0.0)
+
+    # Evidências positivas reduzem o risco desde a primeira revisão.
+    # Se houver sinal local forte, não permitimos que estrutura "bonita"
+    # (refs/imagem/interwiki) o esconda completamente.
+    score = max(0.0, raw_score - reduction)
+    if max(local_signals or [0.0]) >= 0.85:
+        score = max(score, 0.50)
 
     reasons = []
     if profanity >= 0.75:
@@ -9609,12 +9730,14 @@ def analyze_new_page(change, diff):
     reasons.extend(promo_signals)
 
     if not reasons:
-        reasons.append("página nova sem sinais locais suficientes")
+        reasons.append("página nova sem sinais locais fortes")
 
     return {
         "score": min(max(score, 0.0), 1.0),
+        "raw_score": min(max(raw_score, 0.0), 1.0),
         "revert_risk": None,
         "reason": ", ".join(reasons),
+        "new_page_legitimacy": legitimacy,
         "benign_reduction": None,
         "cosmetic_adjustment": None,
         "minimal_adjustment": None,
@@ -9622,6 +9745,7 @@ def analyze_new_page(change, diff):
         "promotional_adjustment": promotional,
         "reference_removal_adjustment": None,
     }
+
 
 def analyze_vandalism(change, diff, revert_risk):
     added = diff.get("added", "")
@@ -10011,7 +10135,34 @@ def format_message(change, result):
     )
 
     if is_new_page:
-        risk_line = f"🧭 Risco heurístico: {final_score}%"
+        raw_score = round(float(result.get("raw_score", result["score"])) * 100)
+        legitimacy = result.get("new_page_legitimacy") or {}
+        positive_lines = []
+
+        interwiki_count = int(legitimacy.get("interwiki_count") or 0)
+        if interwiki_count:
+            positive_lines.append(
+                f"🌐 − artigo em {interwiki_count} outra"
+                f"{'s' if interwiki_count != 1 else ''} Wikipédia"
+                f"{'s' if interwiki_count != 1 else ''}"
+            )
+
+        reference_count = int(legitimacy.get("reference_count") or 0)
+        if reference_count:
+            positive_lines.append(
+                f"📚 − {reference_count} referência"
+                f"{'s' if reference_count != 1 else ''}"
+            )
+
+        if legitimacy.get("has_image"):
+            positive_lines.append("🖼 − contém imagem")
+
+        risk_line = (
+            f"🧭 Risco heurístico: {final_score}%"
+            + (f" (bruto {raw_score}%)" if positive_lines else "")
+        )
+        if positive_lines:
+            risk_line += "\n" + "\n".join(positive_lines)
     else:
         revert_score = round(
             result["revert_risk"] * 100
@@ -10229,6 +10380,8 @@ def analysis_worker():
                                 "revert_risk"
                             ],
                             "is_new_page": is_new_page,
+                            "new_page_legitimacy": result.get("new_page_legitimacy"),
+                            "raw_score": result.get("raw_score"),
                             "byte_delta": ((change.get("length") or {}).get("new", 0) - (change.get("length") or {}).get("old", 0) if isinstance(change.get("length"), dict) and isinstance((change.get("length") or {}).get("new"), int) and isinstance((change.get("length") or {}).get("old"), int) else None),
                         }
                     )
