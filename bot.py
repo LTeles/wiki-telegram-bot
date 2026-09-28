@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.29"
-BOT_BUILD = "3.29-card-separation-preview-entities"
+BOT_VERSION = "3.30"
+BOT_BUILD = "3.30-abuse-filter-user-cooldown"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -169,6 +169,7 @@ TEMP_WATCH_DURATION_SECONDS = 6 * 60 * 60
 IGNORE_DURATION_SECONDS = 6 * 60 * 60
 
 ABUSE_FILTER_POLL_SECONDS = 20
+ABUSE_FILTER_USER_COOLDOWN_SECONDS = 5 * 60
 ABUSE_FILTER_BATCH_LIMIT = 500
 
 # Proteção contra flooding em surtos de bloqueios.
@@ -327,6 +328,11 @@ abuse_filters_lock = threading.Lock()
 # maior ID de ocorrência do AbuseLog já percorrida
 abuse_filter_state = {"last_log_id": 0}
 abuse_state_lock = threading.Lock()
+
+# Anti-flood: uma publicação por combinação filtro + usuário a cada 5 min.
+# Ocorrências suprimidas não renovam o cooldown.
+abuse_filter_user_cooldowns = {}
+abuse_filter_user_cooldowns_lock = threading.Lock()
 
 # revisão -> metadados da mensagem do Telegram
 posted_edits = {}
@@ -2456,6 +2462,7 @@ WIKI_RELEASE_NOTES = {
     "3.27": "Corrige a passagem de parâmetros para a predefinição de alto risco: pipes usam {{!}} e o temporizador é construído pela própria predefinição, evitando erro de expressão e vazamento de parâmetros no cartão.",
     "3.28": "Neutraliza chaves e pipes do conteúdo variável antes de passá-lo à predefinição, impedindo que wikitext presente no diff encerre a chamada do cartão ou seja interpretado como novos parâmetros.",
     "3.29": "Melhora a separação visual dos cartões com espaçamento, cantos discretos e sombra suave, e evita dupla codificação das entidades HTML exibidas na prévia dos diffs.",
+    "3.30": "Adiciona anti-flood aos filtros de abuso vigiados: no máximo um post por combinação filtro e usuário a cada 5 minutos, sem renovar a janela quando ocorrências adicionais são ignoradas.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -4142,6 +4149,39 @@ def fetch_abuse_log_entries(filter_ids):
     return all_entries
 
 
+def abuse_filter_user_cooldown_allows(filter_id, username, now=None):
+    now = time.time() if now is None else float(now)
+    key = (
+        str(normalize_filter_id(filter_id) or filter_id),
+        str(username or "").strip().casefold(),
+    )
+
+    # Se a API não trouxer usuário, não agrupamos ocorrências desconhecidas.
+    if not key[1]:
+        return True
+
+    with abuse_filter_user_cooldowns_lock:
+        cutoff = now - ABUSE_FILTER_USER_COOLDOWN_SECONDS
+        stale = [
+            item_key for item_key, published_at
+            in abuse_filter_user_cooldowns.items()
+            if float(published_at) < cutoff
+        ]
+        for item_key in stale:
+            abuse_filter_user_cooldowns.pop(item_key, None)
+
+        last_published = abuse_filter_user_cooldowns.get(key)
+        if (
+            last_published is not None
+            and now - float(last_published) < ABUSE_FILTER_USER_COOLDOWN_SECONDS
+        ):
+            return False
+
+        # Só uma ocorrência efetivamente aceita inicia a janela.
+        abuse_filter_user_cooldowns[key] = now
+        return True
+
+
 def abuse_filter_monitor():
     print("✅ Monitor de filtros de abuso iniciado.")
 
@@ -4238,6 +4278,22 @@ def abuse_filter_monitor():
                     and
                     event_ts < added_at - 2
                 ):
+                    continue
+
+                username = str(entry.get("user") or "").strip()
+                if not abuse_filter_user_cooldown_allows(
+                    filter_id,
+                    username,
+                    now=time.time(),
+                ):
+                    print(
+                        "🛡 Filtro de abuso suprimido por anti-flood:",
+                        filter_id,
+                        "| usuário:",
+                        username,
+                        "| log:",
+                        log_id
+                    )
                     continue
 
                 message = format_abuse_filter_message(
