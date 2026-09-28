@@ -2463,7 +2463,7 @@ WIKI_RELEASE_NOTES = {
     "3.28": "Neutraliza chaves e pipes do conteúdo variável antes de passá-lo à predefinição, impedindo que wikitext presente no diff encerre a chamada do cartão ou seja interpretado como novos parâmetros.",
     "3.29": "Melhora a separação visual dos cartões com espaçamento, cantos discretos e sombra suave, e evita dupla codificação das entidades HTML exibidas na prévia dos diffs.",
     "3.30": "Adiciona anti-flood aos filtros de abuso vigiados: no máximo um post por combinação filtro e usuário a cada 5 minutos, sem renovar a janela quando ocorrências adicionais são ignoradas.",
-    "3.31": "Prioriza no topo da lista de alto risco as edições pendentes, ordenadas pelo maior percentual de risco, recua o indicador percentual da borda direita, liga o nome da conta nos alertas de filtro às contribuições e coloca automaticamente em observação por 6 horas as contas que geram alertas publicados de filtros vigiados; mensagens posteriores dessa observação mantêm o botão Desobservar.",
+    "3.31": "Prioriza no topo da lista de alto risco as edições pendentes, ordenadas pelo maior percentual de risco, recua o indicador percentual da borda direita, liga o nome da conta nos alertas de filtro às contribuições e coloca automaticamente em observação por 6 horas as contas que geram alertas publicados de filtros vigiados; mensagens posteriores dessa observação mantêm o botão Desobservar; e os posts de edições exibem abaixo do sumário a variação em bytes, com indicador verde para acréscimo e vermelho para remoção.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -10201,6 +10201,24 @@ def tracked_queue_item(
     }
 
 
+def telegram_byte_delta_line(change):
+    lengths = change.get("length")
+    if not isinstance(lengths, dict):
+        return ""
+
+    old_length = lengths.get("old")
+    new_length = lengths.get("new")
+    if not isinstance(old_length, int) or isinstance(old_length, bool) or not isinstance(new_length, int) or isinstance(new_length, bool):
+        return ""
+
+    delta = new_length - old_length
+    if delta > 0:
+        return f"🟢 +{delta} bytes"
+    if delta < 0:
+        return f"🔴 {delta} bytes"
+    return "⚪ 0 bytes"
+
+
 def format_observed_message(change, observation):
     reason = (observation.get("reason") or "").strip()
     reason_line = f"\n📌 Motivo: {html.escape(reason)}\n" if reason else ""
@@ -10211,6 +10229,7 @@ def format_observed_message(change, observation):
         f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
         f"📝 {article_link_html(change.get('title', 'Sem título'))}\n"
         f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n"
+        f"{telegram_byte_delta_line(change)}\n"
         f"{reason_line}\n"
         f"{edit_link_html(build_diff_url(change))}"
         f"{observer_line}"
@@ -10222,7 +10241,8 @@ def format_watched_message(change):
         "👁 Edição em página vigiada\n\n"
         f"📝 {article_link_html(change.get('title', 'Sem título'))}\n"
         f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
-        f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n\n"
+        f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n"
+        f"{telegram_byte_delta_line(change)}\n\n"
         f"{edit_link_html(build_diff_url(change))}"
     )
 
@@ -10279,7 +10299,8 @@ def format_message(change, result):
         f"{heading}\n\n"
         f"📝 {article_link_html(change.get('title', 'Sem título'))}\n"
         f"👤 {user_contributions_link_html(change.get('user', 'Desconhecido'))}\n"
-        f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n\n"
+        f"💬 {html.escape(str(change.get('comment') or 'Sem resumo'))}\n"
+        f"{telegram_byte_delta_line(change)}\n\n"
         f"{risk_line}\n\n"
         f"{edit_link_html(build_diff_url(change))}"
     )
