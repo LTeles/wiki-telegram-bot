@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.24"
-BOT_BUILD = "3.24-new-page-legitimacy-signals"
+BOT_VERSION = "3.26"
+BOT_BUILD = "3.26-high-risk-template"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2451,6 +2451,8 @@ WIKI_RELEASE_NOTES = {
     "3.22": "Corrige o monitoramento de filtros de abuso vigiados, associando cada ocorrência diretamente ao ID do filtro consultado.",
     "3.23": "Restaura as descrições dos anúncios de versão e torna a desmarcação de falso positivo transacional, sem perder a marcação quando a atualização do Telegram falha.",
     "3.24": "Calibra páginas novas com redutores imediatos por interwikis via Wikidata, referências e imagens, exibindo os sinais positivos no alerta.",
+    "3.25": "Impede adicionar filtros de abuso privados à vigilância e informa que a restrição decorre dos direitos atuais da conta TelesGramBot.",
+    "3.26": "Centraliza a estrutura visual dos cartões de alto risco em uma predefinição reutilizável na TestWiki, reduzindo o wikitext repetido sem alterar revisão, risco ou sincronização.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -3865,6 +3867,12 @@ def add_abuse_filter(filter_id):
     # Filtro global é aceito mesmo se não conseguirmos ler a descrição.
     if info is None and not filter_id.startswith("global-"):
         return False, False, None
+
+    # Filtros privados locais não são adicionados com os direitos atuais
+    # da conta TelesGramBot. Retornamos os metadados para que o chamador
+    # possa explicar explicitamente a recusa.
+    if info and info.get("private"):
+        return False, False, info
 
     entry = {
         "filter_id": filter_id,
@@ -7457,6 +7465,18 @@ def execute_reversible_action(action, target):
     if action == "watch_filter":
         filter_id = normalize_filter_id(target)
         success, added, info = add_abuse_filter(filter_id)
+
+        if not success and info and info.get("private"):
+            message = (
+                f"🔒 Filtro {filter_id} é privado\n"
+                "Não adicionado. Filtros privados não podem ser "
+                "adicionados à vigilância com base nos direitos atuais "
+                "da conta TelesGramBot."
+            )
+            # "success" aqui apenas permite que a mensagem explicativa seja
+            # entregue pelo fluxo do botão; "changed=False" impede inversão.
+            return True, False, message, None
+
         description = info.get("description") if info else None
         message = (
             "🛡 Filtro adicionado à vigilância\n\n"
@@ -11645,7 +11665,18 @@ def process_telegram_command(message, from_channel=False):
             filter_id
         )
 
-        if not success:
+        if (
+            not success
+            and info
+            and info.get("private")
+        ):
+            response_text = (
+                f"🔒 Filtro {filter_id} é privado\n"
+                "Não adicionado. Filtros privados não podem ser "
+                "adicionados à vigilância com base nos direitos atuais "
+                "da conta TelesGramBot."
+            )
+        elif not success:
             response_text = (
                 "❌ Não foi possível localizar ou "
                 "salvar esse filtro."
@@ -12781,6 +12812,7 @@ WIKI_HIGH_RISK_ARCHIVE_PREFIX = WIKI_HIGH_RISK_TITLE + "/"
 WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Arquivo"
 WIKI_HIGH_RISK_HEADER_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Cabeçalho"
 WIKI_HIGH_RISK_MANUAL_TITLE = "User:TelesGramBot/Revisões manuais"
+WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE = "User:TelesGramBot/Predefinição/Edição de alto risco"
 WIKI_HIGH_RISK_THRESHOLD = 0.80
 HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS = 60
 HIGH_RISK_MANUAL_CLEANUP_SECONDS = 7 * 24 * 60 * 60
@@ -13440,28 +13472,17 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
             '{{#expr:floor(({{#time:U}}-{{#time:U|' + revision_mw + '}})/60)}} min</span>'
         )
 
+    def tpl(value):
+        return str(value or "").replace("|", "&#124;")
+
     return (
-        f'<div class="telesgram-high-risk-entry" data-telesgram-revid="{revision_id}" '
-        f'data-telesgram-status="{wiki_safe_text(record.get("status") or "pending")}" '
-        f'data-telesgram-reviewer="{wiki_safe_text(record.get("manual_reviewer") or "")}" '
-        f'data-telesgram-timestamp="{revision_iso}" '
-        f'style="position:relative; background:{background}; border:1px solid #a2a9b1; '
-        f'padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0; line-height:1.35">'
-        + risk_badge + f"{first_line}<br>{user_line}<br>"
-        + (preview + "<br>" if preview else "")
-        + (
-            '<div style="display:flex; align-items:baseline; justify-content:space-between; '
-            'gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' ' + status_text + '</small>'
-            + (
-                '<small style="margin-left:auto; text-align:right; white-space:nowrap">'
-                "\'\'\'Conta:\'\'\' " + wiki_safe_text(record.get("account_block_state")) + '</small>'
-                if record.get("account_block_state") else ""
-            )
-            + '</div>'
-        )
-        + ("<br>" + pattern_line if pattern_line else "")
-        + (f'<div class="telesgram-timer-source" style="display:none">{timer_wikitext}</div>' if timer_wikitext else "")
-        + "</div>"
+        "{{" + WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE
+        + f"|revid={revision_id}|status={tpl(wiki_safe_text(record.get('status') or 'pending'))}"
+        + f"|reviewer={tpl(wiki_safe_text(record.get('manual_reviewer') or ''))}|timestamp={tpl(revision_iso)}"
+        + f"|background={tpl(background)}|risk_bg={tpl(risk_badge_bg)}|risk={risk:.0%}|date={tpl(compact_time)}"
+        + f"|first_line={tpl(first_line)}|user_line={tpl(user_line)}|preview={tpl(preview)}"
+        + f"|state={tpl(status_text)}|account_state={tpl(wiki_safe_text(record.get('account_block_state')) if record.get('account_block_state') else '')}"
+        + f"|pattern={tpl(pattern_line)}|timer={tpl(timer_wikitext)}}}}}"
     )
 
 def select_high_risk_records(records):
@@ -13492,6 +13513,10 @@ def select_high_risk_records(records):
 
 def high_risk_header_transclusion():
     return "{{" + WIKI_HIGH_RISK_HEADER_TITLE + "}}"
+
+
+def build_high_risk_entry_template_wikitext():
+    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0; line-height:1.35; overflow:hidden">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.55em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer|}}}|<div class="telesgram-timer-source" style="display:none">{{{timer}}}</div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[User:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
 
 
 def build_high_risk_page(records, heading, introduction, include_dynamic_learning=True):
@@ -13756,7 +13781,7 @@ def build_high_risk_archive_index_wikitext(records):
 
 
 def testwiki_allowed_title(title):
-    if title in (WIKI_HIGH_RISK_TITLE, WIKI_HIGH_RISK_HEADER_TITLE, WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE, WIKI_HIGH_RISK_MANUAL_TITLE):
+    if title in (WIKI_HIGH_RISK_TITLE, WIKI_HIGH_RISK_HEADER_TITLE, WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE, WIKI_HIGH_RISK_MANUAL_TITLE, WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE):
         return True
     if title.startswith(WIKI_HIGH_RISK_ARCHIVE_PREFIX):
         suffix = title[len(WIKI_HIGH_RISK_ARCHIVE_PREFIX):]
@@ -14064,6 +14089,7 @@ def reconcile_high_risk_manual_reviews():
 def queue_high_risk_wiki_pages():
     refresh_pending_high_risk_block_states()
     sync_high_risk_archive()
+    queue_testwiki_edit(WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE, build_high_risk_entry_template_wikitext(), "Atualizando estrutura dos cartões de alto risco", priority=True)
     with high_risk_archive_lock:
         archived = [dict(x) for x in high_risk_archive.values()]
     queue_testwiki_edit(WIKI_HIGH_RISK_TITLE, build_high_risk_wikitext(), "Atualizando lista de edições de alto risco")
