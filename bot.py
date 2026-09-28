@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.27"
-BOT_BUILD = "3.27-template-parameter-fix"
+BOT_VERSION = "3.28"
+BOT_BUILD = "3.28-template-content-escaping"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2454,6 +2454,7 @@ WIKI_RELEASE_NOTES = {
     "3.25": "Impede adicionar filtros de abuso privados à vigilância e informa que a restrição decorre dos direitos atuais da conta TelesGramBot.",
     "3.26": "Centraliza a estrutura visual dos cartões de alto risco em uma predefinição reutilizável na TestWiki, reduzindo o wikitext repetido sem alterar revisão, risco ou sincronização.",
     "3.27": "Corrige a passagem de parâmetros para a predefinição de alto risco: pipes usam {{!}} e o temporizador é construído pela própria predefinição, evitando erro de expressão e vazamento de parâmetros no cartão.",
+    "3.28": "Neutraliza chaves e pipes do conteúdo variável antes de passá-lo à predefinição, impedindo que wikitext presente no diff encerre a chamada do cartão ou seja interpretado como novos parâmetros.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -13474,9 +13475,18 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         )
 
     def tpl(value):
-        # Pipes inside named parameters must survive template parsing without
-        # becoming literal "&" text inside parser functions.
-        return str(value or "").replace("|", "{{!}}")
+        # Conteúdo de diffs pode conter wikitext arbitrário, inclusive
+        # {{predefinições}} com pipes. Dentro de uma chamada de predefinição,
+        # isso pode fechar a chamada externa prematuramente ou criar parâmetros
+        # acidentais. Neutralizamos apenas a sintaxe estrutural do template;
+        # HTML e links já construídos pelo bot permanecem renderizáveis.
+        return (
+            str(value or "")
+            .replace("&", "&amp;")
+            .replace("|", "&#124;")
+            .replace("{", "&#123;")
+            .replace("}", "&#125;")
+        )
 
     return (
         "{{" + WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE
