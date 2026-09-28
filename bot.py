@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.28"
-BOT_BUILD = "3.28-template-content-escaping"
+BOT_VERSION = "3.29"
+BOT_BUILD = "3.29-card-separation-preview-entities"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2455,6 +2455,7 @@ WIKI_RELEASE_NOTES = {
     "3.26": "Centraliza a estrutura visual dos cartões de alto risco em uma predefinição reutilizável na TestWiki, reduzindo o wikitext repetido sem alterar revisão, risco ou sincronização.",
     "3.27": "Corrige a passagem de parâmetros para a predefinição de alto risco: pipes usam {{!}} e o temporizador é construído pela própria predefinição, evitando erro de expressão e vazamento de parâmetros no cartão.",
     "3.28": "Neutraliza chaves e pipes do conteúdo variável antes de passá-lo à predefinição, impedindo que wikitext presente no diff encerre a chamada do cartão ou seja interpretado como novos parâmetros.",
+    "3.29": "Melhora a separação visual dos cartões com espaçamento, cantos discretos e sombra suave, e evita dupla codificação das entidades HTML exibidas na prévia dos diffs.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -13475,18 +13476,14 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         )
 
     def tpl(value):
-        # Conteúdo de diffs pode conter wikitext arbitrário, inclusive
-        # {{predefinições}} com pipes. Dentro de uma chamada de predefinição,
-        # isso pode fechar a chamada externa prematuramente ou criar parâmetros
-        # acidentais. Neutralizamos apenas a sintaxe estrutural do template;
-        # HTML e links já construídos pelo bot permanecem renderizáveis.
-        return (
-            str(value or "")
-            .replace("&", "&amp;")
-            .replace("|", "&#124;")
-            .replace("{", "&#123;")
-            .replace("}", "&#125;")
-        )
+        # Isola a sintaxe estrutural do wikitext sem transformar novamente
+        # entidades HTML já produzidas pela prévia (&#91;, &lt; etc.).
+        # Assim elas continuam seguras durante a expansão da predefinição,
+        # mas são exibidas ao leitor como os caracteres originais.
+        text = str(value or "")
+        text = text.replace("|", "&#124;")
+        text = text.replace("{", "&#123;").replace("}", "&#125;")
+        return text
 
     return (
         "{{" + WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE
@@ -13529,7 +13526,7 @@ def high_risk_header_transclusion():
 
 
 def build_high_risk_entry_template_wikitext():
-    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0; line-height:1.35; overflow:hidden">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.55em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none"><span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[User:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
+    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; border-radius:4px; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0 0.85em 0; line-height:1.35; overflow:hidden; box-shadow:0 2px 2px rgba(0,0,0,.08)">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.55em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none"><span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[User:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
 
 
 def build_high_risk_page(records, heading, introduction, include_dynamic_learning=True):
