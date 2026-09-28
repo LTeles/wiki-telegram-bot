@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.26"
-BOT_BUILD = "3.26-high-risk-template"
+BOT_VERSION = "3.27"
+BOT_BUILD = "3.27-template-parameter-fix"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2453,6 +2453,7 @@ WIKI_RELEASE_NOTES = {
     "3.24": "Calibra páginas novas com redutores imediatos por interwikis via Wikidata, referências e imagens, exibindo os sinais positivos no alerta.",
     "3.25": "Impede adicionar filtros de abuso privados à vigilância e informa que a restrição decorre dos direitos atuais da conta TelesGramBot.",
     "3.26": "Centraliza a estrutura visual dos cartões de alto risco em uma predefinição reutilizável na TestWiki, reduzindo o wikitext repetido sem alterar revisão, risco ou sincronização.",
+    "3.27": "Corrige a passagem de parâmetros para a predefinição de alto risco: pipes usam {{!}} e o temporizador é construído pela própria predefinição, evitando erro de expressão e vazamento de parâmetros no cartão.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -13473,7 +13474,9 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         )
 
     def tpl(value):
-        return str(value or "").replace("|", "&#124;")
+        # Pipes inside named parameters must survive template parsing without
+        # becoming literal "&" text inside parser functions.
+        return str(value or "").replace("|", "{{!}}")
 
     return (
         "{{" + WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE
@@ -13482,7 +13485,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         + f"|background={tpl(background)}|risk_bg={tpl(risk_badge_bg)}|risk={risk:.0%}|date={tpl(compact_time)}"
         + f"|first_line={tpl(first_line)}|user_line={tpl(user_line)}|preview={tpl(preview)}"
         + f"|state={tpl(status_text)}|account_state={tpl(wiki_safe_text(record.get('account_block_state')) if record.get('account_block_state') else '')}"
-        + f"|pattern={tpl(pattern_line)}|timer={tpl(timer_wikitext)}}}}}"
+        + f"|pattern={tpl(pattern_line)}|timer_timestamp={tpl(revision_iso)}}}}}"
     )
 
 def select_high_risk_records(records):
@@ -13516,7 +13519,7 @@ def high_risk_header_transclusion():
 
 
 def build_high_risk_entry_template_wikitext():
-    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0; line-height:1.35; overflow:hidden">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.55em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer|}}}|<div class="telesgram-timer-source" style="display:none">{{{timer}}}</div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[User:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
+    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0; line-height:1.35; overflow:hidden">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.55em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none"><span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[User:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
 
 
 def build_high_risk_page(records, heading, introduction, include_dynamic_learning=True):
