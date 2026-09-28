@@ -27,8 +27,8 @@ from sseclient import SSEClient
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.30"
-BOT_BUILD = "3.30-abuse-filter-user-cooldown"
+BOT_VERSION = "3.31"
+BOT_BUILD = "3.31-pending-priority-risk-inset"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2463,6 +2463,7 @@ WIKI_RELEASE_NOTES = {
     "3.28": "Neutraliza chaves e pipes do conteúdo variável antes de passá-lo à predefinição, impedindo que wikitext presente no diff encerre a chamada do cartão ou seja interpretado como novos parâmetros.",
     "3.29": "Melhora a separação visual dos cartões com espaçamento, cantos discretos e sombra suave, e evita dupla codificação das entidades HTML exibidas na prévia dos diffs.",
     "3.30": "Adiciona anti-flood aos filtros de abuso vigiados: no máximo um post por combinação filtro e usuário a cada 5 minutos, sem renovar a janela quando ocorrências adicionais são ignoradas.",
+    "3.31": "Prioriza no topo da lista de alto risco as edições pendentes, ordenadas pelo maior percentual de risco, recua o indicador percentual da borda direita, liga o nome da conta nos alertas de filtro às contribuições e coloca automaticamente em observação por 6 horas as contas que geram alertas publicados de filtros vigiados; mensagens posteriores dessa observação mantêm o botão Desobservar.",
 }
 WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
 
@@ -4074,7 +4075,7 @@ def format_abuse_filter_message(entry, watched_info):
     return (
         f"{header}"
         f"{description_line}\n\n"
-        f"👤 Usuário: {html.escape(str(user))}\n"
+        f"👤 Usuário: {user_contributions_link_html(user)}\n"
         f"📝 Página: {html.escape(str(title))}\n"
         f"⚙️ Ação: {html.escape(str(action))}\n"
         f"🚨 Resultado: {html.escape(str(result))}\n\n"
@@ -4295,6 +4296,32 @@ def abuse_filter_monitor():
                         log_id
                     )
                     continue
+
+                # Toda conta que gera um alerta publicado de filtro vigiado
+                # entra automaticamente em observação por 6 horas. O anti-flood
+                # é avaliado antes, portanto ocorrências suprimidas não renovam
+                # inadvertidamente a observação.
+                if username:
+                    observation_reason = (
+                        f"Filtro de abuso {filter_id} acionado"
+                    )
+                    if not observe_user(
+                        username,
+                        reason=observation_reason,
+                    ):
+                        print(
+                            "⚠️ Não foi possível observar automaticamente:",
+                            username,
+                            "| filtro:",
+                            filter_id
+                        )
+                    else:
+                        print(
+                            "🔎 Conta colocada em observação pelo filtro:",
+                            username,
+                            "| filtro:",
+                            filter_id
+                        )
 
                 message = format_abuse_filter_message(
                     entry,
@@ -13498,7 +13525,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
 
     risk_badge_bg = "#b32424" if risk > 0.95 else "#ac6600"
     risk_badge = (
-        f'<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.55em; '
+        f'<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.90em; '
         f'width:4.35em; text-align:center; box-sizing:border-box">'
         f'<span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; '
         f'display:flex; align-items:center; justify-content:center; box-sizing:border-box; '
@@ -13568,6 +13595,7 @@ def select_high_risk_records(records):
 
     eligible.sort(
         key=lambda item: (
+            1 if high_risk_action(item)[0] is None else 0,
             float(item.get("revert_risk") or 0),
             float(item.get("posted_at") or 0),
         ),
@@ -13582,7 +13610,7 @@ def high_risk_header_transclusion():
 
 
 def build_high_risk_entry_template_wikitext():
-    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; border-radius:4px; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0 0.85em 0; line-height:1.35; overflow:hidden; box-shadow:0 2px 2px rgba(0,0,0,.08)">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.55em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none"><span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[User:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
+    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; border-radius:4px; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0 0.85em 0; line-height:1.35; overflow:hidden; box-shadow:0 2px 2px rgba(0,0,0,.08)">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.90em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none"><span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[User:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
 
 
 def build_high_risk_page(records, heading, introduction, include_dynamic_learning=True):
