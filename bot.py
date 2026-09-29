@@ -643,6 +643,7 @@ def safe_log_text(value, max_length=1200):
     secrets = [
         TELEGRAM_TOKEN,
         WIKIMEDIA_BOT_PASSWORD,
+        OAUTH_CLIENT_SECRET,
     ]
 
     for secret in secrets:
