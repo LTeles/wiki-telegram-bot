@@ -22,6 +22,11 @@ from zoneinfo import ZoneInfo
 import requests
 from sseclient import SSEClient
 
+DATA_DIR = os.environ.get("TOOL_DATA_DIR", "/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def data_path(filename):
+    return os.path.join(DATA_DIR, filename)
 
 # =========================================================
 # CONFIGURAÇÃO
