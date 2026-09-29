@@ -143,11 +143,11 @@ WIKI_STATISTICS_TITLE = "Usuário:TelesGramBot/Estatísticas"
 WIKI_CREATE_ENABLED = True
 WIKI_WRITE_INTERVAL_SECONDS = 60 * 60
 WIKI_STATUS_INTERVAL_SECONDS = 6 * 60 * 60
-WIKI_WRITE_QUEUE_FILE = "/data/wiki_write_queue.json"
-WIKI_WRITE_CONTROL_FILE = "/data/wiki_write_control.json"
+WIKI_WRITE_QUEUE_FILE = data_path("wiki_write_queue.json")
+WIKI_WRITE_CONTROL_FILE = data_path("wiki_write_control.json")
 WIKI_WRITE_LOCK = threading.RLock()
 GENERAL_PRIORITY_FACTOR = 0.90  # Redução geral de 10% na prioridade, sem alterar o Revert Risk.
-WIKI_PENDING_PAGES_FILE = "/data/wiki_pending_pages.json"
+WIKI_PENDING_PAGES_FILE = data_path("wiki_pending_pages.json")
 
 # Relatórios que serão usados quando a publicação for futuramente ativada.
 WIKI_DAILY_REPORT_PREFIX = "Usuário:TelesGramBot/Relatórios/Diário/"
@@ -218,84 +218,84 @@ REPORT_TIMEZONE = "America/Sao_Paulo"
 
 WATCHLIST_FILE = os.environ.get(
     "WATCHLIST_FILE",
-    "/data/watchlist.json"
+    data_path("watchlist.json")
 )
 
 OBSERVED_USERS_FILE = os.environ.get(
     "OBSERVED_USERS_FILE",
-    "/data/observed_users.json"
+    data_path("observed_users.json")
 )
 
 POST_BLOCK_OBSERVATIONS_FILE = os.environ.get(
     "POST_BLOCK_OBSERVATIONS_FILE",
-    "/data/post_block_observations.json"
+    data_path("post_block_observations.json")
 )
 
 TEMP_WATCHLIST_FILE = os.environ.get(
     "TEMP_WATCHLIST_FILE",
-    "/data/temporary_watchlist.json"
+    data_path("temporary_watchlist.json")
 )
 
 IGNORED_USERS_FILE = os.environ.get(
     "IGNORED_USERS_FILE",
-    "/data/ignored_users.json"
+    data_path("ignored_users.json")
 )
 
 BOT_VERSION_FILE = os.environ.get(
     "BOT_VERSION_FILE",
-    "/data/bot_version.json"
+    data_path("bot_version.json")
 )
 
 ABUSE_FILTERS_FILE = os.environ.get(
     "ABUSE_FILTERS_FILE",
-    "/data/abuse_filters.json"
+    data_path("abuse_filters.json")
 )
 
 ABUSE_FILTER_STATE_FILE = os.environ.get(
     "ABUSE_FILTER_STATE_FILE",
-    "/data/abuse_filter_state.json"
+    data_path("abuse_filter_state.json")
 )
 
 POSTED_EDITS_FILE = os.environ.get(
     "POSTED_EDITS_FILE",
-    "/data/posted_edits.json"
+    data_path("posted_edits.json")
 )
 POSTED_EDITS_BACKUP_FILE = POSTED_EDITS_FILE + ".backup"
 
 DETECTION_STATS_FILE = os.environ.get(
     "DETECTION_STATS_FILE",
-    "/data/detection_stats.json"
+    data_path("detection_stats.json")
 )
 
 PENDING_SUMMARY_STATE_FILE = os.environ.get(
     "PENDING_SUMMARY_STATE_FILE",
-    "/data/pending_summary_state.json"
+    data_path("pending_summary_state.json")
 )
 
 REVERSIBLE_ACTIONS_FILE = os.environ.get(
     "REVERSIBLE_ACTIONS_FILE",
-    "/data/reversible_actions.json"
+    data_path("reversible_actions.json")
 )
 
 
 COMMUNITY_STATS_FILE = os.environ.get(
     "COMMUNITY_STATS_FILE",
-    "/data/community_stats.json"
+    data_path("community_stats.json")
 )
 
 FALSE_POSITIVES_FILE = os.environ.get(
     "FALSE_POSITIVES_FILE",
-    "/data/false_positives.json"
+    data_path("false_positives.json")
 )
 
 FALSE_NEGATIVES_FILE = os.environ.get(
     "FALSE_NEGATIVES_FILE",
-    "/data/false_negatives.json"
+    data_path("false_negatives.json")
 )
 
 WIKI_REPORT_PREVIEW_FILE = os.environ.get(
     "WIKI_REPORT_PREVIEW_FILE",
-    "/data/wiki_report_preview.txt"
+    data_path("wiki_report_preview.txt")
 )
 
 
@@ -2471,7 +2471,7 @@ WIKI_RELEASE_NOTES = {
     "3.30": "Adiciona anti-flood aos filtros de abuso vigiados: no máximo um post por combinação filtro e usuário a cada 5 minutos, sem renovar a janela quando ocorrências adicionais são ignoradas.",
     "3.31": "Prioriza no topo da lista de alto risco as edições pendentes, ordenadas pelo maior percentual de risco, recua o indicador percentual da borda direita, liga o nome da conta nos alertas de filtro às contribuições e coloca automaticamente em observação por 6 horas as contas que geram alertas publicados de filtros vigiados; mensagens posteriores dessa observação mantêm o botão Desobservar; e os posts de edições exibem abaixo do sumário a variação em bytes, com indicador verde para acréscimo e vermelho para remoção.",
 }
-WIKI_RELEASE_HISTORY_FILE = "/data/wiki_release_history.json"
+WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
 
 def wiki_record_release():
@@ -12929,7 +12929,7 @@ WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE = "User:TelesGramBot/Predefinição/Edição
 WIKI_HIGH_RISK_THRESHOLD = 0.80
 HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS = 60
 HIGH_RISK_MANUAL_CLEANUP_SECONDS = 7 * 24 * 60 * 60
-HIGH_RISK_MANUAL_CLEANUP_FILE = "/data/ptwiki_high_risk_manual_cleanup.json"
+HIGH_RISK_MANUAL_CLEANUP_FILE = data_path("ptwiki_high_risk_manual_cleanup.json")
 HIGH_RISK_MANUAL_AUTHORIZED_GROUPS = frozenset((
     "autoreviewer", "rollbacker", "eliminator", "bureaucrat", "sysop", "interface-admin",
 ))
@@ -12944,15 +12944,15 @@ OAUTH_PROFILE_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/resource/profi
 MANUAL_REVIEW_PUBLIC_BASE = os.environ.get(
     "MANUAL_REVIEW_PUBLIC_BASE", "https://wiki-telegram-bot-production.up.railway.app"
 ).rstrip("/")
-MANUAL_REVIEW_STATE_FILE = "/data/ptwiki_oauth_review_states.json"
+MANUAL_REVIEW_STATE_FILE = data_path("ptwiki_oauth_review_states.json")
 MANUAL_REVIEW_STATE_TTL = 10 * 60
 MANUAL_REVIEW_HTTP_PORT = int(os.environ.get("PORT", "8080"))
 MANUAL_REVIEW_ALLOWED_RETURN_HOSTS = frozenset(("test.wikipedia.org",))
 manual_review_state_lock = threading.Lock()
 WIKI_HIGH_RISK_RESOLVED_TTL_SECONDS = 30 * 60
-HIGH_RISK_ARCHIVE_FILE = "/data/ptwiki_high_risk_archive.json"
-TESTWIKI_QUEUE_FILE = "/data/ptwiki_testwiki_queue.json"
-TESTWIKI_CONTROL_FILE = "/data/ptwiki_testwiki_control.json"
+HIGH_RISK_ARCHIVE_FILE = data_path("ptwiki_high_risk_archive.json")
+TESTWIKI_QUEUE_FILE = data_path("ptwiki_testwiki_queue.json")
+TESTWIKI_CONTROL_FILE = data_path("ptwiki_testwiki_control.json")
 TESTWIKI_WRITE_INTERVAL_SECONDS = 121
 TESTWIKI_LOCK = threading.RLock()
 testwiki_session = requests.Session()
