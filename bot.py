@@ -32,8 +32,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.31"
-BOT_BUILD = "3.31-pending-priority-risk-inset"
+BOT_VERSION = "3.32"
+BOT_BUILD = "3.32-watch-link-adjustments-log"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -140,6 +140,7 @@ WIKI_WRITE_ENABLED = True
 WIKI_ALLOWED_TITLE_PREFIX = "Usuário:TelesGramBot/"
 WIKI_STATUS_TITLE = "Usuário:TelesGramBot/Status"
 WIKI_STATISTICS_TITLE = "Usuário:TelesGramBot/Estatísticas"
+WIKI_ADJUSTMENTS_TITLE = "Usuário:TelesGramBot/Ajustes"
 WIKI_CREATE_ENABLED = True
 WIKI_WRITE_INTERVAL_SECONDS = 60 * 60
 WIKI_STATUS_INTERVAL_SECONDS = 6 * 60 * 60
@@ -1752,7 +1753,7 @@ def wiki_edit_page(title, wikitext, summary):
         atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
         exists = wiki_page_exists(title)
         create = not exists
-        if create and not (WIKI_CREATE_ENABLED and (title in (WIKI_STATUS_TITLE, WIKI_STATISTICS_TITLE) or wiki_report_creation_allowed(title))):
+        if create and not (WIKI_CREATE_ENABLED and (title in (WIKI_STATUS_TITLE, WIKI_STATISTICS_TITLE, WIKI_ADJUSTMENTS_TITLE) or wiki_report_creation_allowed(title))):
             print("📄 Página ausente; criação bloqueada:", title)
             return False
         # A deletion log is a hard stop for any attempt to recreate a page.
@@ -1848,6 +1849,10 @@ def process_wiki_write_queue_once():
 
 def wiki_write_queue_worker():
     wiki_record_release()
+    try:
+        queue_current_adjustments_log()
+    except Exception as exc:
+        print("⚠️ Falha ao preparar /Ajustes:", safe_exception(exc))
     mark_wiki_page_pending(WIKI_STATUS_TITLE)
     mark_wiki_page_pending(WIKI_STATISTICS_TITLE)
     mark_wiki_page_pending("Usuário:TelesGramBot/Sobre")  # Inventário apenas; sem criação/publicação automática.
@@ -2470,8 +2475,62 @@ WIKI_RELEASE_NOTES = {
     "3.29": "Melhora a separação visual dos cartões com espaçamento, cantos discretos e sombra suave, e evita dupla codificação das entidades HTML exibidas na prévia dos diffs.",
     "3.30": "Adiciona anti-flood aos filtros de abuso vigiados: no máximo um post por combinação filtro e usuário a cada 5 minutos, sem renovar a janela quando ocorrências adicionais são ignoradas.",
     "3.31": "Prioriza no topo da lista de alto risco as edições pendentes, ordenadas pelo maior percentual de risco, recua o indicador percentual da borda direita, liga o nome da conta nos alertas de filtro às contribuições e coloca automaticamente em observação por 6 horas as contas que geram alertas publicados de filtros vigiados; mensagens posteriores dessa observação mantêm o botão Desobservar; e os posts de edições exibem abaixo do sumário a variação em bytes, com indicador verde para acréscimo e vermelho para remoção.",
+    "3.32": "Adiciona links para páginas nas confirmações de vigilância no Telegram e cria log administrativo padronizado de alterações em /Ajustes, integrado ao limite global de uma edição por hora na ptwiki.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
+
+
+def telegram_page_link_html(title):
+    """Link HTML seguro para uma página da Wikipédia em português."""
+    clean_title = normalize_page_title(title) or str(title or "").strip()
+    encoded_title = quote(clean_title.replace(" ", "_"), safe="/:()")
+    url = f"https://pt.wikipedia.org/wiki/{encoded_title}"
+    return f'<a href="{html.escape(url, quote=True)}">{html.escape(clean_title)}</a>'
+
+
+def fetch_wiki_page_wikitext(title):
+    """Lê o wikitext atual de uma subpágina autorizada; página ausente retorna vazio."""
+    if not wiki_title_is_allowed(title):
+        raise PermissionError("Título wiki não autorizado")
+    _response, data = wikimedia_api_get({
+        "action": "query", "format": "json", "formatversion": 2,
+        "prop": "revisions", "titles": title, "rvprop": "content", "rvslots": "main",
+    })
+    if data.get("error"):
+        raise RuntimeError("Falha ao ler página wiki: " + str(data["error"]))
+    pages = ((data or {}).get("query") or {}).get("pages") or []
+    if not pages or pages[0].get("missing"):
+        return ""
+    revisions = pages[0].get("revisions") or []
+    if not revisions:
+        return ""
+    slot = (revisions[0].get("slots") or {}).get("main") or {}
+    return str(slot.get("content") or "")
+
+
+def queue_current_adjustments_log():
+    """Prepara o registro curto desta versão; a fila global decide quando a ptwiki pode ser editada."""
+    marker = f"[v{BOT_VERSION}]"
+    current = fetch_wiki_page_wikitext(WIKI_ADJUSTMENTS_TITLE)
+    if marker in current:
+        return False
+    now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    entries = [
+        f"* <span style=\"color:#3366cc\">• {now_utc}</span> 💬 '''TG-WATCH''' {marker} CHANGED — Confirmação de vigilância agora vincula o título à página.",
+        f"* <span style=\"color:#14866d\">• {now_utc}</span> 📋 '''WIKI-LOG''' {marker} ADDED — Log administrativo de ajustes integrado à fila global da ptwiki.",
+    ]
+    header = "== Registro de ajustes =="
+    body = current.strip()
+    if body.startswith(header):
+        body = body[len(header):].lstrip()
+    new_text = header + "\n\n" + "\n".join(entries)
+    if body:
+        new_text += "\n" + body
+    return queue_wiki_edit(
+        WIKI_ADJUSTMENTS_TITLE,
+        new_text,
+        f"Registrando ajustes administrativos do TelesGramBot {BOT_VERSION}",
+    )
 
 
 def wiki_record_release():
@@ -7526,8 +7585,8 @@ def execute_reversible_action(action, target):
         return (
             success,
             added,
-            f"👁 {title} adicionada à vigilância.",
-            None,
+            f"👁 {telegram_page_link_html(title)} adicionada à vigilância.",
+            "HTML",
         )
 
     if action == "watch_temp":
@@ -7538,10 +7597,10 @@ def execute_reversible_action(action, target):
             success,
             (
                 "👁 Página colocada em vigilância\n\n"
-                f"📝 {title}\n"
+                f"📝 {telegram_page_link_html(title)}\n"
                 "⏳ Duração: 6 horas"
             ),
-            None,
+            "HTML",
         )
 
     if action == "unwatch":
@@ -11646,12 +11705,12 @@ def process_telegram_command(message, from_channel=False):
                 )
             elif not added:
                 response_text = (
-                    f"👁 {title} já está "
+                    f"👁 {telegram_page_link_html(title)} já está "
                     "sendo vigiada."
                 )
             else:
                 response_text = (
-                    f"👁 {title} adicionada "
+                    f"👁 {telegram_page_link_html(title)} adicionada "
                     "à vigilância."
                 )
 
@@ -11693,6 +11752,7 @@ def process_telegram_command(message, from_channel=False):
         send_telegram_message(
             response_text,
             chat_id=chat_id,
+            parse_mode="HTML" if command == "/vigiar" else None,
             reply_markup=reply_markup,
         )
         return
@@ -12494,7 +12554,7 @@ def process_edit_action_callback(callback):
         actor_line = f"\n👮 Colocada em vigilância por {actor_html}" if actor_html else ""
         send_telegram_message(
             "👁 Página colocada em vigilância\n\n"
-            f"📝 {html.escape(title)}\n"
+            f"📝 {telegram_page_link_html(title)}\n"
             "⏳ Duração: 6 horas"
             f"{actor_line}",
             chat_id=TELEGRAM_CHANNEL,
