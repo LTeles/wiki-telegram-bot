@@ -32,8 +32,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.33"
-BOT_BUILD = "3.33-risk-calibration-structured-edits"
+BOT_VERSION = "3.34"
+BOT_BUILD = "3.34-risk-calibration-contextual-edits"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2477,6 +2477,7 @@ WIKI_RELEASE_NOTES = {
     "3.31": "Prioriza no topo da lista de alto risco as edições pendentes, ordenadas pelo maior percentual de risco, recua o indicador percentual da borda direita, liga o nome da conta nos alertas de filtro às contribuições e coloca automaticamente em observação por 6 horas as contas que geram alertas publicados de filtros vigiados; mensagens posteriores dessa observação mantêm o botão Desobservar; e os posts de edições exibem abaixo do sumário a variação em bytes, com indicador verde para acréscimo e vermelho para remoção.",
     "3.32": "Adiciona links para páginas nas confirmações de vigilância no Telegram e cria log administrativo padronizado de alterações em /Ajustes, integrado ao limite global de uma edição por hora na ptwiki.",
     "3.33": "Calibra edições estruturadas legítimas: parâmetros de predefinição, preenchimento de datas, desambiguação de wikilinks e adição de referências válidas passam a reduzir o risco sem mascarar alterações adicionais.",
+    "3.34": "Amplia a calibração contextual para wikilinks cosméticos, trocas plausíveis de nomes, mídia e reformatação de infobox, pequenas variações numéricas, grandes adições construtivas com fontes e comentários assinados em discussão; corrige também o redutor de desambiguação da 3.33.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -2524,19 +2525,28 @@ def queue_current_adjustments_log():
         "3.33": [
             ("#7a4e00", "🎯", "RISK-CAL", "CHANGED", "Reduz risco em parâmetros wiki, datas preenchidas, links desambiguados e referências estruturadas."),
         ],
+        "3.34": [
+            ("#7a4e00", "🎯", "RISK-CAL", "CHANGED", "Refina wikilinks, nomes, infoboxes, números, grandes acréscimos com fontes e discussões assinadas."),
+            ("#3366cc", "🖥️", "WIKI-UI", "CHANGED", "Ajustes remove ponto duplicado e ganha legenda compacta de códigos e estados."),
+            ("#b32424", "🐛", "FIX", "FIXED", "Corrigido redutor de desambiguação da 3.33 no analisador de edições."),
+        ],
     }
     specs = version_entries.get(BOT_VERSION, [
         ("#72777d", "⚙️", "CORE", "CHANGED", WIKI_RELEASE_NOTES.get(BOT_VERSION, "Ajustes internos do bot.")),
     ])
     entries = [
-        f"* <span style=\"color:{color}\">• {now_utc}</span> {emoji} '''{code}''' {marker} {status} — {message}"
+        f"* <span style=\"color:{color}\">{now_utc}</span> {emoji} '''{code}''' {marker} {status} — {message}"
         for color, emoji, code, status, message in specs[:3]
     ]
     header = "== Registro de ajustes =="
+    legend = ("<small>'''Categorias:''' 🎯 RISK-CAL · 💬 TG · 🛡️ SEC · 🖥️ WIKI-UI · ⚙️ CORE · 📊 METRIC · 🐛 FIX · 🚀 INFRA<br>"
+              "'''Estados:''' ADDED = novo · CHANGED = alterado · FIXED = corrigido · DONE = concluído</small>")
     body = current.strip()
     if body.startswith(header):
         body = body[len(header):].lstrip()
-    new_text = header + "\n\n" + "\n".join(entries)
+        body = re.sub(r"^<small>'''Categorias:'''[\s\S]*?</small>\s*", "", body, count=1)
+        body = re.sub(r'(?m)^(\*\s*<span\s+style="color:[^"]+">)•\s*', r'\1', body)
+    new_text = header + "\n\n" + legend + "\n\n" + "\n".join(entries)
     if body:
         new_text += "\n" + body
     return queue_wiki_edit(
@@ -9309,6 +9319,130 @@ def isolated_wikilink_priority_adjustment(diff):
     return {"factor": 0.55, "reason": "inclusão isolada de link interno; texto preservado"}
 
 
+def wikilink_removal_priority_adjustment(diff):
+    """Reconhece [[X]] -> X quando o texto visível é literalmente preservado."""
+    old = "\n".join(normalized_diff_lines(diff.get("removed", "")))
+    new = "\n".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > 1200:
+        return None
+    matches = list(re.finditer(r"\[\[([^\[\]\n|#:{}<>]{2,120})\]\]", old))
+    if len(matches) != 1:
+        return None
+    m = matches[0]
+    target = m.group(1).strip()
+    restored = old[:m.start()] + target + old[m.end():]
+    if restored != new:
+        return None
+    return {"factor": 0.45, "reason": "remoção isolada de wikilink; texto visível preservado"}
+
+
+def infobox_media_priority_adjustment(diff):
+    """Reduz risco para inclusão de arquivo/legenda em parâmetro típico de infobox."""
+    old = "\n".join(normalized_diff_lines(diff.get("removed", "")))
+    new = "\n".join(normalized_diff_lines(diff.get("added", "")))
+    if not new or max(len(old), len(new)) > 2500:
+        return None
+    media = re.findall(r"(?im)^\s*\|\s*(imagem|image|foto|bandeira|bras[aã]o|logo|imagem_bandeira|imagem_escudo)\s*=\s*([^\n|]+)", new)
+    captions = re.findall(r"(?im)^\s*\|\s*(leg_imagem|legenda|caption)\s*=\s*([^\n|]+)", new)
+    if not media:
+        return None
+    values = " ".join(v for _, v in media + captions)
+    if max(profanity_score(values), repetition_score(values), nonsense_score(values)) >= 0.75:
+        return None
+    plausible = any(re.search(r"\.(?:jpe?g|png|svg|webp|gif|tiff?)\s*$", v.strip(), re.I) for _, v in media)
+    if not plausible:
+        return None
+    # Deve ser acréscimo/preenchimento; não proteger troca destrutiva de arquivo por outro.
+    old_files = re.findall(r"(?im)^\s*\|\s*(?:imagem|image|foto|bandeira|bras[aã]o|logo|imagem_bandeira|imagem_escudo)\s*=\s*([^\n|]+)", old)
+    if old_files and all(v.strip() for v in old_files):
+        return None
+    return {"factor": 0.45, "reason": "inclusão plausível de mídia em parâmetro de infobox"}
+
+
+def template_reformat_priority_adjustment(diff):
+    """Detecta redistribuição de parâmetros = valor sem mudança semântica."""
+    old = "\n".join(normalized_diff_lines(diff.get("removed", "")))
+    new = "\n".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > 3500:
+        return None
+    def pairs(text):
+        # captura vários parâmetros mesmo quando estavam na mesma linha
+        found = re.findall(r"\|\s*([\wÀ-ÿ][\wÀ-ÿ _-]{0,60})\s*=\s*([^|\n}]*)", text)
+        return sorted((k.strip().casefold(), re.sub(r"\s+", " ", v).strip()) for k,v in found)
+    a,b=pairs(old),pairs(new)
+    if len(a) < 2 or a != b:
+        return None
+    return {"factor": 0.35, "reason": "reformatação de parâmetros de predefinição; valores preservados"}
+
+
+def numeric_small_change_priority_adjustment(diff):
+    """Reduz risco de uma única variação numérica pequena em contexto preservado."""
+    old = " ".join(normalized_diff_lines(diff.get("removed", "")))
+    new = " ".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > 1200:
+        return None
+    nums_old=list(re.finditer(r"(?<![\w])(-?\d+(?:[.,]\d+)?)(?![\w])",old))
+    nums_new=list(re.finditer(r"(?<![\w])(-?\d+(?:[.,]\d+)?)(?![\w])",new))
+    if len(nums_old)!=len(nums_new) or not nums_old:
+        return None
+    changed=[]
+    def skeleton(text, ms):
+        out=[]; pos=0
+        for m in ms:
+            out.append(text[pos:m.start()]); out.append('<N>'); pos=m.end()
+        out.append(text[pos:]); return ''.join(out)
+    if skeleton(old,nums_old)!=skeleton(new,nums_new):
+        return None
+    for a,b in zip(nums_old,nums_new):
+        if a.group(1)!=b.group(1): changed.append((a.group(1),b.group(1)))
+    if len(changed)!=1:
+        return None
+    try:
+        a=float(changed[0][0].replace(',','.')); b=float(changed[0][1].replace(',','.'))
+    except ValueError: return None
+    delta=abs(a-b)
+    if delta == 1:
+        return {"factor": 0.55, "reason": "pequena variação numérica isolada; contexto preservado"}
+    magnitude=max(abs(a),abs(b),1.0)
+    if delta <= 2 and delta/magnitude <= .10:
+        return {"factor": 0.70, "reason": "variação numérica pequena e isolada; contexto preservado"}
+    return None
+
+
+def name_substitution_priority_adjustment(diff):
+    """Redutor moderado para troca lexical curta plausível, sem sinais intrínsecos de vandalismo."""
+    old = " ".join(normalized_diff_lines(diff.get("removed", "")))
+    new = " ".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old),len(new)) > 1000:
+        return None
+    import difflib
+    edits=[(old[a:b],new[c:d]) for op,a,b,c,d in difflib.SequenceMatcher(None,old,new,autojunk=False).get_opcodes() if op!='equal']
+    if len(edits)!=1: return None
+    before,after=(x.strip() for x in edits[0])
+    if not before or not after or max(len(before),len(after))>50: return None
+    if not re.fullmatch(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]*",before) or not re.fullmatch(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]*",after): return None
+    if max(profanity_score(after), repetition_score(after), nonsense_score(after)) >= .75: return None
+    # Não tentar validar o fato; apenas reconhecer uma substituição lexical plausível.
+    return {"factor": 0.80, "reason": "substituição curta por nome/termo lexicalmente plausível; fato não verificado"}
+
+
+def large_constructive_addition_priority_adjustment(change, diff):
+    """Grande acréscimo bem estruturado e referenciado: tamanho sozinho não vira alerta."""
+    if change.get("type") == "new": return None
+    added=str(diff.get("added") or ""); removed=str(diff.get("removed") or "")
+    if len(added) < 700 or len(removed) > max(300, int(len(added)*.20)):
+        return None
+    if max(profanity_score(added), repetition_score(added), nonsense_score(added)) >= .75:
+        return None
+    refs=len(re.findall(r"<ref\b[^>]*>.*?</ref\s*>",added,re.I|re.S))
+    cites=len(re.findall(r"\{\{\s*(?:citar|cite)\b",added,re.I))
+    urls=len(re.findall(r"https?://",added,re.I))
+    prose_words=len(re.findall(r"\b[A-Za-zÀ-ÿ]{3,}\b", re.sub(r"<ref\b[^>]*>.*?</ref\s*>"," ",added,flags=re.I|re.S)))
+    if refs < 1 or (cites < 1 and urls < 1) or prose_words < 60:
+        return None
+    if re.search(r"(?:javascript:|<script\b|\b(?:compre agora|whatsapp|telegram\.me)\b)",added,re.I): return None
+    return {"factor": 0.60, "reason": "grande acréscimo construtivo com prosa e fontes estruturadas"}
+
 def template_parameter_priority_adjustment(diff):
     """Reduz prioridade para acréscimos predominantemente estruturais em predefinições."""
     removed = "\n".join(normalized_diff_lines(diff.get("removed", "")))
@@ -10056,12 +10190,24 @@ def analyze_vandalism(change, diff, revert_risk):
         score += 0.05
 
     # Regras novas não são cumulativas com redutores já existentes.
+    link_disambiguation = (wikilink_disambiguation_priority_adjustment(diff)
+                           if change.get("type") != "new" else None)
+    # Termos já existentes no rótulo de link desambiguado não são tratados como
+    # nova linguagem introduzida pelo editor.
+    if link_disambiguation:
+        profanity = min(profanity, 0.20)
+        signals[0] = profanity
+        strong_signals = sum(1 for signal in signals if signal >= 0.75)
     cosmetic_adjustment = None
     if change.get("type") != "new" and max(signals) < 0.75:
         cosmetic_adjustment = (date_placeholder_priority_adjustment(diff)
                                or link_disambiguation
+                               or wikilink_removal_priority_adjustment(diff)
                                or reference_addition_priority_adjustment(diff)
+                               or infobox_media_priority_adjustment(diff)
+                               or template_reformat_priority_adjustment(diff)
                                or template_parameter_priority_adjustment(diff)
+                               or numeric_small_change_priority_adjustment(diff)
                                or whitespace_only_priority_adjustment(diff)
                                or reference_date_priority_adjustment(diff)
                                or isolated_wikilink_priority_adjustment(diff))
@@ -10069,7 +10215,8 @@ def analyze_vandalism(change, diff, revert_risk):
     if children_adjustment and children_adjustment.get("factor") and not cosmetic_adjustment and max(signals) < 0.75:
         cosmetic_adjustment = children_adjustment
     if not cosmetic_adjustment and max(signals) < 0.75:
-        cosmetic_adjustment = contextual_prose_addition_adjustment(change, diff)
+        cosmetic_adjustment = (large_constructive_addition_priority_adjustment(change, diff)
+                               or contextual_prose_addition_adjustment(change, diff))
     benign = None if cosmetic_adjustment or children_adjustment else benign_technical_change(diff)
 
     # O redutor técnico atua apenas em mudanças mínimas reconhecidas.
@@ -10083,6 +10230,7 @@ def analyze_vandalism(change, diff, revert_risk):
     if not benign and not cosmetic_adjustment and not change.get("type") == "new" and max(signals) < 0.75:
         minimal_adjustment = (equivalent_wikimarkup_priority_adjustment(diff)
                               or orthographic_priority_adjustment(diff)
+                              or name_substitution_priority_adjustment(diff)
                               or minimal_text_priority_adjustment(diff))
         if contextual_calibration and (not minimal_adjustment or contextual_calibration["factor"] < minimal_adjustment["factor"]):
             minimal_adjustment = contextual_calibration
