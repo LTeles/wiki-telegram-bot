@@ -32,8 +32,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.32"
-BOT_BUILD = "3.32-watch-link-adjustments-log"
+BOT_VERSION = "3.33"
+BOT_BUILD = "3.33-risk-calibration-structured-edits"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2476,6 +2476,7 @@ WIKI_RELEASE_NOTES = {
     "3.30": "Adiciona anti-flood aos filtros de abuso vigiados: no máximo um post por combinação filtro e usuário a cada 5 minutos, sem renovar a janela quando ocorrências adicionais são ignoradas.",
     "3.31": "Prioriza no topo da lista de alto risco as edições pendentes, ordenadas pelo maior percentual de risco, recua o indicador percentual da borda direita, liga o nome da conta nos alertas de filtro às contribuições e coloca automaticamente em observação por 6 horas as contas que geram alertas publicados de filtros vigiados; mensagens posteriores dessa observação mantêm o botão Desobservar; e os posts de edições exibem abaixo do sumário a variação em bytes, com indicador verde para acréscimo e vermelho para remoção.",
     "3.32": "Adiciona links para páginas nas confirmações de vigilância no Telegram e cria log administrativo padronizado de alterações em /Ajustes, integrado ao limite global de uma edição por hora na ptwiki.",
+    "3.33": "Calibra edições estruturadas legítimas: parâmetros de predefinição, preenchimento de datas, desambiguação de wikilinks e adição de referências válidas passam a reduzir o risco sem mascarar alterações adicionais.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -2515,9 +2516,21 @@ def queue_current_adjustments_log():
     if marker in current:
         return False
     now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    version_entries = {
+        "3.32": [
+            ("#3366cc", "💬", "TG-WATCH", "CHANGED", "Confirmação de vigilância agora vincula o título à página."),
+            ("#14866d", "📋", "WIKI-LOG", "ADDED", "Log administrativo de ajustes integrado à fila global da ptwiki."),
+        ],
+        "3.33": [
+            ("#7a4e00", "🎯", "RISK-CAL", "CHANGED", "Reduz risco em parâmetros wiki, datas preenchidas, links desambiguados e referências estruturadas."),
+        ],
+    }
+    specs = version_entries.get(BOT_VERSION, [
+        ("#72777d", "⚙️", "CORE", "CHANGED", WIKI_RELEASE_NOTES.get(BOT_VERSION, "Ajustes internos do bot.")),
+    ])
     entries = [
-        f"* <span style=\"color:#3366cc\">• {now_utc}</span> 💬 '''TG-WATCH''' {marker} CHANGED — Confirmação de vigilância agora vincula o título à página.",
-        f"* <span style=\"color:#14866d\">• {now_utc}</span> 📋 '''WIKI-LOG''' {marker} ADDED — Log administrativo de ajustes integrado à fila global da ptwiki.",
+        f"* <span style=\"color:{color}\">• {now_utc}</span> {emoji} '''{code}''' {marker} {status} — {message}"
+        for color, emoji, code, status, message in specs[:3]
     ]
     header = "== Registro de ajustes =="
     body = current.strip()
@@ -9296,6 +9309,86 @@ def isolated_wikilink_priority_adjustment(diff):
     return {"factor": 0.55, "reason": "inclusão isolada de link interno; texto preservado"}
 
 
+def template_parameter_priority_adjustment(diff):
+    """Reduz prioridade para acréscimos predominantemente estruturais em predefinições."""
+    removed = "\n".join(normalized_diff_lines(diff.get("removed", "")))
+    added_lines = normalized_diff_lines(diff.get("added", ""))
+    if removed or not added_lines or len("\n".join(added_lines)) > 2500:
+        return None
+    param_lines = [line for line in added_lines if re.match(r"^\|\s*[\wÀ-ÿ][\wÀ-ÿ _-]{0,60}\s*=", line)]
+    if not param_lines or len(param_lines) != len(added_lines):
+        return None
+    joined = "\n".join(param_lines)
+    if re.search(r"(?:<script\b|javascript:|\{\{\s*(?:delete|speedy|db-)\b)", joined, re.I):
+        return None
+    return {"factor": 0.60, "reason": "acréscimo estruturado de parâmetros de predefinição; código wiki preservado"}
+
+
+def date_placeholder_priority_adjustment(diff):
+    """Reconhece troca exclusiva AAAA/MM/DD -> data numérica válida em template."""
+    old = " ".join(normalized_diff_lines(diff.get("removed", "")))
+    new = " ".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > 800:
+        return None
+    pattern = re.compile(r"(?P<prefix>\{\{[^{}|]{1,80}\|)AAAA\|MM\|DD(?P<suffix>[^{}]*\}\})", re.I)
+    m = pattern.search(old)
+    if not m:
+        return None
+    nm = re.search(r"(?P<prefix>\{\{[^{}|]{1,80}\|)(\d{4})\|(\d{1,2})\|(\d{1,2})(?P<suffix>[^{}]*\}\})", new, re.I)
+    if not nm:
+        return None
+    try:
+        datetime(int(nm.group(2)), int(nm.group(3)), int(nm.group(4)))
+    except ValueError:
+        return None
+    old_norm = old[:m.start()] + m.group("prefix") + "__DATE__" + m.group("suffix") + old[m.end():]
+    new_norm = new[:nm.start()] + nm.group("prefix") + "__DATE__" + nm.group("suffix") + new[nm.end():]
+    if old_norm != new_norm:
+        return None
+    return {"factor": 0.35, "reason": "preenchimento de data em predefinição com valores numéricos válidos"}
+
+
+def wikilink_disambiguation_priority_adjustment(diff):
+    """Reconhece [[X]] -> [[X (qualificador)|X]], preservando o texto visível."""
+    old = " ".join(normalized_diff_lines(diff.get("removed", "")))
+    new = " ".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > 1500:
+        return None
+    matches = list(re.finditer(r"\[\[([^\[\]|#]{2,120})\s+\(([^\[\]|]{1,80})\)\|([^\[\]|]{2,120})\]\]", new))
+    if len(matches) != 1:
+        return None
+    m = matches[0]
+    target_base, qualifier, label = (x.strip() for x in m.groups())
+    if not qualifier or target_base != label:
+        return None
+    restored = new[:m.start()] + f"[[{label}]]" + new[m.end():]
+    if restored != old:
+        return None
+    return {"factor": 0.35, "reason": "desambiguação isolada de wikilink; texto visível preservado"}
+
+
+def reference_addition_priority_adjustment(diff):
+    """Reduz prioridade quando a única adição material é uma referência estruturada."""
+    old = " ".join(normalized_diff_lines(diff.get("removed", "")))
+    new = " ".join(normalized_diff_lines(diff.get("added", "")))
+    if not new or max(len(old), len(new)) > MAX_DIFF_CHARS:
+        return None
+    refs = list(re.finditer(r"<ref\b[^>]*>.*?</ref\s*>", new, re.I | re.S))
+    if len(refs) != 1:
+        return None
+    ref = refs[0].group(0)
+    if not re.search(r"https?://", ref, re.I) or not re.search(r"\{\{\s*(?:citar|cite)\b", ref, re.I):
+        return None
+    if not re.search(r"\|\s*(?:t[ií]tulo|title)\s*=", ref, re.I):
+        return None
+    without_ref = (new[:refs[0].start()] + new[refs[0].end():]).strip()
+    if old and re.sub(r"\s+", " ", without_ref) != re.sub(r"\s+", " ", old).strip():
+        return None
+    if not old and without_ref:
+        return None
+    return {"factor": 0.40, "reason": "adição isolada de referência estruturada com citação e URL"}
+
+
 def reference_removal_priority_adjustment(change, diff):
     """Sinal contextual, não prova de vandalismo; só referências inteiras removidas."""
     if change.get("type") == "new":
@@ -9865,7 +9958,13 @@ def analyze_new_page(change, diff):
         else added
     )
 
+    link_disambiguation = (wikilink_disambiguation_priority_adjustment(diff)
+                           if change.get("type") != "new" else None)
     profanity = profanity_score(signal_text)
+    # Termos já existentes no rótulo de um link apenas desambiguado não são
+    # tratados como linguagem nova introduzida pelo editor.
+    if link_disambiguation:
+        profanity = min(profanity, 0.20)
     repetition = repetition_score(signal_text)
     nonsense = nonsense_score(signal_text)
     local_signals = [profanity, repetition, nonsense]
@@ -9959,7 +10058,11 @@ def analyze_vandalism(change, diff, revert_risk):
     # Regras novas não são cumulativas com redutores já existentes.
     cosmetic_adjustment = None
     if change.get("type") != "new" and max(signals) < 0.75:
-        cosmetic_adjustment = (whitespace_only_priority_adjustment(diff)
+        cosmetic_adjustment = (date_placeholder_priority_adjustment(diff)
+                               or link_disambiguation
+                               or reference_addition_priority_adjustment(diff)
+                               or template_parameter_priority_adjustment(diff)
+                               or whitespace_only_priority_adjustment(diff)
                                or reference_date_priority_adjustment(diff)
                                or isolated_wikilink_priority_adjustment(diff))
     children_adjustment = children_count_priority_adjustment(change, diff)
