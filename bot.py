@@ -32,8 +32,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.34"
-BOT_BUILD = "3.34-risk-calibration-contextual-edits"
+BOT_VERSION = "3.35"
+BOT_BUILD = "3.35-safe-diff-adjustments-log"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2478,6 +2478,7 @@ WIKI_RELEASE_NOTES = {
     "3.32": "Adiciona links para páginas nas confirmações de vigilância no Telegram e cria log administrativo padronizado de alterações em /Ajustes, integrado ao limite global de uma edição por hora na ptwiki.",
     "3.33": "Calibra edições estruturadas legítimas: parâmetros de predefinição, preenchimento de datas, desambiguação de wikilinks e adição de referências válidas passam a reduzir o risco sem mascarar alterações adicionais.",
     "3.34": "Amplia a calibração contextual para wikilinks cosméticos, trocas plausíveis de nomes, mídia e reformatação de infobox, pequenas variações numéricas, grandes adições construtivas com fontes e comentários assinados em discussão; corrige também o redutor de desambiguação da 3.33.",
+    "3.35": "Impede que apóstrofos do diferencial alterem a formatação dos cartões seguintes e melhora /Ajustes com data, indicação única de UTC e legenda explicada somente para as categorias.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -2516,7 +2517,7 @@ def queue_current_adjustments_log():
     current = fetch_wiki_page_wikitext(WIKI_ADJUSTMENTS_TITLE)
     if marker in current:
         return False
-    now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    now_utc = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M")
     version_entries = {
         "3.32": [
             ("#3366cc", "💬", "TG-WATCH", "CHANGED", "Confirmação de vigilância agora vincula o título à página."),
@@ -2530,6 +2531,10 @@ def queue_current_adjustments_log():
             ("#3366cc", "🖥️", "WIKI-UI", "CHANGED", "Ajustes remove ponto duplicado e ganha legenda compacta de códigos e estados."),
             ("#b32424", "🐛", "FIX", "FIXED", "Corrigido redutor de desambiguação da 3.33 no analisador de edições."),
         ],
+        "3.35": [
+            ("#b32424", "🐛", "FIX", "FIXED", "A prévia Antes/Depois neutraliza apóstrofos sem perder o destaque das diferenças."),
+            ("#3366cc", "🖥️", "WIKI-UI", "CHANGED", "Ajustes passa a exibir data e hora, com UTC indicado uma única vez e legenda explicada das categorias."),
+        ],
     }
     specs = version_entries.get(BOT_VERSION, [
         ("#72777d", "⚙️", "CORE", "CHANGED", WIKI_RELEASE_NOTES.get(BOT_VERSION, "Ajustes internos do bot.")),
@@ -2539,8 +2544,18 @@ def queue_current_adjustments_log():
         for color, emoji, code, status, message in specs[:3]
     ]
     header = "== Registro de ajustes =="
-    legend = ("<small>'''Categorias:''' 🎯 RISK-CAL · 💬 TG · 🛡️ SEC · 🖥️ WIKI-UI · ⚙️ CORE · 📊 METRIC · 🐛 FIX · 🚀 INFRA<br>"
-              "'''Estados:''' ADDED = novo · CHANGED = alterado · FIXED = corrigido · DONE = concluído</small>")
+    legend = (
+        "<small>'''Categorias:''' "
+        "🎯 RISK-CAL = calibração de risco · "
+        "💬 TG = Telegram · "
+        "🛡️ SEC = segurança · "
+        "🖥️ WIKI-UI = interface na Wikipédia · "
+        "⚙️ CORE = núcleo do bot · "
+        "📊 METRIC = métricas · "
+        "🐛 FIX = correções · "
+        "🚀 INFRA = infraestrutura.<br>"
+        "''Datas e horários em UTC.''</small>"
+    )
     body = current.strip()
     if body.startswith(header):
         body = body[len(header):].lstrip()
@@ -13410,6 +13425,7 @@ def wiki_safe_text(value):
     return (
         str(value or "—")
         .replace("&", "&amp;")
+        .replace("'", "&#39;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace("[", "&#91;")
