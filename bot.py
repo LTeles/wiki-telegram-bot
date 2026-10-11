@@ -14021,15 +14021,16 @@ def build_high_risk_page(records, heading, introduction, include_dynamic_learnin
     pattern_model = train_high_risk_pattern_model() if include_dynamic_learning else {}
     pattern_counts = pattern_model.get("counts", {})
     lines = [
-        "__NOINDEX__",
-        high_risk_header_transclusion(),
-        "{{Usuário:TelesGramBot/Edições de alto risco/Instruções}}",
-        f"= {heading} =",
-        introduction,
-        "",
-        "Amarelo: pendente (acima de 80% até 95%); vermelho: pendente (acima de 95%); "
-        "azul: edição revista.",
-    ]
+    "__NOINDEX__",
+    high_risk_header_transclusion(),
+    "",
+    f"= {heading} =",
+    "",
+    high_risk_instructions_transclusion(),
+    "",
+    introduction,
+    "",
+]
     if include_dynamic_learning:
         lines.extend([
             "Treino de padrões: revertida/eliminada = edição incorreta; patrulhada/falso positivo = edição válida. "
