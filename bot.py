@@ -14023,6 +14023,7 @@ def build_high_risk_page(records, heading, introduction, include_dynamic_learnin
     lines = [
         "__NOINDEX__",
         high_risk_header_transclusion(),
+        "{{Usuário:TelesGramBot/Edições de alto risco/Instruções}}",
         f"= {heading} =",
         introduction,
         "",
