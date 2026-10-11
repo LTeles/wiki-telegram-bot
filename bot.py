@@ -129,7 +129,7 @@ requests.sessions.Session.request = _wiki_controlled_request
 
 
 # =========================================================
-# ESCRITA NA WIKIPÉDIA — PREPARADA, MAS DESATIVADA
+# ESCRITA NA WIKIPÉDIA — em atividade
 # =========================================================
 
 # Trava deliberadamente hardcoded. Nesta versão não existe variável de
@@ -13429,7 +13429,7 @@ if PTWIKI_HIGH_RISK_MODE not in {"off", "shadow", "publish"}:
     PTWIKI_HIGH_RISK_MODE = "shadow"
 WIKI_HIGH_RISK_THRESHOLD = 0.80
 WIKI_HIGH_RISK_DELAY_SECONDS = 2 * 60 * 60
-WIKI_HIGH_RISK_WRITE_INTERVAL_SECONDS = 121
+WIKI_HIGH_RISK_WRITE_INTERVAL_SECONDS = 20
 WIKI_HIGH_RISK_RETRY_SECONDS = 15 * 60
 WIKI_HIGH_RISK_DECISION_RETENTION_SECONDS = 30 * 24 * 60 * 60
 HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS = 60
@@ -15196,7 +15196,7 @@ def ptwiki_high_risk_worker():
             queue_high_risk_wiki_pages()
         except Exception as exc:
             print("⚠️ Lista de alto risco da ptwiki:", safe_exception(exc))
-        time.sleep(30)
+        time.sleep(10)
 
 
 # Compatibilidade com supervisores ou imports da versão anterior.
