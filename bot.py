@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.36"
-BOT_BUILD = "3.36-ptwiki-high-risk-delay"
+BOT_VERSION = "3.37"
+BOT_BUILD = "3.37-high-risk-false-positive-retention"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -129,7 +129,7 @@ requests.sessions.Session.request = _wiki_controlled_request
 
 
 # =========================================================
-# ESCRITA NA WIKIPÉDIA — em atividade
+# ESCRITA NA WIKIPÉDIA — PREPARADA, MAS DESATIVADA
 # =========================================================
 
 # Trava deliberadamente hardcoded. Nesta versão não existe variável de
@@ -197,6 +197,7 @@ MAX_PROTECTION_ALERTS_PER_MINUTE = 5
 POSTED_EDIT_CHECK_SECONDS = 10  # legado; pollers usam intervalos próprios
 REVISION_STATUS_INTERVAL_SECONDS = 30
 POSTED_EDIT_TRACK_SECONDS = 48 * 60 * 60
+HIGH_RISK_FALSE_POSITIVE_WINDOW_SECONDS = 7 * 24 * 60 * 60
 
 # Resumo periódico dos alertas ainda pendentes no canal.
 PENDING_SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60
@@ -353,7 +354,8 @@ posted_edits_lock = threading.Lock()
 posted_edits_persist_lock = threading.Lock()
 
 # Estatísticas dos alertas do detector normal.
-# Mantidas separadamente das mensagens acompanhadas por 48h.
+# Mantidas separadamente das mensagens acompanhadas por 48h (ou 7 dias para
+# os alertas aprovados na lista de alto risco).
 detection_stats = {
     "records": [],
     "last_report_date": None,
@@ -906,6 +908,30 @@ def edit_telegram_message_in_chat(chat_id, message_id, text, parse_mode=None, re
         return bool(data.get("ok"))
     except Exception as e:
         print("⚠️ Erro ao paginar pendentes:", safe_exception(e))
+        return False
+
+
+def edit_telegram_reply_markup(message_id, reply_markup):
+    """Atualiza apenas os botões, com uma tentativa curta e sem reenviar texto."""
+    try:
+        response = requests.post(
+            f"{TELEGRAM_API}/editMessageReplyMarkup",
+            json={
+                "chat_id": TELEGRAM_CHANNEL,
+                "message_id": int(message_id),
+                "reply_markup": reply_markup or {"inline_keyboard": []},
+            },
+            timeout=20,
+        )
+        if (
+            response.status_code == 400
+            and "message is not modified" in response.text.lower()
+        ):
+            return True
+        response.raise_for_status()
+        return bool(response.json().get("ok"))
+    except Exception as exc:
+        print("⚠️ Erro ao atualizar botões Telegram:", safe_exception(exc))
         return False
 
 
@@ -2643,6 +2669,7 @@ WIKI_RELEASE_NOTES = {
     "3.34": "Amplia a calibração contextual para wikilinks cosméticos, trocas plausíveis de nomes, mídia e reformatação de infobox, pequenas variações numéricas, grandes adições construtivas com fontes e comentários assinados em discussão; corrige também o redutor de desambiguação da 3.33.",
     "3.35": "Impede que apóstrofos do diferencial alterem a formatação dos cartões seguintes e melhora /Ajustes com data, indicação única de UTC e legenda explicada somente para as categorias.",
     "3.36": "Prepara a lista de alto risco para a ptwiki com fila persistente de duas horas, revalidação comunitária e publicação desativada por padrão até a conclusão do modo de observação.",
+    "3.37": "Mantém por sete dias os dados necessários para marcar falsos positivos de alto risco, recupera registros pela cópia persistente e encerra a ação após o prazo.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -5256,7 +5283,8 @@ def build_daily_detection_report(
         "(detector, contas observadas e páginas vigiadas). "
         "O bot não sabe quem visualizou uma mensagem no Telegram; "
         "‘checagem’ é uma estimativa baseada em ações detectadas na Wikipédia. "
-        "Os estados podem mudar durante as 48 horas de acompanhamento."
+        "Os estados podem mudar durante as 48 horas de acompanhamento; "
+        "alertas de alto risco permanecem disponíveis por 7 dias."
     )
 
 
@@ -5391,22 +5419,148 @@ def save_posted_edits():
         atomic_write_json(POSTED_EDITS_FILE, data)
 
 
+def high_risk_false_positive_deadline(record):
+    """Retorna o fim da janela de sete dias a partir do registro do alerta."""
+    if not isinstance(record, dict):
+        return 0.0
+
+    for field in ("posted_at", "detected_at", "revision_timestamp"):
+        value = record.get(field)
+        try:
+            if isinstance(value, str) and value.strip():
+                timestamp = datetime.fromisoformat(
+                    value.strip().replace("Z", "+00:00")
+                ).timestamp()
+            else:
+                timestamp = float(value)
+            if timestamp > 0:
+                return timestamp + HIGH_RISK_FALSE_POSITIVE_WINDOW_SECONDS
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return 0.0
+
+
+class HighRiskFalsePositiveExpired(RuntimeError):
+    pass
+
+
+def high_risk_false_positive_is_available(record, now=None):
+    deadline = high_risk_false_positive_deadline(record)
+    if deadline <= 0:
+        return False
+    return float(time.time() if now is None else now) < deadline
+
+
+def is_verified_high_risk_record(revision_id, record=None):
+    """Identifica somente itens que passaram pelo gate persistente de alto risco."""
+    if isinstance(record, dict) and record.get("ptwiki_delay_verified") is True:
+        return True
+    archive = globals().get("high_risk_archive")
+    if not isinstance(archive, dict):
+        return False
+    archived = archive.get(str(revision_id))
+    return (
+        isinstance(archived, dict)
+        and archived.get("ptwiki_delay_verified") is True
+    )
+
+
+def posted_edit_retention_seconds(revision_id, record):
+    if is_verified_high_risk_record(revision_id, record):
+        return HIGH_RISK_FALSE_POSITIVE_WINDOW_SECONDS
+    return POSTED_EDIT_TRACK_SECONDS
+
+
+def posted_edit_is_within_retention(revision_id, record, now=None):
+    try:
+        age = float(time.time() if now is None else now) - float(
+            record.get("posted_at", 0)
+        )
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return False
+    return age <= posted_edit_retention_seconds(revision_id, record)
+
+
+def _restore_active_high_risk_post_records(target, now=None):
+    """Recupera do arquivo de alto risco metadados já removidos após 48h.
+
+    O arquivo recebe uma cópia completa do registro quando o candidato é
+    aprovado. Assim, uma implantação desta versão também corrige cards que já
+    ultrapassaram a retenção antiga, desde que ainda estejam dentro dos 7 dias.
+    """
+    if not isinstance(target, dict):
+        return 0
+    current_time = float(time.time() if now is None else now)
+    archive = globals().get("high_risk_archive")
+    if not isinstance(archive, dict):
+        return 0
+
+    recovered = 0
+    for key, archived in list(archive.items()):
+        key = str(key)
+        if key in target or not isinstance(archived, dict):
+            continue
+        if archived.get("ptwiki_delay_verified") is not True:
+            continue
+        if not high_risk_false_positive_is_available(archived, now=current_time):
+            continue
+        try:
+            revision_id = int(archived.get("revision_id") or key)
+            message_id = int(archived.get("message_id"))
+            posted_at = float(archived.get("posted_at"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not archived.get("base_message"):
+            continue
+        target[key] = {
+            **archived,
+            "revision_id": revision_id,
+            "message_id": message_id,
+            "posted_at": posted_at,
+        }
+        recovered += 1
+    return recovered
+
+
 def cleanup_posted_edits(save=True):
     now = time.time()
     removed = False
+    expired_high_risk_pending = []
 
     with posted_edits_lock:
         expired = [
             key
             for key, item in posted_edits.items()
-            if now - float(
-                item.get("posted_at", 0)
-            ) > POSTED_EDIT_TRACK_SECONDS
+            if not posted_edit_is_within_retention(key, item, now=now)
         ]
 
         for key in expired:
+            item = posted_edits[key]
+            if (
+                not item.get("status")
+                and is_verified_high_risk_record(key, item)
+            ):
+                expired_high_risk_pending.append(dict(item))
             del posted_edits[key]
             removed = True
+
+    # O backend já rejeita o clique vencido. Esta tentativa adicional remove
+    # visualmente Resolver/Falso + do post sem bloquear a limpeza se o Telegram
+    # estiver indisponível.
+    for item in expired_high_risk_pending:
+        try:
+            revision_id = int(item.get("revision_id"))
+            edit_telegram_reply_markup(
+                item.get("message_id"),
+                reply_markup_without_resolution_buttons(
+                    item.get("reply_markup"), revision_id
+                ),
+            )
+        except Exception as exc:
+            print(
+                "⚠️ Não foi possível remover botões vencidos do alerta de alto risco:",
+                safe_exception(exc),
+            )
 
     if removed and save:
         try:
@@ -5430,8 +5584,16 @@ def load_posted_edits():
             print("⚠️ posted_edits", name, "ilegível:", error)
 
     if not sources:
+        loaded = {}
+        recovered = _restore_active_high_risk_post_records(loaded, now=now)
         with posted_edits_lock:
-            posted_edits = {}
+            posted_edits = loaded
+        if recovered:
+            print(
+                "✅ Posts de alto risco recuperados do arquivo persistente:",
+                recovered,
+            )
+            return True
         print("⚠️ Nenhum estado posted_edits disponível; startup não sobrescreverá os arquivos.")
         return False
 
@@ -5449,7 +5611,9 @@ def load_posted_edits():
             except Exception:
                 reasons["invalid_fields"] = reasons.get("invalid_fields", 0) + 1
                 continue
-            if now - posted_at > POSTED_EDIT_TRACK_SECONDS:
+            if not posted_edit_is_within_retention(
+                revision_id, item, now=now
+            ):
                 reasons["expired"] = reasons.get("expired", 0) + 1
                 continue
             if not item.get("base_message"):
@@ -5460,11 +5624,13 @@ def load_posted_edits():
         choices.append((len(loaded), name, loaded, len(data), reasons))
 
     _, source_name, loaded, raw_count, reasons = max(choices, key=lambda x: x[0])
+    recovered = _restore_active_high_risk_post_records(loaded, now=now)
     with posted_edits_lock:
         posted_edits = loaded
     print(
         f"✅ Edições publicadas restauradas: {len(loaded)} | origem={source_name} "
-        f"| registros={raw_count} | descartados={raw_count-len(loaded)} | motivos={reasons}"
+        f"| registros={raw_count} | recuperados_alto_risco={recovered} "
+        f"| descartados={max(0, raw_count + recovered-len(loaded))} | motivos={reasons}"
     )
     # Não chama save_posted_edits(): deploy/startup nunca consolida restauração parcial.
     if raw_count and not loaded:
@@ -7297,9 +7463,9 @@ def get_pending_posted_edits():
     with posted_edits_lock:
         items = [
             dict(item)
-            for item in posted_edits.values()
+            for key, item in posted_edits.items()
             if not item.get("status")
-            and now - float(item.get("posted_at", 0)) <= POSTED_EDIT_TRACK_SECONDS
+            and posted_edit_is_within_retention(key, item, now=now)
         ]
     # Visão geral padrão: cronológica, do mais antigo para o mais recente.
     items.sort(key=lambda item: float(item.get("posted_at", 0)))
@@ -7476,7 +7642,7 @@ def build_pending_summary_message(items):
 
 
 def pending_alerts_summary_scheduler():
-    print("✅ Resumo de pendências: a cada 2 horas, top 10 por prioridade, janela de 48h.")
+    print("✅ Resumo de pendências: a cada 2 horas, top 10 por prioridade, 48h (alto risco: 7 dias).")
     with pending_summary_lock:
         never_sent = not pending_summary_state.get("last_sent_at")
     if never_sent:
@@ -11613,7 +11779,7 @@ def process_telegram_command(message, from_channel=False):
                 f"🏷 Falsos positivos aguardando ajuste: "
                 f"{false_positive_pending_count}\n"
                 f"📌 Resumo prioritário: a cada 2h "
-                f"(top 10, 48h)\n"
+                f"(top 10, 48h; alto risco: 7 dias)\n"
                 f"🧹 Reconciliação de pendências: a cada 30 min\n"
                 f"📊 Registros estatísticos (90d): "
                 f"{stats_count}\n"
@@ -12534,8 +12700,35 @@ def process_edit_action_callback(callback):
     with posted_edits_lock:
         record = posted_edits.get(str(revision_text))
 
+    recovery_state = None
+    if not record and action == "falsepos":
+        try:
+            record, recovery_state = get_high_risk_false_positive_record(
+                revision_text
+            )
+        except (TypeError, ValueError, OverflowError):
+            record = None
+            recovery_state = "not_found"
+
     if not record:
+        if recovery_state == "expired":
+            answer_callback_query(
+                callback_id,
+                "O prazo de 7 dias para marcar falso positivo expirou."
+            )
+            return
         answer_callback_query(callback_id, "Não encontrei os dados deste alerta.")
+        return
+
+    if (
+        action == "falsepos"
+        and is_verified_high_risk_record(revision_text, record)
+        and not high_risk_false_positive_is_available(record)
+    ):
+        answer_callback_query(
+            callback_id,
+            "O prazo de 7 dias para marcar falso positivo expirou."
+        )
         return
 
     username = str(record.get("username") or "").strip()
@@ -13429,7 +13622,7 @@ if PTWIKI_HIGH_RISK_MODE not in {"off", "shadow", "publish"}:
     PTWIKI_HIGH_RISK_MODE = "shadow"
 WIKI_HIGH_RISK_THRESHOLD = 0.80
 WIKI_HIGH_RISK_DELAY_SECONDS = 2 * 60 * 60
-WIKI_HIGH_RISK_WRITE_INTERVAL_SECONDS = 20
+WIKI_HIGH_RISK_WRITE_INTERVAL_SECONDS = 121
 WIKI_HIGH_RISK_RETRY_SECONDS = 15 * 60
 WIKI_HIGH_RISK_DECISION_RETENTION_SECONDS = 30 * 24 * 60 * 60
 HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS = 60
@@ -13950,7 +14143,23 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
 
     preview = high_risk_diff_excerpt(record)
     action, actor, _ = high_risk_action(record)
-    status_text = (f"{action} por {high_risk_account_link(actor)}" if actor else action) if action else "Pendente de revisão"
+    false_positive_available = high_risk_false_positive_is_available(record)
+    false_positive_deadline = high_risk_false_positive_deadline(record)
+    false_positive_until = (
+        datetime.fromtimestamp(false_positive_deadline, timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        if false_positive_deadline > 0 else ""
+    )
+    template_status = record.get("status") or "pending"
+    if action:
+        status_text = (
+            f"{action} por {high_risk_account_link(actor)}" if actor else action
+        )
+    elif false_positive_available:
+        status_text = "Pendente de revisão"
+    else:
+        status_text = "Pendente de revisão · prazo para falso positivo encerrado"
     pattern_line = high_risk_pattern_annotation(record, pattern_model or {}) if include_pattern else ""
     background = high_risk_background(record)
     timer_wikitext = ""
@@ -13973,8 +14182,9 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
 
     return (
         "{{" + WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE
-        + f"|revid={revision_id}|status={tpl(wiki_safe_text(record.get('status') or 'pending'))}"
+        + f"|revid={revision_id}|status={tpl(wiki_safe_text(template_status))}"
         + f"|reviewer={tpl(wiki_safe_text(record.get('manual_reviewer') or ''))}|timestamp={tpl(revision_iso)}"
+        + f"|falsepos_available={'1' if false_positive_available else '0'}|falsepos_until={tpl(false_positive_until)}"
         + f"|background={tpl(background)}|risk_bg={tpl(risk_badge_bg)}|risk={risk:.0%}|date={tpl(compact_time)}"
         + f"|first_line={tpl(first_line)}|user_line={tpl(user_line)}|preview={tpl(preview)}"
         + f"|state={tpl(status_text)}|account_state={tpl(wiki_safe_text(record.get('account_block_state')) if record.get('account_block_state') else '')}"
@@ -14011,11 +14221,9 @@ def select_high_risk_records(records):
 def high_risk_header_transclusion():
     return "{{" + WIKI_HIGH_RISK_HEADER_TITLE + "}}"
 
-def high_risk_instructions_transclusion():
-    return "{{Usuário:TelesGramBot/Edições de alto risco/Instruções}}"
-    
+
 def build_high_risk_entry_template_wikitext():
-    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; border-radius:4px; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0 0.85em 0; line-height:1.35; overflow:hidden; box-shadow:0 2px 2px rgba(0,0,0,.08)">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.90em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none"><span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[Usuário:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
+    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" data-telesgram-falsepos-available="{{{falsepos_available|0}}}" data-telesgram-falsepos-until="{{{falsepos_until|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; border-radius:4px; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0 0.85em 0; line-height:1.35; overflow:hidden; box-shadow:0 2px 2px rgba(0,0,0,.08)">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.90em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none"><span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[Usuário:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
 
 
 def build_high_risk_page(records, heading, introduction, include_dynamic_learning=True):
@@ -14023,16 +14231,14 @@ def build_high_risk_page(records, heading, introduction, include_dynamic_learnin
     pattern_model = train_high_risk_pattern_model() if include_dynamic_learning else {}
     pattern_counts = pattern_model.get("counts", {})
     lines = [
-    "__NOINDEX__",
-    high_risk_header_transclusion(),
-    "",
-    f"= {heading} =",
-    "",
-    high_risk_instructions_transclusion(),
-    "",
-    introduction,
-    "",
-]
+        "__NOINDEX__",
+        high_risk_header_transclusion(),
+        f"= {heading} =",
+        introduction,
+        "",
+        "Amarelo: pendente (acima de 80% até 95%); vermelho: pendente (acima de 95%); "
+        "azul: edição revista.",
+    ]
     if include_dynamic_learning:
         lines.extend([
             "Treino de padrões: revertida/eliminada = edição incorreta; patrulhada/falso positivo = edição válida. "
@@ -14079,6 +14285,43 @@ def save_high_risk_archive():
     with high_risk_archive_lock:
         snapshot = dict(high_risk_archive)
     atomic_write_json(HIGH_RISK_ARCHIVE_FILE, snapshot)
+
+
+def get_high_risk_false_positive_record(revision_id, now=None):
+    """Obtém ou reidrata o post enquanto a janela de sete dias estiver aberta.
+
+    Retorna ``(record, state)``; state pode ser ``available``, ``expired`` ou
+    ``not_found``. O arquivo de alto risco é a fonte de recuperação para cards
+    que já tinham ultrapassado a antiga retenção de 48 horas.
+    """
+    key = str(int(revision_id))
+    with high_risk_archive_lock:
+        archived = high_risk_archive.get(key)
+        archived = dict(archived) if isinstance(archived, dict) else None
+
+    if not archived or archived.get("ptwiki_delay_verified") is not True:
+        return None, "not_found"
+    if not high_risk_false_positive_is_available(archived, now=now):
+        return None, "expired"
+
+    with posted_edits_lock:
+        live = posted_edits.get(key)
+        if isinstance(live, dict):
+            return dict(live), "available"
+
+        try:
+            recovered = {
+                **archived,
+                "revision_id": int(archived.get("revision_id") or key),
+                "message_id": int(archived.get("message_id")),
+                "posted_at": float(archived.get("posted_at")),
+            }
+        except (TypeError, ValueError, OverflowError):
+            return None, "not_found"
+        if not recovered.get("base_message"):
+            return None, "not_found"
+        posted_edits[key] = recovered
+        return dict(recovered), "available"
 
 
 def _high_risk_candidate_state():
@@ -15196,7 +15439,7 @@ def ptwiki_high_risk_worker():
             queue_high_risk_wiki_pages()
         except Exception as exc:
             print("⚠️ Lista de alto risco da ptwiki:", safe_exception(exc))
-        time.sleep(10)
+        time.sleep(30)
 
 
 # Compatibilidade com supervisores ou imports da versão anterior.
@@ -15292,6 +15535,14 @@ def apply_wiki_false_positive(revid, actor):
     """Marca pela Wiki usando a mesma base /falsospositivos do botão do Telegram."""
     revision_id = int(revid)
     key = str(revision_id)
+
+    record, availability = get_high_risk_false_positive_record(revision_id)
+    if availability == "expired":
+        raise HighRiskFalsePositiveExpired(
+            "O prazo de 7 dias para marcar este falso positivo expirou"
+        )
+    if availability != "available" or not record:
+        raise RuntimeError("Não encontrei os dados deste alerta de alto risco")
 
     with posted_edits_lock:
         live = posted_edits.get(key)
@@ -15428,6 +15679,8 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
                 return self._redirect(target)
             except PermissionError as exc:
                 return self._html(403, "Revisão não autorizada", str(exc))
+            except HighRiskFalsePositiveExpired as exc:
+                return self._html(410, "Prazo encerrado", str(exc))
             except Exception as exc:
                 print("❌ OAuth/revisão manual:", safe_exception(exc))
                 return self._html(500, "Falha na revisão", "A decisão não foi aplicada. Tente novamente.")
@@ -15471,6 +15724,22 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
                 action = str(payload.get("action") or "")
                 if action not in ("clean", "vandalism", "falsepos", "undo"):
                     raise ValueError("Ação inválida")
+                if action == "falsepos":
+                    record, availability = get_high_risk_false_positive_record(
+                        revid
+                    )
+                    if availability == "expired":
+                        return self._html(
+                            410,
+                            "Prazo encerrado",
+                            "O prazo de 7 dias para marcar este falso positivo expirou.",
+                        )
+                    if availability != "available" or not record:
+                        return self._html(
+                            404,
+                            "Alerta não encontrado",
+                            "Não encontrei os dados deste alerta de alto risco.",
+                        )
                 state = _new_oauth_state(revid, action, payload.get("return_to"))
                 auth_url = OAUTH_AUTHORIZE_URL + "?" + urlencode({
                     "client_id": OAUTH_CLIENT_ID,
@@ -15543,8 +15812,10 @@ def main():
     load_ignored_users()
     load_abuse_filters()
     load_abuse_filter_state()
-    load_posted_edits()
+    # O arquivo de alto risco precisa estar em memória antes de posted_edits:
+    # ele define a retenção seletiva de 7 dias e recupera registros antigos.
     load_high_risk_archive()
+    load_posted_edits()
     load_detection_stats()
     load_pending_summary_state()
     load_reversible_actions()
@@ -15611,7 +15882,7 @@ def main():
     )
     print(
         "🕒 Resumo prioritário: a cada 2 horas, "
-        "top 10 por risco, janela de 48h"
+        "top 10 por risco, 48h; alto risco por 7 dias"
     )
     print(
         "🧹 Reconciliação de pendências: a cada 30 minutos, "
