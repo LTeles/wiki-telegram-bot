@@ -5919,65 +5919,86 @@ def wikimedia_login():
 
     with wikimedia_auth_lock:
         try:
-            token_response = wikimedia_session.get(
+            # Uma sessão BotPassword já autenticada não aceita novo action=login.
+            existing_response = wikimedia_session.get(
                 WIKIPEDIA_API,
                 params={
-                    "action": "query",
-                    "meta": "tokens",
-                    "type": "login",
-                    "format": "json",
-                    "formatversion": 2,
+                    "action": "query", "meta": "userinfo",
+                    "format": "json", "formatversion": 2,
                 },
-                timeout=25
+                timeout=25,
             )
-            token_response.raise_for_status()
-            token_data = token_response.json()
-            login_token = (
-                token_data
-                .get("query", {})
-                .get("tokens", {})
-                .get("logintoken")
-            )
-
-            if not login_token:
-                raise RuntimeError(
-                    "token de login não retornado"
+            existing_response.raise_for_status()
+            existing_data = existing_response.json()
+            if existing_data.get("error"):
+                raise RuntimeError(f"userinfo Wikimedia: {existing_data['error']}")
+            existing_user = existing_data.get("query", {}).get("userinfo", {})
+            expected_user = WIKIMEDIA_BOT_USERNAME.split("@", 1)[0]
+            existing_name = existing_user.get("name")
+            if existing_name and not existing_user.get("anon") and existing_user.get("id", 0):
+                if existing_name != expected_user:
+                    raise RuntimeError("Sessão Wikimedia pertence a outra conta")
+                print("✅ Sessão BotPassword já autenticada; reutilizando.")
+            else:
+                token_response = wikimedia_session.get(
+                    WIKIPEDIA_API,
+                    params={
+                        "action": "query",
+                        "meta": "tokens",
+                        "type": "login",
+                        "format": "json",
+                        "formatversion": 2,
+                    },
+                    timeout=25
+                )
+                token_response.raise_for_status()
+                token_data = token_response.json()
+                login_token = (
+                    token_data
+                    .get("query", {})
+                    .get("tokens", {})
+                    .get("logintoken")
                 )
 
-            login_response = wikimedia_session.post(
-                WIKIPEDIA_API,
-                data={
-                    "action": "login",
-                    "lgname": WIKIMEDIA_BOT_USERNAME,
-                    "lgpassword": WIKIMEDIA_BOT_PASSWORD,
-                    "lgtoken": login_token,
-                    "format": "json",
-                    "formatversion": 2,
-                },
-                timeout=25
-            )
-            login_response.raise_for_status()
-            login_data = login_response.json()
+                if not login_token:
+                    raise RuntimeError(
+                        "token de login não retornado"
+                    )
 
-            login_result = (
-                login_data
-                .get("login", {})
-                .get("result")
-            )
+                login_response = wikimedia_session.post(
+                    WIKIPEDIA_API,
+                    data={
+                        "action": "login",
+                        "lgname": WIKIMEDIA_BOT_USERNAME,
+                        "lgpassword": WIKIMEDIA_BOT_PASSWORD,
+                        "lgtoken": login_token,
+                        "format": "json",
+                        "formatversion": 2,
+                    },
+                    timeout=25
+                )
+                login_response.raise_for_status()
+                login_data = login_response.json()
 
-            if login_result != "Success":
-                reason = (
+                login_result = (
                     login_data
                     .get("login", {})
-                    .get("reason")
-                    or
-                    login_result
-                    or
-                    "falha desconhecida"
+                    .get("result")
                 )
-                raise RuntimeError(
-                    f"login Wikimedia falhou: {reason}"
-                )
+
+                if login_result != "Success":
+                    reason = (
+                        login_data
+                        .get("login", {})
+                        .get("reason")
+                        or
+                        login_result
+                        or
+                        "falha desconhecida"
+                    )
+                    raise RuntimeError(
+                        f"login Wikimedia falhou: {reason}"
+                    )
 
             user_response = wikimedia_session.get(
                 WIKIPEDIA_API,
@@ -5999,6 +6020,8 @@ def wikimedia_login():
             )
 
             wikimedia_authenticated_user = userinfo.get("name")
+            if wikimedia_authenticated_user != expected_user:
+                raise RuntimeError("Identidade Wikimedia diferente da conta configurada")
             wikimedia_rights = set(
                 userinfo.get("rights", [])
             )
@@ -13653,7 +13676,7 @@ HIGH_RISK_CANDIDATES_FILE = data_path("ptwiki_high_risk_candidates_v1.json")
 HIGH_RISK_WRITE_CONTROL_FILE = data_path("ptwiki_high_risk_write_control.json")
 HIGH_RISK_WRITE_LOCK = threading.RLock()
 high_risk_archive = {}
-high_risk_archive_lock = threading.Lock()
+high_risk_archive_lock = threading.RLock()
 high_risk_candidates_lock = threading.RLock()
 
 
@@ -15146,7 +15169,7 @@ def apply_high_risk_manual_decision(decision):
     if action in ("vandalism", "clean") and high_risk_action(archived)[0] is None:
         new_status = "manual_vandalism" if action == "vandalism" else "manual_clean"
         changed_status = True
-    elif action == "undo" and current_status in ("manual_vandalism", "manual_clean"):
+    elif action == "undo" and (current_status in ("manual_vandalism", "manual_clean") or (current_status == "false_positive" and archived.get("manual_reviewer") and "manual_previous_status" in archived)):
         new_status = previous_status
         changed_status = True
     reviewed_at = decision.get("timestamp") or datetime.now(timezone.utc).isoformat()
@@ -15163,6 +15186,10 @@ def apply_high_risk_manual_decision(decision):
             record["status"] = new_status
             record["manual_reviewer"] = None
             record["manual_reviewed_at"] = None
+            if current_status == "false_positive":
+                record.pop("false_positive_at", None)
+                record.pop("false_positive_by", None)
+                record.pop("manual_previous_status", None)
         record["manual_decision_revid"] = decision_revid
         record["manual_seen_revid"] = decision_revid
     save_high_risk_archive()
@@ -15547,7 +15574,23 @@ def apply_wiki_false_positive(revid, actor):
     with posted_edits_lock:
         live = posted_edits.get(key)
         if not isinstance(live, dict):
-            raise RuntimeError("Não encontrei os dados deste alerta")
+            with high_risk_archive_lock:
+                archived = high_risk_archive.get(key)
+                if not isinstance(archived, dict):
+                    raise RuntimeError("Não encontrei os dados deste alerta")
+                if archived.get("status") in ("false_positive", "falsepos"):
+                    raise RuntimeError("Este alerta já está marcado como falso positivo")
+                if archived.get("status") in ("clean", "vandalism", "reverted", "approved"):
+                    raise RuntimeError("Este alerta já foi resolvido")
+                archived["manual_previous_status"] = archived.get("status")
+                archived["status"] = "false_positive"
+                archived["false_positive_at"] = time.time()
+                archived["false_positive_by"] = actor
+                archived["manual_reviewer"] = actor
+                archived["manual_reviewed_at"] = datetime.now(timezone.utc).isoformat()
+            save_high_risk_archive()
+            queue_high_risk_manual_refresh(revision_id)
+            return True
         if live.get("alert_kind", "normal") != "normal":
             raise RuntimeError("Falso positivo só pode ser marcado em alertas do detector")
         if live.get("status"):
