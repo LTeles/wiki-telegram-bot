@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.37"
-BOT_BUILD = "3.37-high-risk-false-positive-retention"
+BOT_VERSION = "3.38"
+BOT_BUILD = "3.38-false-positive-calibration"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -9518,26 +9518,23 @@ def profanity_score(text):
 
 
 def repetition_score(text):
+    """Detecta repetição na prosa, ignorando sintaxe comum do wikitext."""
     if not text:
         return 0.0
-
-    patterns = [
-        r"(.)\1{8,}",
-        r"[!?]{8,}",
-        r"\b(\w{2,5})\1{4,}\b",
-        r"(ha){6,}",
-        r"(kk){4,}",
-    ]
-
-    for pattern in patterns:
-        if re.search(
-            pattern,
-            text.lower()
-        ):
-            return 0.95
-
-    return 0.0
-
+    value = str(text)
+    value = re.sub(r"<!--.*?-->", " ", value, flags=re.S)
+    value = re.sub(r"<ref\b[^>]*>.*?</ref>", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<[^>]+>", " ", value)
+    for _ in range(4):
+        value = re.sub(r"\{\{[^{}]*\}\}", " ", value)
+    value = re.sub(r"\[\[([^\]]+)\]\]", lambda match: match.group(1).split("|")[-1], value)
+    value = re.sub(r"\[(?:https?://\S+\s+)?([^\]]+)\]", r"\1", value)
+    value = re.sub(r"'{2,}|={2,}", " ", value)
+    value = re.sub(r"(?m)^\s*[*#:;|!-]+\s*", " ", value)
+    value = re.sub(r"[\[\]{}<>|]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip().lower()
+    patterns = [r"(.)\1{8,}", r"[!?]{8,}", r"\b(\w{2,5})\1{4,}\b", r"(ha){6,}", r"(kk){4,}"]
+    return 0.95 if any(re.search(pattern, value) for pattern in patterns) else 0.0
 
 def destructive_score(added, removed):
     added_len = len(added.strip())
@@ -9711,27 +9708,42 @@ def wikilink_removal_priority_adjustment(diff):
 
 
 def infobox_media_priority_adjustment(diff):
-    """Reduz risco para inclusão de arquivo/legenda em parâmetro típico de infobox."""
-    old = "\n".join(normalized_diff_lines(diff.get("removed", "")))
-    new = "\n".join(normalized_diff_lines(diff.get("added", "")))
-    if not new or max(len(old), len(new)) > 2500:
+    """Reduz risco em inclusão ou troca isolada e plausível de imagem na infobox."""
+    old_lines = normalized_diff_lines(diff.get("removed", ""))
+    new_lines = normalized_diff_lines(diff.get("added", ""))
+    if not new_lines or max(len(old_lines), len(new_lines)) > 6:
         return None
-    media = re.findall(r"(?im)^\s*\|\s*(imagem|image|foto|bandeira|bras[aã]o|logo|imagem_bandeira|imagem_escudo)\s*=\s*([^\n|]+)", new)
-    captions = re.findall(r"(?im)^\s*\|\s*(leg_imagem|legenda|caption)\s*=\s*([^\n|]+)", new)
-    if not media:
+    pattern = re.compile(r"^\|\s*(imagem|image|foto)\d*\s*=\s*(.*?)\s*$", re.I)
+    def parse_media(lines):
+        result = []
+        for line in lines:
+            match = pattern.match(line)
+            if not match:
+                return None
+            result.append((match.group(1).casefold(), match.group(2).strip()))
+        return result
+    old_media = parse_media(old_lines) if old_lines else []
+    new_media = parse_media(new_lines)
+    if old_media is None or new_media is None or not new_media:
         return None
-    values = " ".join(v for _, v in media + captions)
-    if max(profanity_score(values), repetition_score(values), nonsense_score(values)) >= 0.75:
+    if old_media and (
+        len(old_media) != len(new_media)
+        or [key for key, _ in old_media] != [key for key, _ in new_media]
+    ):
         return None
-    plausible = any(re.search(r"\.(?:jpe?g|png|svg|webp|gif|tiff?)\s*$", v.strip(), re.I) for _, v in media)
-    if not plausible:
+    values = [value for _, value in new_media]
+    # Nomes repetidos de arquivos são usuais; conteúdo ofensivo não recebe redutor.
+    if any(profanity_score(value) >= 0.75 for value in values):
         return None
-    # Deve ser acréscimo/preenchimento; não proteger troca destrutiva de arquivo por outro.
-    old_files = re.findall(r"(?im)^\s*\|\s*(?:imagem|image|foto|bandeira|bras[aã]o|logo|imagem_bandeira|imagem_escudo)\s*=\s*([^\n|]+)", old)
-    if old_files and all(v.strip() for v in old_files):
+    if not all(re.search(r"\.(?:jpe?g|png|svg|webp|gif|tiff?)\s*$", value, re.I)
+               for value in values):
         return None
-    return {"factor": 0.45, "reason": "inclusão plausível de mídia em parâmetro de infobox"}
-
+    reason = (
+        "troca plausível de imagem em parâmetro de infobox"
+        if old_media and all(value for _, value in old_media)
+        else "inclusão plausível de mídia em parâmetro de infobox"
+    )
+    return {"factor": 0.45, "reason": reason}
 
 def template_reformat_priority_adjustment(diff):
     """Detecta redistribuição de parâmetros = valor sem mudança semântica."""
@@ -9995,34 +10007,49 @@ def equivalent_wikimarkup_priority_adjustment(diff):
 
 
 def minimal_text_priority_adjustment(diff):
-    """Redutor moderado de prioridade para uma única mudança lexical curta.
-
-    Não altera o Revert Risk original nem trata a edição como legítima.
-    Exclui números, negações e mudanças com mais de um trecho modificado.
-    """
+    """Reduz prioridade para uma mudança lexical isolada de uma letra."""
     import difflib
     old = " ".join(normalized_diff_lines(diff.get("removed", "")))
     new = " ".join(normalized_diff_lines(diff.get("added", "")))
     if not old or not new or len(old) > 500 or len(new) > 500:
         return None
-    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
-    edits = [(old[a:b], new[c:d]) for op, a, b, c, d in matcher.get_opcodes()
-             if op != "equal"]
+    edits = [
+        (old[a:b], new[c:d])
+        for op, a, b, c, d in difflib.SequenceMatcher(
+            None, old, new, autojunk=False
+        ).get_opcodes()
+        if op != "equal"
+    ]
     if len(edits) != 1:
         return None
     before, after = edits[0]
     if max(len(before), len(after)) > 16 or any(ch.isdigit() for ch in before + after):
         return None
-    if not re.fullmatch(r"[\wÀ-ÿ-]*", before) or not re.fullmatch(r"[\wÀ-ÿ-]*", after):
+    if not re.fullmatch(r"[\wÀ-ÿ-]*", before) or not re.fullmatch(
+        r"[\wÀ-ÿ-]*", after
+    ):
         return None
     if not before and not after:
         return None
-    # Negações podem inverter inteiramente o sentido da frase.
     if re.search(r"\b(?:não|nao|nunca|jamais|sem)\b", before + " " + after, re.I):
         return None
-    # Somente um pequeno ajuste na prioridade, sem blindar alterações factuais.
-    return {"factor": 0.85, "reason": "alteração lexical mínima; conferir contexto factual"}
-
+    a, b = before.casefold(), after.casefold()
+    one_character_edit = False
+    if a and b and a.isalpha() and b.isalpha() and min(len(a), len(b)) >= 4:
+        if len(a) == len(b):
+            one_character_edit = sum(x != y for x, y in zip(a, b)) == 1
+        elif abs(len(a) - len(b)) == 1:
+            shorter, longer = (a, b) if len(a) < len(b) else (b, a)
+            one_character_edit = any(
+                longer[:i] + longer[i + 1:] == shorter
+                for i in range(len(longer))
+            )
+    if one_character_edit:
+        return {
+            "factor": 0.70,
+            "reason": "troca isolada de uma letra entre palavras; sem outros sinais suspeitos",
+        }
+    return None
 
 def children_count_priority_adjustment(change, diff):
     """Avalia apenas uma troca isolada no parâmetro numérico |filhos da infocaixa."""
@@ -10320,9 +10347,9 @@ def contextual_discussion_adjustment(change, diff, strong_signals):
         if (not removed.strip() and strong_signals == 0 and body_signals < 0.75
                 and links == 0 and len(body) >= 12):
             return {
-                "multiplier": 0.45,
+                "multiplier": 0.35,
                 "additive": 0.0,
-                "reason": "comentário assinado inserido em espaço de conversa, sem remoções nem sinais fortes",
+                "reason": "comentário assinado e construtivo em espaço de conversa, sem remoções nem sinais fortes",
                 "kind": "talk_signed_append",
             }
         # Não aplica redutor genérico a edições com remoções ou links externos.
@@ -10604,8 +10631,8 @@ def analyze_vandalism(change, diff, revert_risk):
     if not benign and not cosmetic_adjustment and not change.get("type") == "new" and max(signals) < 0.75:
         minimal_adjustment = (equivalent_wikimarkup_priority_adjustment(diff)
                               or orthographic_priority_adjustment(diff)
-                              or name_substitution_priority_adjustment(diff)
-                              or minimal_text_priority_adjustment(diff))
+                              or minimal_text_priority_adjustment(diff)
+                              or name_substitution_priority_adjustment(diff))
         if contextual_calibration and (not minimal_adjustment or contextual_calibration["factor"] < minimal_adjustment["factor"]):
             minimal_adjustment = contextual_calibration
         if minimal_adjustment:
