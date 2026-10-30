@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.38"
-BOT_BUILD = "3.38-false-positive-calibration"
+BOT_VERSION = "3.39"
+BOT_BUILD = "3.39-false-positive-calibration-discussions-and-routine-edits"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2670,6 +2670,8 @@ WIKI_RELEASE_NOTES = {
     "3.35": "Impede que apóstrofos do diferencial alterem a formatação dos cartões seguintes e melhora /Ajustes com data, indicação única de UTC e legenda explicada somente para as categorias.",
     "3.36": "Prepara a lista de alto risco para a ptwiki com fila persistente de duas horas, revalidação comunitária e publicação desativada por padrão até a conclusão do modo de observação.",
     "3.37": "Mantém por sete dias os dados necessários para marcar falsos positivos de alto risco, recupera registros pela cópia persistente e encerra a ação após o prazo.",
+    "3.38": "Calibra falsos positivos em comentários assinados, alterações mínimas de texto, referências, wikitexto e mídia em infocaixas.",
+    "3.39": "Reduz o risco de comentários benignos em páginas de discussão e de ajuda, edições inocuas na própria página de usuário, ajustes mínimos de pontuação e números em predefinições; reconhece imagens comuns no corpo do artigo e o preenchimento de dados em referências. Registra estas calibrações em /Ajustes e no anúncio do Telegram.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -2730,6 +2732,11 @@ def queue_current_adjustments_log():
             ("#7a4e00", "🎯", "RISK-QUEUE", "ADDED", "Edições de alto risco aguardam duas horas e são revalidadas antes da publicação."),
             ("#3366cc", "🖥️", "WIKI-PT", "CHANGED", "Lista de alto risco preparada para subpáginas controladas da ptwiki, com ativação explícita."),
             ("#b32424", "🛡️", "SAFE-WRITE", "ADDED", "Escritas usam fila única, conflito de edição, maxlag e confirmação de identidade do bot."),
+        ],
+        "3.39": [
+            ("#7a4e00", "🎯", "RISK-CAL", "CHANGED", "Reduz o risco de comentários benignos em discussões e páginas de ajuda, de edições inocuas na própria página de usuário e de ajustes mínimos de pontuação ou números em predefinições."),
+            ("#7a4e00", "🎯", "RISK-CAL", "ADDED", "Reconhece inserção ou troca rotineira de imagens no corpo do artigo e preenchimento de metadados em referências, sem penalizar caracteres repetidos próprios de nomes de arquivos ou código wiki."),
+            ("#3366cc", "💬", "TG-WATCH", "CHANGED", "Notas específicas desta calibração passam a constar no anúncio de versão do Telegram."),
         ],
     }
     specs = version_entries.get(BOT_VERSION, [
@@ -9524,6 +9531,12 @@ def repetition_score(text):
     value = str(text)
     value = re.sub(r"<!--.*?-->", " ", value, flags=re.S)
     value = re.sub(r"<ref\b[^>]*>.*?</ref>", " ", value, flags=re.I | re.S)
+    # Nomes de arquivos e legendas de imagens são dados de mídia, não repetição
+    # da prosa; nomes podem conter letras ou números duplicados legitimamente.
+    value = re.sub(
+        r"\[\[(?:Ficheiro|Imagem|Image|File):[^\]]+\]\]", " ", value,
+        flags=re.I,
+    )
     value = re.sub(r"<[^>]+>", " ", value)
     for _ in range(4):
         value = re.sub(r"\{\{[^{}]*\}\}", " ", value)
@@ -9743,7 +9756,47 @@ def infobox_media_priority_adjustment(diff):
         if old_media and all(value for _, value in old_media)
         else "inclusão plausível de mídia em parâmetro de infobox"
     )
-    return {"factor": 0.45, "reason": reason}
+    return {"factor": 0.25, "reason": reason}
+
+
+def routine_media_priority_adjustment(diff):
+    """Reconhece inclusão, remoção ou troca isolada de uma imagem comum."""
+    old = str(diff.get("removed") or "")
+    new = str(diff.get("added") or "")
+    if not new or max(len(old), len(new)) > MAX_DIFF_CHARS:
+        return None
+    pattern = re.compile(
+        r"\[\[(?:Ficheiro|Imagem|Image|File):([^\]\n]+)\]\]", re.I
+    )
+    old_items = list(pattern.finditer(old))
+    new_items = list(pattern.finditer(new))
+    if not new_items or len(old_items) > 1 or len(new_items) > 1:
+        return None
+
+    def image_is_plausible(match):
+        raw = match.group(1).strip()
+        filename = raw.split("|", 1)[0].strip()
+        if not re.search(r"\.(?:jpe?g|png|svg|webp|gif|tiff?|avif)\s*$", filename, re.I):
+            return False
+        # Ofensas no nome/legenda continuam sendo sinal; duplicações no nome não.
+        return profanity_score(raw) < 0.75
+
+    if not all(image_is_plausible(item) for item in old_items + new_items):
+        return None
+
+    def without_images(value):
+        value = pattern.sub(" ", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    if without_images(old) != without_images(new):
+        return None
+    if old_items and new_items:
+        reason = "troca isolada de imagem com nome/legenda plausíveis"
+    elif new_items:
+        reason = "inclusão isolada de imagem com nome/legenda plausíveis"
+    else:
+        reason = "remoção isolada de imagem sem alteração da prosa"
+    return {"factor": 0.25, "reason": reason}
 
 def template_reformat_priority_adjustment(diff):
     """Detecta redistribuição de parâmetros = valor sem mudança semântica."""
@@ -9793,6 +9846,60 @@ def numeric_small_change_priority_adjustment(diff):
     if delta <= 2 and delta/magnitude <= .10:
         return {"factor": 0.70, "reason": "variação numérica pequena e isolada; contexto preservado"}
     return None
+
+
+def template_single_value_priority_adjustment(change, diff):
+    """Calibra uma troca isolada de valor numérico ou '?' dentro de predefinição."""
+    if change.get("type") == "new":
+        return None
+    old = "\n".join(normalized_diff_lines(diff.get("removed", "")))
+    new = "\n".join(normalized_diff_lines(diff.get("added", "")))
+    if not old or not new or max(len(old), len(new)) > 2500:
+        return None
+    template_pattern = re.compile(r"\{\{[^{}]*\}\}")
+    old_templates = list(template_pattern.finditer(old))
+    new_templates = list(template_pattern.finditer(new))
+    if len(old_templates) != 1 or len(new_templates) != 1:
+        return None
+
+    def replace_template(value, match):
+        return value[:match.start()] + "{{TEMPLATE_VALUE}}" + value[match.end():]
+
+    old_match, new_match = old_templates[0], new_templates[0]
+    old_template, new_template = old_match.group(0), new_match.group(0)
+    if replace_template(old, old_match) != replace_template(new, new_match):
+        return None
+    if "|" not in old_template or "|" not in new_template:
+        return None
+    old_parts = old_template[2:-2].split("|")
+    new_parts = new_template[2:-2].split("|")
+    if len(old_parts) != len(new_parts) or old_parts[0].strip().casefold() != new_parts[0].strip().casefold():
+        return None
+    changed = []
+    for before, after in zip(old_parts[1:], new_parts[1:]):
+        if before == after:
+            continue
+        before_name, sep_before, before_value = before.partition("=")
+        after_name, sep_after, after_value = after.partition("=")
+        if sep_before or sep_after:
+            if not (sep_before and sep_after and before_name.strip().casefold() == after_name.strip().casefold()):
+                return None
+            before, after = before_value.strip(), after_value.strip()
+        else:
+            before, after = before.strip(), after.strip()
+        if not (before == "?" and re.fullmatch(r"\d{1,2}", after)
+                or re.fullmatch(r"\d{1,2}", before) and re.fullmatch(r"\d{1,2}", after)):
+            return None
+        changed.append((before, after))
+    if len(changed) != 1:
+        return None
+    if max(profanity_score(old + new), repetition_score(old + new), nonsense_score(old + new)) >= 0.75:
+        return None
+    factor = 0.20 if is_discussion_namespace(change) else 0.40
+    return {
+        "factor": factor,
+        "reason": "alteração isolada de valor numérico em predefinição; sem outros sinais suspeitos",
+    }
 
 
 def name_substitution_priority_adjustment(diff):
@@ -9909,6 +10016,81 @@ def reference_addition_priority_adjustment(diff):
     return {"factor": 0.40, "reason": "adição isolada de referência estruturada com citação e URL"}
 
 
+def reference_template_completion_priority_adjustment(diff):
+    """Reduz risco quando a mesma fonte ganha metadados em {{Citar web}}."""
+    old = str(diff.get("removed") or "")
+    new = str(diff.get("added") or "")
+    if not old or not new or max(len(old), len(new)) > MAX_DIFF_CHARS:
+        return None
+    pattern = re.compile(r"\{\{\s*Citar\s+web\b([^{}]*?)\}\}", re.I | re.S)
+    old_templates = list(pattern.finditer(old))
+    new_templates = list(pattern.finditer(new))
+    if not old_templates or len(old_templates) != len(new_templates):
+        return None
+
+    def parameters(match):
+        result = {}
+        for key, value in re.findall(
+            r"\|\s*([^|=\n]+?)\s*=\s*([^|\n}]*)", match.group(1)
+        ):
+            result[key.strip().casefold()] = re.sub(r"\s+", " ", value).strip()
+        return result
+
+    allowed_new = {
+        "titulo", "título", "title", "data", "date", "website", "obra",
+        "publisher", "publicador", "lingua", "língua", "language",
+        "acessodata", "acessadoem", "access-date", "archive-date",
+        "arquivodata", "arquivadoem", "urlmorta", "dead-url",
+    }
+    used_new = set()
+    added_metadata = False
+    for old_match in old_templates:
+        before = parameters(old_match)
+        source_url = before.get("url")
+        if not source_url:
+            return None
+        match_index = next((
+            i for i, candidate in enumerate(new_templates)
+            if i not in used_new and parameters(candidate).get("url") == source_url
+        ), None)
+        if match_index is None:
+            return None
+        used_new.add(match_index)
+        after = parameters(new_templates[match_index])
+        if not after.get("url") or before.get("url") != after.get("url"):
+            return None
+        for key, value in before.items():
+            if key not in after:
+                return None
+            if after[key] == value:
+                continue
+            if key != "website":
+                return None
+            old_domain = re.sub(r"^www\.", "", value.casefold()).split("/", 1)[0]
+            old_brand = old_domain.split(".", 1)[0]
+            new_brand = re.sub(r"[^a-z0-9]", "", after[key].casefold())
+            if not old_brand or old_brand not in new_brand:
+                return None
+        extra_keys = set(after) - set(before)
+        if not extra_keys or not extra_keys.issubset(allowed_new):
+            return None
+        added_metadata = True
+
+    if not added_metadata or len(used_new) != len(new_templates):
+        return None
+
+    def outer_text(value):
+        value = pattern.sub("{{CITAR_WEB}}", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    if outer_text(old) != outer_text(new):
+        return None
+    return {
+        "factor": 0.25,
+        "reason": "preenchimento de metadados em referência existente; URL preservada",
+    }
+
+
 def reference_removal_priority_adjustment(change, diff):
     """Sinal contextual, não prova de vandalismo; só referências inteiras removidas."""
     if change.get("type") == "new":
@@ -9976,7 +10158,7 @@ def orthographic_priority_adjustment(diff):
              if op != "equal"]
     if not 1 <= len(edits) <= 3 or any(max(len(a), len(b)) > 3 for a, b in edits):
         return None
-    return {"factor": 0.85, "reason": "correção mínima de pontuação/acentuação; conferir contexto"}
+    return {"factor": 0.35, "reason": "ajuste mínimo de pontuação/acentuação; sem mudança de conteúdo"}
 
 
 def equivalent_wikimarkup_priority_adjustment(diff):
@@ -10046,7 +10228,7 @@ def minimal_text_priority_adjustment(diff):
             )
     if one_character_edit:
         return {
-            "factor": 0.70,
+            "factor": 0.40,
             "reason": "troca isolada de uma letra entre palavras; sem outros sinais suspeitos",
         }
     return None
@@ -10111,6 +10293,37 @@ def contextual_prose_addition_adjustment(change, diff):
     return {"factor": 0.85, "reason": "acréscimo curto de prosa contextual; fatos não verificados"}
 
 
+def own_user_page_help_intent_adjustment(change, diff):
+    """Reduz risco em autodescrição benigna de intenção de colaborar na Wiki."""
+    title = str(change.get("title") or "").replace("_", " ").strip()
+    user = str(change.get("user") or "").replace("_", " ").strip()
+    folded_title = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode().casefold()
+    if ":" not in folded_title or not user:
+        return None
+    namespace, page_name = folded_title.split(":", 1)
+    if namespace not in {"usuario", "usuaria", "usuario(a)"}:
+        return None
+    owner = page_name.split("/", 1)[0].strip().casefold()
+    normalized_user = unicodedata.normalize("NFKD", user).encode("ascii", "ignore").decode().casefold()
+    if owner != normalized_user:
+        return None
+    added = str(diff.get("added") or "")
+    removed = str(diff.get("removed") or "")
+    if not added or len(added) > 1800:
+        return None
+    if count_external_links(added + removed):
+        return None
+    if max(profanity_score(added), repetition_score(added), nonsense_score(added)) >= 0.75:
+        return None
+    if re.search(r"(?:compre|contrate|patrocinad[oa]|whatsapp|instagram|telegram\.me|javascript:|<script)", added, re.I):
+        return None
+    intent = re.search(r"\b(?:planeja|pretende|espera|quer|deseja)\s+(?:ajudar|contribuir|colaborar)\b", added, re.I)
+    wiki_work = re.search(r"\b(?:wikipedia|wiki|vandalismo|manuten[cç][aã]o de artigos|artigos)\b", added, re.I)
+    if intent and wiki_work:
+        return {"factor": 0.30, "reason": "autodescrição benigna na própria página de usuário; intenção de colaborar"}
+    return None
+
+
 def contextual_priority_calibration(change, diff, strong_signals):
     """Conservative contextual discount; never stacks with other discounts."""
     if change.get("type") == "new" or strong_signals:
@@ -10119,6 +10332,9 @@ def contextual_priority_calibration(change, diff, strong_signals):
     folded = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode().casefold()
     added = str(diff.get("added") or "")
     removed = str(diff.get("removed") or "")
+    own_page_intent = own_user_page_help_intent_adjustment(change, diff)
+    if own_page_intent:
+        return own_page_intent
     # User pages: only literal punctuation/accent edits, no new links or promotion.
     if folded.startswith(("usuario:", "usuaria:", "usuario(a):")) and not folded.startswith(("usuario discussao:", "usuaria discussao:")):
         adjustment = orthographic_priority_adjustment(diff)
@@ -10132,7 +10348,7 @@ def contextual_priority_calibration(change, diff, strong_signals):
         return None
     body = discussion_comment_body(added)
     if (not looks_like_signed_discussion_comment(added) or len(body) < 12
-            or count_external_links(body) or max(profanity_score(body), repetition_score(body), nonsense_score(body)) >= 0.75
+            or count_external_links(body) > 1 or max(profanity_score(body), repetition_score(body), nonsense_score(body)) >= 0.75
             or re.search(r"(?:www\.|\b(?:compre|contrate|patrocinad[oa]|whatsapp|instagram)\b)", body, re.I)):
         return None
     help_page = any(x in folded for x in (
@@ -10142,8 +10358,8 @@ def contextual_priority_calibration(change, diff, strong_signals):
         r"sou nov[oa]|como faco|como faço|agradeco sugestoes|agradeço sugestões|"
         r"avaliacao|avaliação|podem me ajudar|alguma duvida|alguma dúvida)\b", body, re.I))
     if help_page and help_request:
-        return {"factor": 0.70, "reason": "pedido de ajuda assinado em espaço comunitário"}
-    return {"factor": 0.70, "reason": "comentário assinado em espaço de discussão"}
+        return {"factor": 0.20, "reason": "relato ou pedido benigno assinado em espaço comunitário/de ajuda"}
+    return {"factor": 0.20, "reason": "comentário assinado e sem sinais suspeitos em página de discussão"}
 
 
 def benign_technical_change(diff):
@@ -10247,6 +10463,7 @@ def is_discussion_namespace(change):
     normalized = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode().casefold()
     discussion_help = (
         "ajuda:tire suas duvidas",
+        "ajuda:informe um erro",
         "ajuda:contato/fale com a wikipedia",
     )
     if any(normalized == prefix or normalized.startswith(prefix + "/") for prefix in discussion_help):
@@ -10345,11 +10562,12 @@ def contextual_discussion_adjustment(change, diff, strong_signals):
         links = count_external_links(body)
         body_signals = max(profanity_score(body), repetition_score(body), nonsense_score(body))
         if (not removed.strip() and strong_signals == 0 and body_signals < 0.75
-                and links == 0 and len(body) >= 12):
+                and links <= 1 and len(body) >= 12
+                and not re.search(r"(?:compre|contrate|patrocinad[oa]|whatsapp|telegram\.me)", body, re.I)):
             return {
-                "multiplier": 0.35,
+                "multiplier": 0.15,
                 "additive": 0.0,
-                "reason": "comentário assinado e construtivo em espaço de conversa, sem remoções nem sinais fortes",
+                "reason": "comentário assinado e sem sinais suspeitos em espaço de conversa",
                 "kind": "talk_signed_append",
             }
         # Não aplica redutor genérico a edições com remoções ou links externos.
@@ -10604,10 +10822,13 @@ def analyze_vandalism(change, diff, revert_risk):
         cosmetic_adjustment = (date_placeholder_priority_adjustment(diff)
                                or link_disambiguation
                                or wikilink_removal_priority_adjustment(diff)
+                               or reference_template_completion_priority_adjustment(diff)
                                or reference_addition_priority_adjustment(diff)
+                               or routine_media_priority_adjustment(diff)
                                or infobox_media_priority_adjustment(diff)
                                or template_reformat_priority_adjustment(diff)
                                or template_parameter_priority_adjustment(diff)
+                               or template_single_value_priority_adjustment(change, diff)
                                or numeric_small_change_priority_adjustment(diff)
                                or whitespace_only_priority_adjustment(diff)
                                or reference_date_priority_adjustment(diff)
