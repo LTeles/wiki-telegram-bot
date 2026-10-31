@@ -15594,6 +15594,64 @@ def reconcile_high_risk_manual_reviews():
     return changed
 
 
+HIGH_RISK_HOURLY_RECONCILE_SECONDS = 3600
+
+
+def reconcile_recent_high_risk_daily_pages():
+    """Hourly repair of the seven newest daily archives, even without new alerts.
+
+    Compare the actual wiki content, not only the local published-hash cache.
+    This detects missed edits and out-of-band changes without generating no-op edits.
+    """
+    if not high_risk_publish_enabled() or high_risk_writing_paused():
+        return 0
+    sync_high_risk_archive()
+    records = ptwiki_publishable_high_risk_records()
+    days = high_risk_archive_days(records)[-7:]
+    queued = 0
+    for day in days:
+        title = WIKI_HIGH_RISK_ARCHIVE_PREFIX + day
+        expected = build_high_risk_daily_wikitext(
+            day, [record for record in records if record.get("archive_date") == day]
+        )
+        try:
+            response = requests.get(
+                WIKIPEDIA_API,
+                params={"action": "query", "format": "json", "formatversion": 2,
+                        "prop": "revisions", "titles": title,
+                        "rvprop": "content", "rvslots": "main"},
+                headers=HEADERS, timeout=25,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get("error"):
+                raise RuntimeError(str(data["error"]))
+            pages = data.get("query", {}).get("pages", [])
+            if len(pages) != 1:
+                raise RuntimeError("Resposta inesperada da API")
+            page = pages[0]
+            revisions = page.get("revisions") or []
+            current = (revisions[0].get("slots", {}).get("main", {}).get("content")
+                       if revisions else None)
+            if current is None and not page.get("missing"):
+                raise RuntimeError("Conteúdo remoto indisponível")
+            if current == expected:
+                # The local hash may be stale; do not rewrite an identical page.
+                continue
+            # Clear stale local hash so a missed publication can be retried.
+            with WIKI_WRITE_LOCK:
+                state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": []})
+                state.setdefault("published_hashes", {}).pop(title, None)
+                atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+            if queue_high_risk_wiki_edit(
+                title, expected, "Sincronizando estado das revisões de alto risco",
+            ):
+                queued += 1
+        except Exception as exc:
+            print("⚠️ Reconciliação horária do arquivo", day, safe_exception(exc))
+    return queued
+
+
 def queue_high_risk_wiki_pages():
     if not high_risk_publish_enabled():
         return False
@@ -15704,6 +15762,7 @@ def testwiki_write_once():
 
 def ptwiki_high_risk_worker():
     last_manual_review_check = 0.0
+    last_archive_reconcile = 0.0
     while True:
         try:
             if time.time() - last_manual_review_check >= HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS:
@@ -15712,6 +15771,10 @@ def ptwiki_high_risk_worker():
                 last_manual_review_check = time.time()
             process_due_high_risk_candidates()
             queue_high_risk_wiki_pages()
+            if time.time() - last_archive_reconcile >= HIGH_RISK_HOURLY_RECONCILE_SECONDS:
+                # Retry on next loop if the scan itself fails.
+                reconcile_recent_high_risk_daily_pages()
+                last_archive_reconcile = time.time()
         except Exception as exc:
             print("⚠️ Lista de alto risco da ptwiki:", safe_exception(exc))
         time.sleep(30)
