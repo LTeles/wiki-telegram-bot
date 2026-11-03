@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.39"
-BOT_BUILD = "3.39-false-positive-calibration-discussions-and-routine-edits"
+BOT_VERSION = "3.40"
+BOT_BUILD = "3.40-high-risk-review-summary"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -143,6 +143,7 @@ WIKI_STATUS_TITLE = "Usuário:TelesGramBot/Status"
 WIKI_STATISTICS_TITLE = "Usuário:TelesGramBot/Estatísticas"
 WIKI_ADJUSTMENTS_TITLE = "Usuário:TelesGramBot/Ajustes"
 WIKI_HIGH_RISK_TITLE = "Usuário:TelesGramBot/Edições de alto risco"
+WIKI_HIGH_RISK_SUMMARY_TITLE = "Usuário:TelesGramBot/Resumo_edicoes_de_alto_risco"
 WIKI_HIGH_RISK_ARCHIVE_PREFIX = WIKI_HIGH_RISK_TITLE + "/"
 WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Arquivo"
 WIKI_HIGH_RISK_HEADER_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Cabeçalho"
@@ -1632,6 +1633,7 @@ def wiki_high_risk_title_is_allowed(title):
     """Allow only the fixed high-risk pages and ISO-dated daily archives."""
     if title in {
         WIKI_HIGH_RISK_TITLE,
+        WIKI_HIGH_RISK_SUMMARY_TITLE,
         WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE,
         WIKI_HIGH_RISK_HEADER_TITLE,
         WIKI_HIGH_RISK_MANUAL_TITLE,
@@ -2672,6 +2674,7 @@ WIKI_RELEASE_NOTES = {
     "3.37": "Mantém por sete dias os dados necessários para marcar falsos positivos de alto risco, recupera registros pela cópia persistente e encerra a ação após o prazo.",
     "3.38": "Calibra falsos positivos em comentários assinados, alterações mínimas de texto, referências, wikitexto e mídia em infocaixas.",
     "3.39": "Reduz o risco de comentários benignos em páginas de discussão e de ajuda, edições inocuas na própria página de usuário, ajustes mínimos de pontuação e números em predefinições; reconhece imagens comuns no corpo do artigo e o preenchimento de dados em referências. Registra estas calibrações em /Ajustes e no anúncio do Telegram.",
+    "3.40": "Publica um resumo dos cards pendentes da página principal de alto risco, separado nas faixas 81–89%, 90–94% e ≥95%, com atualização quando os totais mudam.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -13892,8 +13895,8 @@ PTWIKI_HIGH_RISK_MODE = os.environ.get("PTWIKI_HIGH_RISK_MODE", "shadow").strip(
 if PTWIKI_HIGH_RISK_MODE not in {"off", "shadow", "publish"}:
     PTWIKI_HIGH_RISK_MODE = "shadow"
 WIKI_HIGH_RISK_THRESHOLD = 0.80
-WIKI_HIGH_RISK_DELAY_SECONDS = 30 * 60
-WIKI_HIGH_RISK_WRITE_INTERVAL_SECONDS = 30
+WIKI_HIGH_RISK_DELAY_SECONDS = 2 * 60 * 60
+WIKI_HIGH_RISK_WRITE_INTERVAL_SECONDS = 121
 WIKI_HIGH_RISK_RETRY_SECONDS = 15 * 60
 WIKI_HIGH_RISK_DECISION_RETENTION_SECONDS = 30 * 24 * 60 * 60
 HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS = 60
@@ -13923,6 +13926,8 @@ HIGH_RISK_ARCHIVE_FILE = data_path("ptwiki_high_risk_archive.json")
 HIGH_RISK_CANDIDATES_FILE = data_path("ptwiki_high_risk_candidates_v1.json")
 HIGH_RISK_WRITE_CONTROL_FILE = data_path("ptwiki_high_risk_write_control.json")
 HIGH_RISK_WRITE_LOCK = threading.RLock()
+HIGH_RISK_SUMMARY_STATE_FILE = data_path("ptwiki_high_risk_summary_state.json")
+HIGH_RISK_SUMMARY_STATE_LOCK = threading.Lock()
 high_risk_archive = {}
 high_risk_archive_lock = threading.RLock()
 high_risk_candidates_lock = threading.RLock()
@@ -15047,6 +15052,8 @@ def prepare_high_risk_write_item(item):
     if title == WIKI_HIGH_RISK_TITLE:
         prepared["text"] = build_high_risk_wikitext()
         prepared["publication_revision_ids"] = ready
+    elif title == WIKI_HIGH_RISK_SUMMARY_TITLE:
+        prepared["text"] = build_high_risk_summary_wikitext()
     elif title == WIKI_HIGH_RISK_HEADER_TITLE:
         prepared["text"] = build_high_risk_header_wikitext(archived)
     elif title == WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE:
@@ -15122,7 +15129,8 @@ def ptwiki_publishable_high_risk_records():
         ]
 
 
-def build_high_risk_wikitext(now=None):
+def current_high_risk_main_page_records(now=None):
+    """Records meeting the same pending and 24-hour rules used by the main page."""
     records = ptwiki_publishable_high_risk_records()
     if now is None:
         now = time.time()
@@ -15141,16 +15149,53 @@ def build_high_risk_wikitext(now=None):
             ts = float(record.get("posted_at") or 0)
         return ts >= cutoff
 
-    visible = [
+    return [
         record for record in records
         if high_risk_action(record)[0] is None and main_page_record_is_recent(record)
     ]
+
+
+def build_high_risk_wikitext(now=None):
+    visible = current_high_risk_main_page_records(now=now)
     return build_high_risk_page(
         visible,
         "Edições com alto risco de erro",
         "Esta lista inclui edições da Wikipédia em português com risco "
         f"superior a {WIKI_HIGH_RISK_THRESHOLD:.0%}.",
     )
+
+
+def _high_risk_summary_updated_at(counts, now=None):
+    """Keep the timestamp stable until a bucket count changes."""
+    if now is None:
+        now = time.time()
+    snapshot = {key: int(counts.get(key, 0)) for key in ("amarelo", "laranja", "vermelho")}
+    with HIGH_RISK_SUMMARY_STATE_LOCK:
+        state = load_json(HIGH_RISK_SUMMARY_STATE_FILE, {})
+        if not isinstance(state, dict) or state.get("counts") != snapshot or not state.get("atualizado"):
+            updated = datetime.fromtimestamp(float(now), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            atomic_write_json(HIGH_RISK_SUMMARY_STATE_FILE, {"counts": snapshot, "atualizado": updated})
+            return updated
+        return str(state["atualizado"])
+
+
+def build_high_risk_summary_wikitext(now=None):
+    """Raw JSON consumed by Selet; counts match the visible pending main-page cards."""
+    records = select_high_risk_records(current_high_risk_main_page_records(now=now))
+    counts = {"amarelo": 0, "laranja": 0, "vermelho": 0}
+    for record in records:
+        try:
+            shown_percent = int(round(float(record.get("revert_risk")) * 100))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 81 <= shown_percent <= 89:
+            counts["amarelo"] += 1
+        elif 90 <= shown_percent <= 94:
+            counts["laranja"] += 1
+        elif shown_percent >= 95:
+            counts["vermelho"] += 1
+    payload = {**counts, "atualizado": _high_risk_summary_updated_at(counts, now=now)}
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
 def build_high_risk_daily_wikitext(day, records):
@@ -15666,6 +15711,13 @@ def queue_high_risk_wiki_pages():
         priority=True,
         publication_revision_ids=publication_ids,
     )
+    # Enqueue the machine-readable totals after the main page so it is published
+    # only when its counts actually differ from the last published data.
+    queued_any = queue_high_risk_wiki_edit(
+        WIKI_HIGH_RISK_SUMMARY_TITLE,
+        build_high_risk_summary_wikitext(),
+        "Atualizando totais pendentes de alto risco",
+    ) or queued_any
     # Priority inserts at the head. Enqueue in reverse dependency order so a
     # first deployment creates the template and header before the main page.
     queued_any = queue_high_risk_wiki_edit(
