@@ -9506,6 +9506,12 @@ BAD_WORDS = [
     "otário",
     "otario",
     "vagabundo",
+    "puta",
+    "viado",
+    "nigger",
+    "buceta",
+    "tomar no cu",
+    "arrombado",
 ]
 
 
