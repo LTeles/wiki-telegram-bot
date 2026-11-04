@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.41"
-BOT_BUILD = "3.41-high-risk-card-buttons"
+BOT_VERSION = "3.43"
+BOT_BUILD = "3.43-selet-primary-row"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2676,6 +2676,8 @@ WIKI_RELEASE_NOTES = {
     "3.39": "Reduz o risco de comentários benignos em páginas de discussão e de ajuda, edições inocuas na própria página de usuário, ajustes mínimos de pontuação e números em predefinições; reconhece imagens comuns no corpo do artigo e o preenchimento de dados em referências. Registra estas calibrações em /Ajustes e no anúncio do Telegram.",
     "3.40": "Publica um resumo dos cards pendentes da página principal de alto risco, separado nas faixas 81–89%, 90–94% e ≥95%, com atualização quando os totais mudam.",
     "3.41": "Reorganiza os cartões de alto risco com o título separado dos atalhos e botões alinhados em espaços iguais, com cores distintas para Diff, Histórico, Discussão, Contribuições e Bloquear.",
+    "3.42": "Move a montagem dos botões para a predefinição dos cartões, usa ligações internas e oculta o indicador externo no botão de bloqueio, mantendo o usuário pré-preenchido.",
+    "3.43": "Move Discussão e Contribuições para a segunda fileira e coloca Ações do Selet como terceiro botão da primeira fileira, mantendo a integração funcional e o padrão visual verde do Selet.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -2744,6 +2746,12 @@ def queue_current_adjustments_log():
         ],
         "3.41": [
             ("#3366cc", "🖥️", "WIKI-UI", "CHANGED", "Cards de alto risco recebem atalhos em botões alinhados, com cores próprias e sem depender do tamanho do título."),
+        ],
+        "3.42": [
+            ("#3366cc", "🖥️", "WIKI-UI", "CHANGED", "A predefinição centraliza os botões e remove o indicador externo sem perder o usuário pré-preenchido no formulário de bloqueio."),
+        ],
+        "3.43": [
+            ("#14866d", "S", "SELET", "CHANGED", "Ações do Selet passa à primeira fileira; Discussão e Contribuições ficam apenas junto às ações da conta."),
         ],
     }
     specs = version_entries.get(BOT_VERSION, [
@@ -14366,16 +14374,6 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
     username = str(record.get("username") or "Desconhecido")
     title = str(record.get("title") or "Sem título")
     risk = float(record.get("revert_risk") or 0)
-    encoded_user = quote(username.replace(" ", "_"), safe="")
-    encoded_title = quote(title.replace(" ", "_"), safe="/:()")
-    article_link = f"[https://pt.wikipedia.org/wiki/{encoded_title} {wiki_safe_text(title)}]"
-    diff_url = f"https://pt.wikipedia.org/w/index.php?diff={revision_id}"
-    history_url = f"https://pt.wikipedia.org/w/index.php?title={encoded_title}&action=history"
-    user_url = f"https://pt.wikipedia.org/wiki/Usu%C3%A1rio:{encoded_user}"
-    talk_url = f"https://pt.wikipedia.org/wiki/Usu%C3%A1rio_Discuss%C3%A3o:{encoded_user}"
-    contributions_url = f"https://pt.wikipedia.org/wiki/Especial:Contribui%C3%A7%C3%B5es/{encoded_user}"
-    block_url = f"https://pt.wikipedia.org/wiki/Especial:Bloquear/{encoded_user}"
-
     revision_timestamp = record.get("revision_timestamp")
     try:
         if isinstance(revision_timestamp, (int, float)):
@@ -14393,11 +14391,8 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         compact_time = ""
 
     byte_delta = record.get("byte_delta")
-    byte_inline = ""
     if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool):
         byte_delta = int(byte_delta)
-        byte_color = "#14866d" if byte_delta > 0 else "#b32424" if byte_delta < 0 else "#54595d"
-        byte_inline = f' <span style="color:{byte_color}">({byte_delta:+d} bytes)</span>' 
 
     risk_badge_bg = "#b32424" if risk > 0.95 else "#ac6600"
     risk_badge = (
@@ -14411,47 +14406,6 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
            f'color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">'
            f'{compact_time}</span>' if compact_time else "")
         + '</div>'
-    )
-
-    def action_button(url, label, background, border):
-        return (
-            f'[{url} <span style="display:block; width:100%; box-sizing:border-box; '
-            f'padding:0.42em 0.35em; border:1px solid {border}; border-radius:4px; '
-            f'background:{background}; color:#fff; font-weight:bold; text-align:center; '
-            f'line-height:1.15; white-space:nowrap">{label}</span>]'
-        )
-
-    def button_table(buttons):
-        cell_width = 100 / len(buttons)
-        cells = "".join(
-            f'<td style="width:{cell_width:.4g}%; padding:0.18em">{button}</td>'
-            for button in buttons
-        )
-        return (
-            '<table style="width:100%; table-layout:fixed; border-collapse:separate; '
-            f'border-spacing:0"><tr>{cells}</tr></table>'
-        )
-
-    article_buttons = button_table([
-        action_button(diff_url, "Diff", "#3366cc", "#2a4b8d"),
-        action_button(history_url, "Histórico", "#72777d", "#54595d"),
-        action_button(talk_url, "Discussão", "#72538c", "#563b70"),
-        action_button(contributions_url, "Contribuições", "#14866d", "#0f6b56"),
-    ])
-    account_buttons = button_table([
-        action_button(talk_url, "Discussão", "#72538c", "#563b70"),
-        action_button(contributions_url, "Contribuições", "#14866d", "#0f6b56"),
-        action_button(block_url, "Bloquear", "#b32424", "#8f1d1d"),
-    ])
-    first_line = (
-        '<div style="padding-right:5.2em; margin-bottom:0.3em">'
-        f'<small>Artigo:</small> <b>{article_link}</b>{byte_inline}</div>'
-        f'<div style="padding-right:5.2em">{article_buttons}</div>'
-    )
-    user_line = (
-        '<div style="padding-right:5.2em; margin-top:0.35em">'
-        f'<small>Conta: [{user_url} {wiki_safe_text(username)}]</small></div>'
-        f'<div style="padding-right:5.2em">{account_buttons}</div>'
     )
 
     preview = high_risk_diff_excerpt(record)
@@ -14499,7 +14453,8 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         + f"|reviewer={tpl(wiki_safe_text(record.get('manual_reviewer') or ''))}|timestamp={tpl(revision_iso)}"
         + f"|falsepos_available={'1' if false_positive_available else '0'}|falsepos_until={tpl(false_positive_until)}"
         + f"|background={tpl(background)}|risk_bg={tpl(risk_badge_bg)}|risk={risk:.0%}|date={tpl(compact_time)}"
-        + f"|first_line={tpl(first_line)}|user_line={tpl(user_line)}|preview={tpl(preview)}"
+        + f"|article_title={tpl(wiki_safe_text(title))}|username={tpl(wiki_safe_text(username))}"
+        + f"|byte_delta={tpl(int(byte_delta) if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool) else '')}|preview={tpl(preview)}"
         + f"|state={tpl(status_text)}|account_state={tpl(wiki_safe_text(record.get('account_block_state')) if record.get('account_block_state') else '')}"
         + f"|pattern={tpl(pattern_line)}|timer_timestamp={tpl(revision_iso)}}}}}"
     )
@@ -14536,8 +14491,71 @@ def high_risk_header_transclusion():
 
 
 def build_high_risk_entry_template_wikitext():
-    return '<div class="telesgram-high-risk-entry" data-telesgram-revid="{{{revid|}}}" data-telesgram-status="{{{status|pending}}}" data-telesgram-reviewer="{{{reviewer|}}}" data-telesgram-timestamp="{{{timestamp|}}}" data-telesgram-falsepos-available="{{{falsepos_available|0}}}" data-telesgram-falsepos-until="{{{falsepos_until|}}}" style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; border-radius:4px; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; margin:0.35em 0 0.85em 0; line-height:1.35; overflow:hidden; box-shadow:0 2px 2px rgba(0,0,0,.08)">\n<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.90em; width:4.35em; text-align:center; box-sizing:border-box"><span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; display:flex; align-items:center; justify-content:center; box-sizing:border-box; border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>\n{{{first_line|}}}<br>{{{user_line|}}}<br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}\n<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>\n{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none"><span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}\n</div><noinclude>Estrutura reutilizável dos cartões de [[Usuário:TelesGramBot/Edições de alto risco]]. Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
-
+    return (
+        '<div class="telesgram-high-risk-entry" '
+        'data-telesgram-revid="{{{revid|}}}" '
+        'data-telesgram-status="{{{status|pending}}}" '
+        'data-telesgram-reviewer="{{{reviewer|}}}" '
+        'data-telesgram-timestamp="{{{timestamp|}}}" '
+        'data-telesgram-falsepos-available="{{{falsepos_available|0}}}" '
+        'data-telesgram-falsepos-until="{{{falsepos_until|}}}" '
+        'style="position:relative; background:{{{background|#fff}}}; border:1px solid #a2a9b1; '
+        'border-radius:4px; padding:0.55em 6.5em 0.55em 0.75em; min-height:6.2em; '
+        'margin:0.35em 0 0.85em 0; line-height:1.35; overflow:hidden; '
+        'box-shadow:0 2px 2px rgba(0,0,0,.08)">'
+        '<div class="telesgram-risk-column" style="position:absolute; top:0.45em; right:0.90em; '
+        'width:4.35em; text-align:center; box-sizing:border-box">'
+        '<span class="telesgram-risk-badge" style="width:3.55em; height:3.55em; margin:0 auto; '
+        'display:flex; align-items:center; justify-content:center; box-sizing:border-box; '
+        'border:1px solid rgba(0,0,0,.22); border-radius:4px; background:{{{risk_bg|#ac6600}}}; '
+        'color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>'
+        '{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; '
+        'color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>'
+        '<div style="padding-right:5.2em; margin-bottom:0.3em">'
+        '<small>Artigo:</small> <b>[[{{{article_title|}}}|{{{article_title|}}}]]</b>'
+        '{{#if:{{{byte_delta|}}}| <span style="color:{{#ifexpr:{{{byte_delta}}} > 0|#14866d|'
+        '{{#ifexpr:{{{byte_delta}}} < 0|#b32424|#54595d}}}}">'
+        '({{#ifexpr:{{{byte_delta}}} > 0|+}}{{{byte_delta}}} bytes)</span>}}</div>'
+        '<table style="width:100%; max-width:100%; table-layout:fixed; border-collapse:separate; '
+        'border-spacing:0"><tr>'
+        '<td style="width:33.33%; padding:0.18em; box-sizing:border-box">[[Special:Diff/{{{revid|}}}|'
+        '<span style="display:block; width:100%; box-sizing:border-box; padding:0.42em 0.35em; '
+        'border:1px solid #2a4b8d; border-radius:4px; background:#3366cc; color:#fff; '
+        'font-weight:bold; text-align:center; line-height:1.15; white-space:nowrap">Diff</span>]]</td>'
+        '<td style="width:33.33%; padding:0.18em; box-sizing:border-box">[[Special:History/{{{article_title|}}}|'
+        '<span style="display:block; width:100%; box-sizing:border-box; padding:0.42em 0.35em; '
+        'border:1px solid #54595d; border-radius:4px; background:#72777d; color:#fff; '
+        'font-weight:bold; text-align:center; line-height:1.15; white-space:nowrap">Histórico</span>]]</td>'
+        '<td style="width:33.33%; padding:0.18em; box-sizing:border-box"><div class="telesgram-selet-slot"></div></td>'
+        '</tr></table>'
+        '<div style="padding-right:5.2em; margin-top:0.35em"><small>Conta: '
+        '[[User:{{{username|}}}|{{{username|}}}]]</small></div>'
+        '<table style="width:100%; max-width:100%; table-layout:fixed; border-collapse:separate; '
+        'border-spacing:0"><tr>'
+        '<td style="width:33.33%; padding:0.18em; box-sizing:border-box">[[User talk:{{{username|}}}|'
+        '<span style="display:block; width:100%; box-sizing:border-box; padding:0.42em 0.35em; '
+        'border:1px solid #563b70; border-radius:4px; background:#72538c; color:#fff; '
+        'font-weight:bold; text-align:center; line-height:1.15; white-space:nowrap">Discussão</span>]]</td>'
+        '<td style="width:33.33%; padding:0.18em; box-sizing:border-box">[[Special:Contributions/{{{username|}}}|'
+        '<span style="display:block; width:100%; box-sizing:border-box; padding:0.42em 0.35em; '
+        'border:1px solid #0f6b56; border-radius:4px; background:#14866d; color:#fff; '
+        'font-weight:bold; text-align:center; line-height:1.15; white-space:nowrap">Contribuições</span>]]</td>'
+        '<td style="width:33.33%; padding:0.18em; box-sizing:border-box"><span class="plainlinks">'
+        '[{{fullurl:Special:Block|wpTarget={{urlencode:{{{username|}}}}}}} '
+        '<span style="display:block; width:100%; box-sizing:border-box; padding:0.42em 0.35em; '
+        'border:1px solid #8f1d1d; border-radius:4px; background:#b32424; color:#fff; '
+        'font-weight:bold; text-align:center; line-height:1.15; white-space:nowrap">Bloquear</span>]</span></td>'
+        '</tr></table><br>{{#if:{{{preview|}}}|{{{preview}}}<br>}}'
+        '<div style="display:flex; align-items:baseline; justify-content:space-between; gap:1em; '
+        'flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>'
+        '{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">'
+        '\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>'
+        '{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}'
+        '{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none">'
+        '<span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}'
+        '</div><noinclude>Estrutura reutilizável dos cartões de [[Usuário:TelesGramBot/Edições de alto risco]]. '
+        'Gerenciada automaticamente pelo TelesGramBot.</noinclude>'
+    )
 
 def build_high_risk_page(records, heading, introduction, include_dynamic_learning=True):
     eligible = select_high_risk_records(records)
