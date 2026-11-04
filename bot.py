@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.40"
-BOT_BUILD = "3.40-high-risk-review-summary"
+BOT_VERSION = "3.41"
+BOT_BUILD = "3.41-high-risk-card-buttons"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2675,6 +2675,7 @@ WIKI_RELEASE_NOTES = {
     "3.38": "Calibra falsos positivos em comentários assinados, alterações mínimas de texto, referências, wikitexto e mídia em infocaixas.",
     "3.39": "Reduz o risco de comentários benignos em páginas de discussão e de ajuda, edições inocuas na própria página de usuário, ajustes mínimos de pontuação e números em predefinições; reconhece imagens comuns no corpo do artigo e o preenchimento de dados em referências. Registra estas calibrações em /Ajustes e no anúncio do Telegram.",
     "3.40": "Publica um resumo dos cards pendentes da página principal de alto risco, separado nas faixas 81–89%, 90–94% e ≥95%, com atualização quando os totais mudam.",
+    "3.41": "Reorganiza os cartões de alto risco com o título separado dos atalhos e botões alinhados em espaços iguais, com cores distintas para Diff, Histórico, Discussão, Contribuições e Bloquear.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -2740,6 +2741,9 @@ def queue_current_adjustments_log():
             ("#7a4e00", "🎯", "RISK-CAL", "CHANGED", "Reduz o risco de comentários benignos em discussões e páginas de ajuda, de edições inocuas na própria página de usuário e de ajustes mínimos de pontuação ou números em predefinições."),
             ("#7a4e00", "🎯", "RISK-CAL", "ADDED", "Reconhece inserção ou troca rotineira de imagens no corpo do artigo e preenchimento de metadados em referências, sem penalizar caracteres repetidos próprios de nomes de arquivos ou código wiki."),
             ("#3366cc", "💬", "TG-WATCH", "CHANGED", "Notas específicas desta calibração passam a constar no anúncio de versão do Telegram."),
+        ],
+        "3.41": [
+            ("#3366cc", "🖥️", "WIKI-UI", "CHANGED", "Cards de alto risco recebem atalhos em botões alinhados, com cores próprias e sem depender do tamanho do título."),
         ],
     }
     specs = version_entries.get(BOT_VERSION, [
@@ -9506,12 +9510,6 @@ BAD_WORDS = [
     "otário",
     "otario",
     "vagabundo",
-    "puta",
-    "viado",
-    "nigger",
-    "buceta",
-    "tomar no cu",
-    "arrombado",
 ]
 
 
@@ -14415,12 +14413,45 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         + '</div>'
     )
 
+    def action_button(url, label, background, border):
+        return (
+            f'[{url} <span style="display:block; width:100%; box-sizing:border-box; '
+            f'padding:0.42em 0.35em; border:1px solid {border}; border-radius:4px; '
+            f'background:{background}; color:#fff; font-weight:bold; text-align:center; '
+            f'line-height:1.15; white-space:nowrap">{label}</span>]'
+        )
+
+    def button_table(buttons):
+        cell_width = 100 / len(buttons)
+        cells = "".join(
+            f'<td style="width:{cell_width:.4g}%; padding:0.18em">{button}</td>'
+            for button in buttons
+        )
+        return (
+            '<table style="width:100%; table-layout:fixed; border-collapse:separate; '
+            f'border-spacing:0"><tr>{cells}</tr></table>'
+        )
+
+    article_buttons = button_table([
+        action_button(diff_url, "Diff", "#3366cc", "#2a4b8d"),
+        action_button(history_url, "Histórico", "#72777d", "#54595d"),
+        action_button(talk_url, "Discussão", "#72538c", "#563b70"),
+        action_button(contributions_url, "Contribuições", "#14866d", "#0f6b56"),
+    ])
+    account_buttons = button_table([
+        action_button(talk_url, "Discussão", "#72538c", "#563b70"),
+        action_button(contributions_url, "Contribuições", "#14866d", "#0f6b56"),
+        action_button(block_url, "Bloquear", "#b32424", "#8f1d1d"),
+    ])
     first_line = (
-        f"<small>Artigo:</small> '''{article_link}''' · [{diff_url} Ver diferenças]{byte_inline} · [{history_url} Histórico]"
+        '<div style="padding-right:5.2em; margin-bottom:0.3em">'
+        f'<small>Artigo:</small> <b>{article_link}</b>{byte_inline}</div>'
+        f'<div style="padding-right:5.2em">{article_buttons}</div>'
     )
     user_line = (
-        f'<small>Conta: [{user_url} {wiki_safe_text(username)}] · [{talk_url} discussão] · '
-        f'[{contributions_url} contribuições] · [{block_url} bloquear]</small>'
+        '<div style="padding-right:5.2em; margin-top:0.35em">'
+        f'<small>Conta: [{user_url} {wiki_safe_text(username)}]</small></div>'
+        f'<div style="padding-right:5.2em">{account_buttons}</div>'
     )
 
     preview = high_risk_diff_excerpt(record)
