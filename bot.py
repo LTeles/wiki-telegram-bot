@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.43"
-BOT_BUILD = "3.43-selet-primary-row"
+BOT_VERSION = "3.44"
+BOT_BUILD = "3.44-wiki-write-rate-cap"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -150,7 +150,10 @@ WIKI_HIGH_RISK_HEADER_TITLE = WIKI_HIGH_RISK_ARCHIVE_PREFIX + "Cabeçalho"
 WIKI_HIGH_RISK_MANUAL_TITLE = "Usuário:TelesGramBot/Revisões manuais"
 WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE = "Usuário:TelesGramBot/Predefinição/Edição de alto risco"
 WIKI_CREATE_ENABLED = True
-WIKI_WRITE_INTERVAL_SECONDS = 60 * 60
+WIKI_WRITE_INTERVAL_SECONDS = 21
+# Intervalo global entre quaisquer duas edições do bot: garante no máximo
+# três escritas em qualquer janela de 60 segundos, inclusive entre filas.
+WIKI_GLOBAL_WRITE_INTERVAL_SECONDS = 21
 WIKI_STATUS_INTERVAL_SECONDS = 6 * 60 * 60
 WIKI_WRITE_QUEUE_FILE = data_path("wiki_write_queue.json")
 WIKI_WRITE_CONTROL_FILE = data_path("wiki_write_control.json")
@@ -1887,10 +1890,19 @@ def wiki_edit_page(title, wikitext, summary, write_class="general"):
     with WIKI_WRITE_LOCK:
         state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
         interval = wiki_write_interval_seconds(write_class)
-        if wiki_writing_paused() or time.time() - wiki_last_attempt(state, write_class) < interval:
+        now = time.time()
+        last_any_attempt = float(
+            state.get("last_any_attempt") or state.get("last_attempt") or 0
+        )
+        if (
+            wiki_writing_paused()
+            or now - wiki_last_attempt(state, write_class) < interval
+            or now - last_any_attempt < WIKI_GLOBAL_WRITE_INTERVAL_SECONDS
+        ):
             return False
         # Reserve the slot BEFORE any remote operation; crashes cannot cause a burst.
-        reserved_at = time.time()
+        reserved_at = now
+        state["last_any_attempt"] = reserved_at
         state.setdefault("last_attempts", {})[write_class] = reserved_at
         if write_class == "general":
             state["last_attempt"] = reserved_at
@@ -1968,12 +1980,19 @@ def process_wiki_write_queue_once():
         if wiki_writing_paused() or not pending:
             return False
         now = time.time()
+        last_any_attempt = float(
+            state.get("last_any_attempt") or state.get("last_attempt") or 0
+        )
+        global_interval_elapsed = (
+            now - last_any_attempt >= WIKI_GLOBAL_WRITE_INTERVAL_SECONDS
+        )
         due = [
             (0 if item.get("write_class") == "high_risk" else 1, index, item)
             for index, item in enumerate(pending)
             if now - wiki_last_attempt(
                 state, item.get("write_class", "general")
             ) >= wiki_write_interval_seconds(item.get("write_class", "general"))
+            and global_interval_elapsed
             and (
                 item.get("write_class") != "high_risk"
                 or not high_risk_writing_paused()
@@ -2077,7 +2096,7 @@ def wiki_write_queue_worker():
             process_wiki_write_queue_once()
         except Exception as exc:
             print("⚠️ Falha no agendador de escrita wiki:", safe_exception(exc))
-        time.sleep(30)
+        time.sleep(5)
 
 
 def community_events_between(start_ts, end_ts):
@@ -2678,6 +2697,7 @@ WIKI_RELEASE_NOTES = {
     "3.41": "Reorganiza os cartões de alto risco com o título separado dos atalhos e botões alinhados em espaços iguais, com cores distintas para Diff, Histórico, Discussão, Contribuições e Bloquear.",
     "3.42": "Move a montagem dos botões para a predefinição dos cartões, usa ligações internas e oculta o indicador externo no botão de bloqueio, mantendo o usuário pré-preenchido.",
     "3.43": "Move Discussão e Contribuições para a segunda fileira e coloca Ações do Selet como terceiro botão da primeira fileira, mantendo a integração funcional e o padrão visual verde do Selet.",
+    "3.44": "Aumenta a frequência das edições do bot e limita globalmente as escritas a no máximo três por minuto.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -2752,6 +2772,9 @@ def queue_current_adjustments_log():
         ],
         "3.43": [
             ("#14866d", "S", "SELET", "CHANGED", "Ações do Selet passa à primeira fileira; Discussão e Contribuições ficam apenas junto às ações da conta."),
+        ],
+        "3.44": [
+            ("#3366cc", "⏱️", "WIKI-RATE", "CHANGED", "As edições de alto risco passam a ser mais frequentes, com limite global de até três edições por minuto."),
         ],
     }
     specs = version_entries.get(BOT_VERSION, [
@@ -13908,7 +13931,7 @@ if PTWIKI_HIGH_RISK_MODE not in {"off", "shadow", "publish"}:
     PTWIKI_HIGH_RISK_MODE = "shadow"
 WIKI_HIGH_RISK_THRESHOLD = 0.80
 WIKI_HIGH_RISK_DELAY_SECONDS = 2 * 60 * 60
-WIKI_HIGH_RISK_WRITE_INTERVAL_SECONDS = 121
+WIKI_HIGH_RISK_WRITE_INTERVAL_SECONDS = 21
 WIKI_HIGH_RISK_RETRY_SECONDS = 15 * 60
 WIKI_HIGH_RISK_DECISION_RETENTION_SECONDS = 30 * 24 * 60 * 60
 HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS = 60
