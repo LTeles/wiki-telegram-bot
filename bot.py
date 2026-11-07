@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.48"
-BOT_BUILD = "3.48-reliable-abuse-filter-delivery-and-observation-controls"
+BOT_VERSION = "3.49"
+BOT_BUILD = "3.49-fix-observation-queue-scope-errors"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2718,6 +2718,7 @@ WIKI_RELEASE_NOTES = {
     "3.46": "Contas com escore final de risco igual ou superior a 98% também iniciam a observação teste das cinco edições seguintes.",
     "3.47": "Restaura o botão Desobservar nas confirmações de observação automática e nos alertas de contas observadas durante uma janela teste.",
     "3.48": "Confirma o envio dos alertas de filtros antes de avançar o cursor, mantém cursores independentes por filtro e pagina o AbuseLog para evitar perdas; restaura o botão Desobservar nas observações automáticas e em contas observadas durante o teste.",
+    "3.49": "Corrige escopo de variáveis na reconciliação de pendências e na montagem dos alertas acompanhados, restaurando as reconciliações e a publicação de alertas com escore de risco.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -7758,18 +7759,6 @@ def reconcile_pending_resolutions():
             ) or time.time(),
         )
 
-    reply_markup = tracked_edit_reply_markup(
-        revision.get("new"),
-        alert_kind=alert_kind,
-    )
-    test_case_id = change.get("_abuse_filter_test_case_id")
-    if test_case_id and alert_kind != "abuse_filter_test":
-        rows = reply_markup.setdefault("inline_keyboard", [])
-        rows.insert(1, [{
-            "text": "🛑 Parar observação teste",
-            "callback_data": f"stoptest:{revision.get('new')}",
-        }])
-
     return {
         "checked": len(items),
         "missing": len(missing_titles),
@@ -11526,6 +11515,20 @@ def tracked_queue_item(
     alert_kind="normal"
 ):
     revision = change.get("revision", {})
+    test_case_id = change.get("_abuse_filter_test_case_id")
+    reply_markup = tracked_edit_reply_markup(
+        revision.get("new"),
+        alert_kind=alert_kind,
+    )
+    if test_case_id and alert_kind not in (
+        "abuse_filter_test",
+        "abuse_filter_test_observed",
+    ):
+        rows = reply_markup.setdefault("inline_keyboard", [])
+        rows.insert(1, [{
+            "text": "🛑 Parar observação teste",
+            "callback_data": f"stoptest:{revision.get('new')}",
+        }])
 
     return {
         "message": message,
