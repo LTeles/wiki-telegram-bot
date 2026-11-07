@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.44"
-BOT_BUILD = "3.44-wiki-write-rate-cap"
+BOT_VERSION = "3.46"
+BOT_BUILD = "3.46-abuse-filter-five-edit-high-risk-trigger"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -269,6 +269,11 @@ ABUSE_FILTER_STATE_FILE = os.environ.get(
     data_path("abuse_filter_state.json")
 )
 
+ABUSE_FILTER_TEST_OBSERVATIONS_FILE = os.environ.get(
+    "ABUSE_FILTER_TEST_OBSERVATIONS_FILE",
+    data_path("abuse_filter_test_observations.json")
+)
+
 POSTED_EDITS_FILE = os.environ.get(
     "POSTED_EDITS_FILE",
     data_path("posted_edits.json")
@@ -346,6 +351,16 @@ abuse_filters_lock = threading.Lock()
 # maior ID de ocorrência do AbuseLog já percorrida
 abuse_filter_state = {"last_log_id": 0}
 abuse_state_lock = threading.Lock()
+
+# Contas acionadas por filtros vigiados entram em observação de teste pelas
+# cinco próximas edições. Casos e revisões são persistidos para detectar uma
+# reversão mesmo depois de reinicializações.
+ABUSE_FILTER_TEST_EDIT_LIMIT = 5
+ABUSE_FILTER_TEST_CASE_RETENTION_SECONDS = 30 * 24 * 60 * 60
+abuse_filter_test_cases = {}
+abuse_filter_test_by_user = {}
+abuse_filter_test_lock = threading.RLock()
+abuse_filter_test_persist_lock = threading.Lock()
 
 # Anti-flood: uma publicação por combinação filtro + usuário a cada 5 min.
 # Ocorrências suprimidas não renovam o cooldown.
@@ -508,6 +523,7 @@ def ensure_storage():
         BOT_VERSION_FILE,
         ABUSE_FILTERS_FILE,
         ABUSE_FILTER_STATE_FILE,
+        ABUSE_FILTER_TEST_OBSERVATIONS_FILE,
         POSTED_EDITS_FILE,
         DETECTION_STATS_FILE,
         PENDING_SUMMARY_STATE_FILE,
@@ -2698,6 +2714,8 @@ WIKI_RELEASE_NOTES = {
     "3.42": "Move a montagem dos botões para a predefinição dos cartões, usa ligações internas e oculta o indicador externo no botão de bloqueio, mantendo o usuário pré-preenchido.",
     "3.43": "Move Discussão e Contribuições para a segunda fileira e coloca Ações do Selet como terceiro botão da primeira fileira, mantendo a integração funcional e o padrão visual verde do Selet.",
     "3.44": "Aumenta a frequência das edições do bot e limita globalmente as escritas a no máximo três por minuto.",
+    "3.45": "Filtros de abuso iniciam observação nas cinco edições seguintes; reversão confirmada inicia observação de seis horas, com botões para observar por seis horas ou encerrar o teste.",
+    "3.46": "Contas com escore final de risco igual ou superior a 98% também iniciam a observação teste das cinco edições seguintes.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -4527,6 +4545,212 @@ def abuse_filter_user_cooldown_allows(filter_id, username, now=None):
         return True
 
 
+def save_abuse_filter_test_observations():
+    with abuse_filter_test_persist_lock:
+        with abuse_filter_test_lock:
+            payload = {
+                "cases": list(abuse_filter_test_cases.values()),
+                "by_user": dict(abuse_filter_test_by_user),
+            }
+        atomic_write_json(ABUSE_FILTER_TEST_OBSERVATIONS_FILE, payload)
+
+
+def load_abuse_filter_test_observations():
+    global abuse_filter_test_cases, abuse_filter_test_by_user
+    data = load_json(ABUSE_FILTER_TEST_OBSERVATIONS_FILE, {})
+    if not isinstance(data, dict):
+        print("⚠️ Formato inválido de abuse_filter_test_observations.json")
+        return
+
+    now = time.time()
+    cases = {}
+    for item in data.get("cases", []):
+        if not isinstance(item, dict) or not item.get("case_id"):
+            continue
+        try:
+            created_at = float(item.get("created_at") or 0)
+            remaining = max(0, min(ABUSE_FILTER_TEST_EDIT_LIMIT, int(item.get("remaining", 0))))
+        except (TypeError, ValueError):
+            continue
+        if now - created_at > ABUSE_FILTER_TEST_CASE_RETENTION_SECONDS:
+            continue
+        cases[str(item["case_id"])] = {
+            **item,
+            "remaining": remaining,
+            "revisions": item.get("revisions") if isinstance(item.get("revisions"), list) else [],
+        }
+
+    by_user = {
+        str(key): str(case_id)
+        for key, case_id in (data.get("by_user") or {}).items()
+        if str(case_id) in cases
+        and cases[str(case_id)].get("active")
+        and cases[str(case_id)].get("remaining", 0) > 0
+    }
+    with abuse_filter_test_lock:
+        abuse_filter_test_cases = cases
+        abuse_filter_test_by_user = by_user
+    print("✅ Casos de observação de teste carregados:", len(cases))
+
+
+def start_abuse_filter_test_observation(
+    username,
+    filter_id,
+    log_id,
+    trigger_revision_id=None,
+    trigger_reason=None,
+):
+    username = str(username or "").strip()
+    key = username_key(username)
+    if not key:
+        return None
+
+    with abuse_filter_test_lock:
+        existing_id = abuse_filter_test_by_user.get(key)
+        existing = abuse_filter_test_cases.get(existing_id) if existing_id else None
+        if existing and existing.get("active") and existing.get("remaining", 0) > 0:
+            return dict(existing)
+
+        case_id = secrets.token_hex(8)
+        item = {
+            "case_id": case_id,
+            "username": username,
+            "filter_id": str(filter_id),
+            "trigger_log_id": str(log_id),
+            "trigger_revision_id": trigger_revision_id,
+            "trigger_reason": trigger_reason or f"Filtro de abuso {filter_id} acionado",
+            "created_at": time.time(),
+            "remaining": ABUSE_FILTER_TEST_EDIT_LIMIT,
+            "active": True,
+            "stopped": False,
+            "revisions": [],
+        }
+        abuse_filter_test_cases[case_id] = item
+        abuse_filter_test_by_user[key] = case_id
+
+    try:
+        save_abuse_filter_test_observations()
+        return dict(item)
+    except Exception as exc:
+        print("⚠️ Erro ao salvar observação de teste:", safe_exception(exc))
+        with abuse_filter_test_lock:
+            abuse_filter_test_cases.pop(case_id, None)
+            if abuse_filter_test_by_user.get(key) == case_id:
+                abuse_filter_test_by_user.pop(key, None)
+        return None
+
+
+def consume_abuse_filter_test_edit(change):
+    username = str(change.get("user") or "").strip()
+    key = username_key(username)
+    if not key:
+        return False
+
+    with abuse_filter_test_lock:
+        case_id = abuse_filter_test_by_user.get(key)
+        item = abuse_filter_test_cases.get(case_id) if case_id else None
+        if not item or not item.get("active") or item.get("remaining", 0) <= 0:
+            return False
+
+        event_revision_id = (change.get("revision") or {}).get("new")
+        try:
+            if (
+                item.get("trigger_revision_id") is not None
+                and int(event_revision_id) == int(item["trigger_revision_id"])
+            ):
+                return False
+        except (TypeError, ValueError):
+            pass
+
+        item["remaining"] = max(0, int(item.get("remaining", 0)) - 1)
+        revision_id = event_revision_id
+        if revision_id is not None:
+            try:
+                item.setdefault("revisions", []).append(int(revision_id))
+            except (TypeError, ValueError):
+                pass
+        if item["remaining"] == 0:
+            item["active"] = False
+            if abuse_filter_test_by_user.get(key) == case_id:
+                abuse_filter_test_by_user.pop(key, None)
+
+        change["_abuse_filter_test_case_id"] = case_id
+        change["_abuse_filter_test_remaining"] = item["remaining"]
+
+    try:
+        save_abuse_filter_test_observations()
+    except Exception as exc:
+        print("⚠️ Erro ao salvar progresso da observação de teste:", safe_exception(exc))
+    return True
+
+
+def stop_abuse_filter_test_observation(case_id):
+    case_id = str(case_id or "")
+    with abuse_filter_test_lock:
+        item = abuse_filter_test_cases.get(case_id)
+        if not item:
+            return False, False
+        changed = not item.get("stopped")
+        item["active"] = False
+        item["stopped"] = True
+        key = username_key(item.get("username"))
+        if abuse_filter_test_by_user.get(key) == case_id:
+            abuse_filter_test_by_user.pop(key, None)
+    try:
+        save_abuse_filter_test_observations()
+        return True, changed
+    except Exception as exc:
+        print("⚠️ Erro ao encerrar observação de teste:", safe_exception(exc))
+        return False, False
+
+
+def get_abuse_filter_test_case(case_id):
+    with abuse_filter_test_lock:
+        item = abuse_filter_test_cases.get(str(case_id or ""))
+        return dict(item) if item else None
+
+
+def abuse_filter_test_reply_markup(case_id):
+    return {
+        "inline_keyboard": [
+            [{
+                "text": "🔎 Observar conta (6h)",
+                "callback_data": f"abuseobserve:{case_id}",
+            }],
+            [{
+                "text": "🛑 Parar observação teste",
+                "callback_data": f"stoptestcase:{case_id}",
+            }],
+        ]
+    }
+
+
+def escalate_abuse_filter_test_case(case_id, username):
+    with abuse_filter_test_lock:
+        item = abuse_filter_test_cases.get(str(case_id or ""))
+        should_escalate = bool(item and not item.get("stopped"))
+        watched_username = (item.get("username") or username) if item else username
+    if not should_escalate:
+        return False
+
+    ok = observe_user(
+        watched_username,
+        reason="Edição observada após acionamento de filtro de abuso foi revertida",
+    )
+    if ok:
+        with abuse_filter_test_lock:
+            item = abuse_filter_test_cases.get(str(case_id or ""))
+            if item:
+                item["active"] = False
+                item["stopped"] = True
+                key = username_key(item.get("username"))
+                if abuse_filter_test_by_user.get(key) == case_id:
+                    abuse_filter_test_by_user.pop(key, None)
+        save_abuse_filter_test_observations()
+        print("🔎 Observação de teste escalada para 6 horas:", watched_username)
+    return ok
+
+
 def abuse_filter_monitor():
     print("✅ Monitor de filtros de abuso iniciado.")
 
@@ -4641,30 +4865,27 @@ def abuse_filter_monitor():
                     )
                     continue
 
-                # Toda conta que gera um alerta publicado de filtro vigiado
-                # entra automaticamente em observação por 6 horas. O anti-flood
-                # é avaliado antes, portanto ocorrências suprimidas não renovam
-                # inadvertidamente a observação.
+                # O anti-flood é avaliado antes; somente um alerta publicado
+                # inicia (ou mantém) a janela das cinco próximas edições.
                 if username:
-                    observation_reason = (
-                        f"Filtro de abuso {filter_id} acionado"
+                    test_case = start_abuse_filter_test_observation(
+                        username, filter_id, log_id, entry.get("revid")
                     )
-                    if not observe_user(
-                        username,
-                        reason=observation_reason,
-                    ):
+                    if not test_case:
                         print(
-                            "⚠️ Não foi possível observar automaticamente:",
+                            "⚠️ Não foi possível iniciar observação de teste:",
                             username,
                             "| filtro:",
                             filter_id
                         )
                     else:
                         print(
-                            "🔎 Conta colocada em observação pelo filtro:",
+                            "🧪 Conta em observação de teste pelas próximas edições:",
                             username,
                             "| filtro:",
-                            filter_id
+                            filter_id,
+                            "| restantes:",
+                            test_case.get("remaining", ABUSE_FILTER_TEST_EDIT_LIMIT),
                         )
 
                 message = format_abuse_filter_message(
@@ -4679,6 +4900,10 @@ def abuse_filter_monitor():
                             f"Filtro de abuso {filter_id}"
                         ),
                         "parse_mode": "HTML",
+                        "reply_markup": (
+                            abuse_filter_test_reply_markup(test_case["case_id"])
+                            if username and test_case else None
+                        ),
                     }
                 )
 
@@ -5729,6 +5954,8 @@ def register_posted_edit(item, telegram_message):
         "parse_mode": item.get("parse_mode"),
         "reply_markup": item.get("reply_markup"),
         "alert_kind": item.get("alert_kind", "normal"),
+        "abuse_filter_test_case_id": item.get("abuse_filter_test_case_id"),
+        "abuse_filter_test_trigger": bool(item.get("abuse_filter_test_trigger")),
         "posted_at": posted_at,
         "status": None,
     }
@@ -6521,7 +6748,7 @@ def message_with_status(record, status, reverter=None, deleter=None, patroller=N
             f"\nRevertido por: {html.escape(str(reverter))}" if reverter else ""
         )
 
-        if record.get("alert_kind") == "observed":
+        if record.get("alert_kind") in ("observed", "abuse_filter_test"):
             remaining_line = observation_remaining_line(
                 record.get("username") or ""
             )
@@ -6823,6 +7050,12 @@ def _process_posted_statuses(
             if new_status == "reverted":
                 reversal_diagnostic("reversao_identificada", revision_id,
                                     origem=reversal_source)
+                test_case_id = record.get("abuse_filter_test_case_id")
+                if test_case_id and not record.get("abuse_filter_test_trigger"):
+                    escalate_abuse_filter_test_case(
+                        test_case_id,
+                        record.get("username") or "",
+                    )
             reverter = None
 
             # Quando a revisão foi revertida, identifica primeiro o autor
@@ -7421,6 +7654,18 @@ def reconcile_pending_resolutions():
                 deletion.get("timestamp")
             ) or time.time(),
         )
+
+    reply_markup = tracked_edit_reply_markup(
+        revision.get("new"),
+        alert_kind=alert_kind,
+    )
+    test_case_id = change.get("_abuse_filter_test_case_id")
+    if test_case_id and alert_kind != "abuse_filter_test":
+        rows = reply_markup.setdefault("inline_keyboard", [])
+        rows.insert(1, [{
+            "text": "🛑 Parar observação teste",
+            "callback_data": f"stoptest:{revision.get('new')}",
+        }])
 
     return {
         "checked": len(items),
@@ -11086,6 +11331,17 @@ def tracked_edit_reply_markup(
                 "callback_data": f"watch:{revision_id}",
             }],
         ]
+    elif alert_kind == "abuse_filter_test":
+        rows = [
+            [{
+                "text": "🔎 Observar conta (6h)",
+                "callback_data": f"observe:{revision_id}",
+            }],
+            [{
+                "text": "🛑 Parar observação teste",
+                "callback_data": f"stoptest:{revision_id}",
+            }],
+        ]
     elif alert_kind == "watched":
         rows = [
             [{
@@ -11170,11 +11426,10 @@ def tracked_queue_item(
         "diff_url": build_diff_url(change),
         "stats_payload": stats_payload,
         "alert_kind": alert_kind,
+        "abuse_filter_test_case_id": test_case_id,
+        "abuse_filter_test_trigger": bool(change.get("_abuse_filter_test_trigger")),
         "parse_mode": "HTML",
-        "reply_markup": tracked_edit_reply_markup(
-            revision.get("new"),
-            alert_kind=alert_kind,
-        ),
+        "reply_markup": reply_markup,
     }
 
 
@@ -11309,7 +11564,33 @@ def analysis_worker():
             username = change.get("user", "")
             title = change.get("title", "")
 
-            # 1. Conta observada
+            # 1. Edição dentro da janela de teste iniciada por filtro.
+            # Tem prioridade sobre uma observação comum para manter os botões
+            # próprios do teste disponíveis no post desta edição.
+            test_case_id = change.get("_abuse_filter_test_case_id")
+            if test_case_id:
+                remaining = change.get("_abuse_filter_test_remaining")
+                test_case = get_abuse_filter_test_case(test_case_id) or {}
+                trigger_reason = test_case.get("trigger_reason") or "filtro de abuso"
+                test_observation = {
+                    "reason": (
+                        f"Observação de teste após {trigger_reason}"
+                        + (f" — {remaining} edição(ões) restante(s)" if remaining is not None else "")
+                    )
+                }
+                message = format_observed_message(change, test_observation)
+                telegram_queue.put(
+                    tracked_queue_item(
+                        change,
+                        message,
+                        f"Observação de teste: {username}",
+                        alert_kind="abuse_filter_test"
+                    )
+                )
+                print("🧪 Edição na janela de teste:", username, "|", title)
+                continue
+
+            # 2. Conta observada
             observation = get_observation(
                 username
             )
@@ -11337,7 +11618,7 @@ def analysis_worker():
                 )
                 continue
 
-            # 2. Página vigiada
+            # 3. Página vigiada
             if is_watched_page(title):
                 # Vigilância explícita prevalece sobre o filtro de administradores.
                 # Edições bot já são descartadas antes deste ponto.
@@ -11360,7 +11641,7 @@ def analysis_worker():
                 )
                 continue
 
-            # 3. Conta temporariamente ignorada
+            # 4. Conta temporariamente ignorada
             # A observação e a página vigiada têm prioridade.
             ignored = get_ignored_user(username)
 
@@ -11373,7 +11654,7 @@ def analysis_worker():
                 )
                 continue
 
-            # 4. Filtro normal de conta
+            # 5. Filtro normal de conta
             if not should_evaluate_user(
                 username
             ):
@@ -11465,6 +11746,26 @@ def analysis_worker():
                 >=
                 VANDALISM_THRESHOLD
             ):
+                if result["score"] >= 0.98:
+                    high_score_case = start_abuse_filter_test_observation(
+                        username,
+                        "score≥98%",
+                        new_revision,
+                        trigger_revision_id=new_revision,
+                        trigger_reason="escore final de risco ≥98%",
+                    )
+                    if high_score_case:
+                        change["_abuse_filter_test_case_id"] = high_score_case["case_id"]
+                        change["_abuse_filter_test_trigger"] = True
+                        print(
+                            "🧪 Observação teste iniciada por escore ≥98%:",
+                            username,
+                            "| revisão:",
+                            new_revision,
+                            "| próximas edições:",
+                            high_score_case.get("remaining", ABUSE_FILTER_TEST_EDIT_LIMIT),
+                        )
+
                 # A publicação wiki segue uma fila independente do Telegram.
                 # O helper aplica o limiar estrito (>80%) e persiste a janela
                 # original de duas horas de forma idempotente.
@@ -12985,12 +13286,60 @@ def process_edit_action_callback(callback):
         )
         return
 
+    if data.startswith(("abuseobserve:", "stoptestcase:")):
+        callback_message = callback.get("message") or {}
+        callback_chat = callback_message.get("chat") or {}
+        if not is_target_channel(callback_chat):
+            answer_callback_query(callback_id, "Este botão só funciona no canal configurado.")
+            return
+        clicker = callback.get("from") or {}
+        clicker_id = clicker.get("id")
+        if not clicker_id or not telegram_user_is_channel_admin(clicker_id):
+            answer_callback_query(callback_id, "Apenas administradores do canal podem usar este botão.")
+            return
+
+        action, case_id = data.split(":", 1)
+        test_case = get_abuse_filter_test_case(case_id)
+        if not test_case:
+            answer_callback_query(callback_id, "Não encontrei esta observação de teste.")
+            return
+        username = str(test_case.get("username") or "").strip()
+        if action == "abuseobserve":
+            if not observe_user(username, reason="Observação solicitada no alerta de filtro de abuso"):
+                answer_callback_query(callback_id, "Não foi possível observar a conta por 6 horas.")
+                return
+            answer_callback_query(callback_id, f"{username} em observação por 6 horas.")
+            send_telegram_message(
+                "🔎 Conta colocada em observação\n\n"
+                f"{user_contributions_link_html(username)}\n"
+                "⏳ Duração: 6 horas",
+                chat_id=TELEGRAM_CHANNEL,
+                parse_mode="HTML",
+            )
+        else:
+            success, stopped = stop_abuse_filter_test_observation(case_id)
+            if not success:
+                answer_callback_query(callback_id, "Não foi possível parar a observação de teste.")
+                return
+            answer_callback_query(
+                callback_id,
+                "Observação de teste encerrada." if stopped else "A observação de teste já estava encerrada.",
+            )
+            if stopped:
+                send_telegram_message(
+                    "🛑 Observação de teste encerrada\n\n"
+                    f"{user_contributions_link_html(username)}",
+                    chat_id=TELEGRAM_CHANNEL,
+                    parse_mode="HTML",
+                )
+        return
+
     if ":" not in data:
         answer_callback_query(callback_id)
         return
 
     action, revision_text = data.split(":", 1)
-    if action not in ("observe", "watch", "unobserve", "unwatch", "resolve", "falsepos", "unfalsepos"):
+    if action not in ("observe", "watch", "unobserve", "unwatch", "stoptest", "resolve", "falsepos", "unfalsepos"):
         answer_callback_query(callback_id)
         return
 
@@ -13044,6 +13393,28 @@ def process_edit_action_callback(callback):
     title = str(record.get("title") or "").strip()
     actor = telegram_person_display_name(clicker)
     actor_html = html.escape(actor) if actor else None
+
+    if action == "stoptest":
+        case_id = record.get("abuse_filter_test_case_id")
+        if not case_id:
+            answer_callback_query(callback_id, "Este post não pertence a uma observação de teste.")
+            return
+        success, stopped = stop_abuse_filter_test_observation(case_id)
+        if not success:
+            answer_callback_query(callback_id, "Não foi possível parar a observação de teste.")
+            return
+        answer_callback_query(
+            callback_id,
+            "Observação de teste encerrada." if stopped else "A observação de teste já estava encerrada.",
+        )
+        if stopped:
+            send_telegram_message(
+                "🛑 Observação de teste encerrada\n\n"
+                f"👤 {user_contributions_link_html(username)}",
+                chat_id=TELEGRAM_CHANNEL,
+                parse_mode="HTML",
+            )
+        return
 
     if action == "unfalsepos":
         revision_id = int(record.get("revision_id") or revision_text)
@@ -13885,6 +14256,11 @@ def wikimedia_loop():
                     last_ptwiki_edit_at = (
                         time.time()
                     )
+
+                # Captura a janela na entrada do EventStream, antes da fila
+                # de análise, para que exatamente as próximas cinco revisões
+                # fiquem marcadas mesmo se o processamento atrasar.
+                consume_abuse_filter_test_edit(change)
 
                 analysis_queue.put(change)
 
@@ -16296,6 +16672,7 @@ def main():
     load_ignored_users()
     load_abuse_filters()
     load_abuse_filter_state()
+    load_abuse_filter_test_observations()
     # O arquivo de alto risco precisa estar em memória antes de posted_edits:
     # ele define a retenção seletiva de 7 dias e recupera registros antigos.
     load_high_risk_archive()
