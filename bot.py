@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.52"
-BOT_BUILD = "3.52-account-command-diagnostics"
+BOT_VERSION = "3.53"
+BOT_BUILD = "3.53-mark-test-stop-on-original-alert"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2755,6 +2755,7 @@ WIKI_RELEASE_NOTES = {
     "3.50": "Monitora criações de contas na ptwiki com aviso curto e link para contribuições; adiciona comandos administrativos no Telegram para pausar, retomar e consultar o estado do monitoramento.",
     "3.51": "Corrige o uso dos comandos do monitoramento de novas contas em conversas e grupos: status disponível para consulta e pausa/retomada autorizadas a administradores do canal configurado.",
     "3.52": "Registra o recebimento, a autorização e o resultado dos comandos de monitoramento de novas contas para facilitar o diagnóstico de mensagens que não chegam ao bot.",
+    "3.53": "Ao parar uma observação teste pelo botão, atualiza o alerta original com esse estado e mantém a confirmação separada, identificando nela quem solicitou a parada.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -13416,6 +13417,41 @@ def answer_callback_query(callback_query_id, text=None):
         print("⚠️ Erro ao responder callback:", safe_exception(e))
 
 
+def mark_test_observation_stopped_on_alert(message, callback_data):
+    """Atualiza o alerta original e remove o botão já utilizado."""
+    if not isinstance(message, dict):
+        return False
+    original_text = str(message.get("text") or "")
+    if not original_text:
+        return False
+
+    marker = "🛑 Observação teste parada"
+    updated_text = original_text
+    if marker not in original_text:
+        updated_text = original_text.rstrip() + "\n\n" + marker + "."
+
+    old_markup = message.get("reply_markup") or {}
+    rows = []
+    for row in old_markup.get("inline_keyboard", []):
+        kept = [
+            button for button in row
+            if not (
+                isinstance(button, dict)
+                and button.get("callback_data") == callback_data
+            )
+        ]
+        if kept:
+            rows.append(kept)
+
+    return edit_telegram_message_in_chat(
+        (message.get("chat") or {}).get("id"),
+        message.get("message_id"),
+        updated_text,
+        parse_mode="HTML",
+        reply_markup={"inline_keyboard": rows},
+    )
+
+
 def telegram_user_is_channel_admin(user_id):
     """Valida no Telegram se quem clicou é administrador do canal.
 
@@ -13545,14 +13581,20 @@ def process_edit_action_callback(callback):
             if not success:
                 answer_callback_query(callback_id, "Não foi possível parar a observação de teste.")
                 return
+            actor_name = telegram_person_display_name(clicker) or "administrador do canal"
             answer_callback_query(
                 callback_id,
-                "Observação de teste encerrada." if stopped else "A observação de teste já estava encerrada.",
+                "Observação teste parada." if stopped else "A observação teste já estava parada.",
             )
             if stopped:
+                mark_test_observation_stopped_on_alert(
+                    callback_message,
+                    f"stoptestcase:{case_id}",
+                )
                 send_telegram_message(
                     "🛑 Observação de teste encerrada\n\n"
-                    f"{user_contributions_link_html(username)}",
+                    f"{user_contributions_link_html(username)}\n"
+                    f"👮 Solicitada por: {html.escape(actor_name)}",
                     chat_id=TELEGRAM_CHANNEL,
                     parse_mode="HTML",
                 )
@@ -13627,14 +13669,20 @@ def process_edit_action_callback(callback):
         if not success:
             answer_callback_query(callback_id, "Não foi possível parar a observação de teste.")
             return
+        actor_name = actor or "administrador do canal"
         answer_callback_query(
             callback_id,
-            "Observação de teste encerrada." if stopped else "A observação de teste já estava encerrada.",
+            "Observação teste parada." if stopped else "A observação teste já estava parada.",
         )
         if stopped:
+            mark_test_observation_stopped_on_alert(
+                callback_message,
+                f"stoptest:{revision_text}",
+            )
             send_telegram_message(
                 "🛑 Observação de teste encerrada\n\n"
-                f"👤 {user_contributions_link_html(username)}",
+                f"👤 {user_contributions_link_html(username)}\n"
+                f"👮 Solicitada por: {html.escape(actor_name)}",
                 chat_id=TELEGRAM_CHANNEL,
                 parse_mode="HTML",
             )
