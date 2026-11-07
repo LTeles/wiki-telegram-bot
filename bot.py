@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.46"
-BOT_BUILD = "3.46-abuse-filter-five-edit-high-risk-trigger"
+BOT_VERSION = "3.48"
+BOT_BUILD = "3.48-reliable-abuse-filter-delivery-and-observation-controls"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2716,6 +2716,8 @@ WIKI_RELEASE_NOTES = {
     "3.44": "Aumenta a frequência das edições do bot e limita globalmente as escritas a no máximo três por minuto.",
     "3.45": "Filtros de abuso iniciam observação nas cinco edições seguintes; reversão confirmada inicia observação de seis horas, com botões para observar por seis horas ou encerrar o teste.",
     "3.46": "Contas com escore final de risco igual ou superior a 98% também iniciam a observação teste das cinco edições seguintes.",
+    "3.47": "Restaura o botão Desobservar nas confirmações de observação automática e nos alertas de contas observadas durante uma janela teste.",
+    "3.48": "Confirma o envio dos alertas de filtros antes de avançar o cursor, mantém cursores independentes por filtro e pagina o AbuseLog para evitar perdas; restaura o botão Desobservar nas observações automáticas e em contas observadas durante o teste.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -3739,6 +3741,11 @@ def start_automatic_observation(username, reason):
         ),
         "title": "Observação automática",
         "parse_mode": "HTML",
+        "reply_markup": reversible_action_markup(
+            "unobserve",
+            username,
+            "⛔ Desobservar",
+        ),
     })
 
     print(
@@ -4320,15 +4327,33 @@ def load_abuse_filter_state():
         data = {"last_log_id": 0}
 
     try:
-        last_log_id = int(
-            data.get("last_log_id", 0)
-        )
+        last_log_id = max(0, int(data.get("last_log_id", 0)))
     except Exception:
         last_log_id = 0
+    last_log_ids = {}
+    raw_per_filter = data.get("last_log_ids", {})
+    if isinstance(raw_per_filter, dict):
+        for raw_filter_id, raw_log_id in raw_per_filter.items():
+            filter_id = normalize_filter_id(raw_filter_id)
+            try:
+                value = max(0, int(raw_log_id))
+            except (TypeError, ValueError):
+                continue
+            if filter_id:
+                last_log_ids[filter_id] = value
+    if not last_log_ids and last_log_id:
+        # Migra o cursor global legado para os filtros já existentes. Filtros
+        # adicionados depois terão cursor próprio desde added_at.
+        with abuse_filters_lock:
+            last_log_ids = {
+                filter_id: last_log_id
+                for filter_id in watched_abuse_filters
+            }
 
     with abuse_state_lock:
         abuse_filter_state = {
-            "last_log_id": max(0, last_log_id)
+            "last_log_id": last_log_id,
+            "last_log_ids": last_log_ids,
         }
 
     print(
@@ -4337,15 +4362,22 @@ def load_abuse_filter_state():
     )
 
 
-def save_abuse_filter_state(last_log_id):
+def save_abuse_filter_state(last_log_id, filter_id=None):
     with abuse_state_lock:
-        abuse_filter_state[
-            "last_log_id"
-        ] = int(last_log_id)
+        log_id = int(last_log_id)
+        abuse_filter_state["last_log_id"] = max(
+            int(abuse_filter_state.get("last_log_id", 0)), log_id
+        )
+        if filter_id:
+            filter_id = normalize_filter_id(filter_id)
+            if filter_id:
+                cursors = abuse_filter_state.setdefault("last_log_ids", {})
+                cursors[filter_id] = max(int(cursors.get(filter_id, 0)), log_id)
 
         data = dict(
             abuse_filter_state
         )
+        data["last_log_ids"] = dict(abuse_filter_state.get("last_log_ids", {}))
 
     atomic_write_json(
         ABUSE_FILTER_STATE_FILE,
@@ -4446,8 +4478,15 @@ def format_abuse_filter_message(entry, watched_info):
     )
 
 
-def fetch_abuse_log_entries(filter_ids):
+def fetch_abuse_log_entries(
+    filter_ids,
+    after_log_id=0,
+    after_log_id_by_filter=None,
+    added_at_by_filter=None,
+):
     all_entries = []
+    after_log_id_by_filter = after_log_id_by_filter or {}
+    added_at_by_filter = added_at_by_filter or {}
 
     # Consulta cada filtro separadamente. Além de simplificar a associação,
     # isso contorna uma mudança da API em que o AbuseLog pode devolver
@@ -4461,8 +4500,7 @@ def fetch_abuse_log_entries(filter_ids):
             continue
 
         try:
-            response, data = wikimedia_api_get(
-                {
+            base_params = {
                     "action": "query",
                     "format": "json",
                     "formatversion": 2,
@@ -4474,32 +4512,55 @@ def fetch_abuse_log_entries(filter_ids):
                         "ids|filter|user|title|action|"
                         "result|timestamp|hidden|revid"
                     ),
-                },
-                timeout=30,
-            )
+            }
+            continuation = {}
+            added_at_cutoff = float(added_at_by_filter.get(filter_id, 0) or 0)
+            filter_cursor = int(after_log_id_by_filter.get(filter_id, 0) or 0)
+            while True:
+                params = dict(base_params)
+                params.update(continuation)
+                _response, data = wikimedia_api_get(params, timeout=30)
 
-            if data.get("error"):
-                print(
-                    "⚠️ AbuseLog API | filtro",
-                    filter_id,
-                    ":",
-                    data["error"]
-                )
-                continue
+                if data.get("error"):
+                    print(
+                        "⚠️ AbuseLog API | filtro",
+                        filter_id,
+                        ":",
+                        data["error"]
+                    )
+                    break
 
-            entries = (
-                data
-                .get("query", {})
-                .get("abuselog", [])
-            )
+                entries = (data.get("query", {}).get("abuselog", []))
+                reached_cursor = False
+                reached_added_at = False
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        item_id = int(entry.get("id") or entry.get("logid") or 0)
+                    except (TypeError, ValueError):
+                        item_id = 0
+                    if item_id and item_id <= filter_cursor:
+                        reached_cursor = True
+                        continue
+                    event_ts = parse_mw_timestamp(entry.get("timestamp"))
+                    before_watch_start = bool(
+                        event_ts is not None
+                        and added_at_cutoff
+                        and event_ts < added_at_cutoff - 2
+                    )
+                    if before_watch_start:
+                        reached_added_at = True
+                    item = dict(entry)
+                    item["_watched_filter_id"] = filter_id
+                    item["_before_watch_start"] = before_watch_start
+                    all_entries.append(item)
 
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-
-                item = dict(entry)
-                item["_watched_filter_id"] = filter_id
-                all_entries.append(item)
+                if reached_cursor or reached_added_at or not entries:
+                    break
+                continuation = data.get("continue") or {}
+                if not continuation:
+                    break
 
         except Exception as e:
             print(
@@ -4512,7 +4573,7 @@ def fetch_abuse_log_entries(filter_ids):
     return all_entries
 
 
-def abuse_filter_user_cooldown_allows(filter_id, username, now=None):
+def abuse_filter_user_cooldown_allows(filter_id, username, now=None, commit=True):
     now = time.time() if now is None else float(now)
     key = (
         str(normalize_filter_id(filter_id) or filter_id),
@@ -4540,8 +4601,9 @@ def abuse_filter_user_cooldown_allows(filter_id, username, now=None):
         ):
             return False
 
-        # Só uma ocorrência efetivamente aceita inicia a janela.
-        abuse_filter_user_cooldowns[key] = now
+        # A janela só começa quando a publicação no Telegram foi confirmada.
+        if commit:
+            abuse_filter_user_cooldowns[key] = now
         return True
 
 
@@ -4767,8 +4829,18 @@ def abuse_filter_monitor():
                 time.sleep(ABUSE_FILTER_POLL_SECONDS)
                 continue
 
+            with abuse_state_lock:
+                global_last_log_id = int(abuse_filter_state.get("last_log_id", 0))
+                last_log_ids = dict(abuse_filter_state.get("last_log_ids", {}))
+
             entries = fetch_abuse_log_entries(
-                list(filters_snapshot.keys())
+                list(filters_snapshot.keys()),
+                after_log_id=global_last_log_id,
+                after_log_id_by_filter=last_log_ids,
+                added_at_by_filter={
+                    key: value.get("added_at", 0)
+                    for key, value in filters_snapshot.items()
+                },
             )
 
             if not entries:
@@ -4789,28 +4861,21 @@ def abuse_filter_monitor():
 
             entries.sort(key=entry_id)
 
-            with abuse_state_lock:
-                last_log_id = int(
-                    abuse_filter_state.get(
-                        "last_log_id",
-                        0
+            def commit_processed_log(log_id, filter_id):
+                try:
+                    save_abuse_filter_state(log_id, filter_id=filter_id)
+                    last_log_ids[filter_id] = max(
+                        int(last_log_ids.get(filter_id, 0)), int(log_id)
                     )
-                )
-
-            max_seen = last_log_id
+                    return True
+                except Exception as exc:
+                    print("⚠️ Erro ao salvar estado do AbuseLog:", safe_exception(exc))
+                    return False
 
             for entry in entries:
                 log_id = entry_id(entry)
 
                 if log_id <= 0:
-                    continue
-
-                max_seen = max(
-                    max_seen,
-                    log_id
-                )
-
-                if log_id <= last_log_id:
                     continue
 
                 filter_id = extract_abuse_filter_id(
@@ -4820,11 +4885,20 @@ def abuse_filter_monitor():
                 if not filter_id:
                     continue
 
+                filter_cursor = int(last_log_ids.get(filter_id, 0))
+                if log_id <= filter_cursor:
+                    continue
+
                 watched_info = filters_snapshot.get(
                     filter_id
                 )
 
                 if not watched_info:
+                    commit_processed_log(log_id, filter_id)
+                    continue
+
+                if entry.get("_before_watch_start"):
+                    commit_processed_log(log_id, filter_id)
                     continue
 
                 # Evita publicar ocorrências anteriores ao momento
@@ -4847,6 +4921,7 @@ def abuse_filter_monitor():
                     and
                     event_ts < added_at - 2
                 ):
+                    commit_processed_log(log_id, filter_id)
                     continue
 
                 username = str(entry.get("user") or "").strip()
@@ -4854,6 +4929,7 @@ def abuse_filter_monitor():
                     filter_id,
                     username,
                     now=time.time(),
+                    commit=False,
                 ):
                     print(
                         "🛡 Filtro de abuso suprimido por anti-flood:",
@@ -4863,6 +4939,7 @@ def abuse_filter_monitor():
                         "| log:",
                         log_id
                     )
+                    commit_processed_log(log_id, filter_id)
                     continue
 
                 # O anti-flood é avaliado antes; somente um alerta publicado
@@ -4893,19 +4970,47 @@ def abuse_filter_monitor():
                     watched_info
                 )
 
-                telegram_queue.put(
-                    {
-                        "message": message,
-                        "title": (
-                            f"Filtro de abuso {filter_id}"
-                        ),
-                        "parse_mode": "HTML",
-                        "reply_markup": (
-                            abuse_filter_test_reply_markup(test_case["case_id"])
-                            if username and test_case else None
-                        ),
-                    }
+                reply_markup = (
+                    abuse_filter_test_reply_markup(test_case["case_id"])
+                    if username and test_case else None
                 )
+                sent = send_telegram_message(
+                    message,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
+                if not sent:
+                    # O cursor não avança sem confirmação do Telegram. Uma
+                    # tentativa simples também contorna erros de HTML/botões.
+                    plain_message = re.sub(r"<[^>]*>", "", html.unescape(message))
+                    sent = send_telegram_message(
+                        plain_message,
+                        reply_markup=reply_markup,
+                    )
+                    if sent:
+                        print(
+                            "⚠️ Alerta de filtro entregue sem formatação/botões:",
+                            filter_id,
+                            "| log:",
+                            log_id,
+                        )
+
+                if not sent:
+                    print(
+                        "❌ Alerta de filtro não confirmado; será tentado novamente:",
+                        filter_id,
+                        "| log:",
+                        log_id,
+                    )
+                    break
+
+                abuse_filter_user_cooldown_allows(
+                    filter_id,
+                    username,
+                    now=time.time(),
+                    commit=True,
+                )
+                commit_processed_log(log_id, filter_id)
 
                 print(
                     "🛡 Filtro de abuso acionado:",
@@ -4913,17 +5018,6 @@ def abuse_filter_monitor():
                     "| log:",
                     log_id
                 )
-
-            if max_seen > last_log_id:
-                try:
-                    save_abuse_filter_state(
-                        max_seen
-                    )
-                except Exception as e:
-                    print(
-                        "⚠️ Erro ao salvar estado do AbuseLog:",
-                        safe_exception(e)
-                    )
 
         except Exception as e:
             print(
@@ -6748,7 +6842,11 @@ def message_with_status(record, status, reverter=None, deleter=None, patroller=N
             f"\nRevertido por: {html.escape(str(reverter))}" if reverter else ""
         )
 
-        if record.get("alert_kind") in ("observed", "abuse_filter_test"):
+        if record.get("alert_kind") in (
+            "observed",
+            "abuse_filter_test",
+            "abuse_filter_test_observed",
+        ):
             remaining_line = observation_remaining_line(
                 record.get("username") or ""
             )
@@ -7047,15 +7145,18 @@ def _process_posted_statuses(
             and
             new_status != current_status
         ):
+            test_observation_escalated = False
             if new_status == "reverted":
                 reversal_diagnostic("reversao_identificada", revision_id,
                                     origem=reversal_source)
                 test_case_id = record.get("abuse_filter_test_case_id")
                 if test_case_id and not record.get("abuse_filter_test_trigger"):
-                    escalate_abuse_filter_test_case(
+                    test_observation_escalated = escalate_abuse_filter_test_case(
                         test_case_id,
                         record.get("username") or "",
                     )
+                    if test_observation_escalated:
+                        record["alert_kind"] = "observed"
             reverter = None
 
             # Quando a revisão foi revertida, identifica primeiro o autor
@@ -7111,6 +7212,8 @@ def _process_posted_statuses(
                 ):
                     continue
                 live["status"] = new_status
+                if test_observation_escalated:
+                    live["alert_kind"] = "observed"
                 if reverter:
                     live["reverted_by"] = reverter
                 if new_status in ("reverted", "self_reverted"):
@@ -11331,6 +11434,17 @@ def tracked_edit_reply_markup(
                 "callback_data": f"watch:{revision_id}",
             }],
         ]
+    elif alert_kind == "abuse_filter_test_observed":
+        rows = [
+            [{
+                "text": "⛔ Desobservar",
+                "callback_data": f"unobserve:{revision_id}",
+            }],
+            [{
+                "text": "🛑 Parar observação teste",
+                "callback_data": f"stoptest:{revision_id}",
+            }],
+        ]
     elif alert_kind == "abuse_filter_test":
         rows = [
             [{
@@ -11568,10 +11682,17 @@ def analysis_worker():
             # Tem prioridade sobre uma observação comum para manter os botões
             # próprios do teste disponíveis no post desta edição.
             test_case_id = change.get("_abuse_filter_test_case_id")
-            if test_case_id:
+            test_case = get_abuse_filter_test_case(test_case_id) if test_case_id else None
+            if test_case_id and test_case and not test_case.get("stopped"):
                 remaining = change.get("_abuse_filter_test_remaining")
-                test_case = get_abuse_filter_test_case(test_case_id) or {}
                 trigger_reason = test_case.get("trigger_reason") or "filtro de abuso"
+                active_observation = get_observation(username)
+                alert_kind = (
+                    "abuse_filter_test_observed"
+                    if active_observation else "abuse_filter_test"
+                )
+                if active_observation:
+                    trigger_reason = active_observation.get("reason") or trigger_reason
                 test_observation = {
                     "reason": (
                         f"Observação de teste após {trigger_reason}"
@@ -11584,7 +11705,7 @@ def analysis_worker():
                         change,
                         message,
                         f"Observação de teste: {username}",
-                        alert_kind="abuse_filter_test"
+                        alert_kind=alert_kind
                     )
                 )
                 print("🧪 Edição na janela de teste:", username, "|", title)
@@ -13315,6 +13436,11 @@ def process_edit_action_callback(callback):
                 "⏳ Duração: 6 horas",
                 chat_id=TELEGRAM_CHANNEL,
                 parse_mode="HTML",
+                reply_markup=reversible_action_markup(
+                    "unobserve",
+                    username,
+                    "⛔ Desobservar",
+                ),
             )
         else:
             success, stopped = stop_abuse_filter_test_observation(case_id)
