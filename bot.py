@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.49"
-BOT_BUILD = "3.49-fix-observation-queue-scope-errors"
+BOT_VERSION = "3.52"
+BOT_BUILD = "3.52-account-command-diagnostics"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -511,6 +511,39 @@ def load_json(path, default):
     except Exception as e:
         print("⚠️ Erro ao ler", path, ":", safe_exception(e))
         return default
+
+
+# Monitoramento de novas contas na ptwiki. O estado persiste entre reinícios.
+ACCOUNT_CREATION_MONITOR_FILE = data_path("ptwiki_account_creation_monitor.json")
+ACCOUNT_CREATION_MONITOR_LOCK = threading.Lock()
+
+
+def account_creation_monitor_enabled():
+    with ACCOUNT_CREATION_MONITOR_LOCK:
+        state = load_json(ACCOUNT_CREATION_MONITOR_FILE, {"enabled": True})
+        return bool(state.get("enabled", True)) if isinstance(state, dict) else True
+
+
+def set_account_creation_monitor_enabled(enabled):
+    with ACCOUNT_CREATION_MONITOR_LOCK:
+        state = load_json(ACCOUNT_CREATION_MONITOR_FILE, {"enabled": True})
+        if not isinstance(state, dict):
+            state = {}
+        state["enabled"] = bool(enabled)
+        state["updated_at"] = time.time()
+        atomic_write_json(ACCOUNT_CREATION_MONITOR_FILE, state)
+
+
+def created_account_from_log(change):
+    """Extrai a conta alvo do título Usuário: gravado no log newusers."""
+    title = str(change.get("title") or "").strip().replace("_", " ")
+    match = re.match(r"^(?:Usuário|User)\s*:\s*(.+)$", title, flags=re.IGNORECASE)
+    if not match:
+        return None
+    username = match.group(1).strip()
+    if not username or username.casefold().startswith("~"):
+        return None
+    return username
 
 
 def ensure_storage():
@@ -2719,6 +2752,9 @@ WIKI_RELEASE_NOTES = {
     "3.47": "Restaura o botão Desobservar nas confirmações de observação automática e nos alertas de contas observadas durante uma janela teste.",
     "3.48": "Confirma o envio dos alertas de filtros antes de avançar o cursor, mantém cursores independentes por filtro e pagina o AbuseLog para evitar perdas; restaura o botão Desobservar nas observações automáticas e em contas observadas durante o teste.",
     "3.49": "Corrige escopo de variáveis na reconciliação de pendências e na montagem dos alertas acompanhados, restaurando as reconciliações e a publicação de alertas com escore de risco.",
+    "3.50": "Monitora criações de contas na ptwiki com aviso curto e link para contribuições; adiciona comandos administrativos no Telegram para pausar, retomar e consultar o estado do monitoramento.",
+    "3.51": "Corrige o uso dos comandos do monitoramento de novas contas em conversas e grupos: status disponível para consulta e pausa/retomada autorizadas a administradores do canal configurado.",
+    "3.52": "Registra o recebimento, a autorização e o resultado dos comandos de monitoramento de novas contas para facilitar o diagnóstico de mensagens que não chegam ao bot.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -12066,6 +12102,12 @@ def process_telegram_command(message, from_channel=False):
         .lower()
     )
 
+    print(
+        "📨 Comando Telegram recebido:", command,
+        "| origem:", "channel_post" if from_channel else "message",
+        "| chat:", chat.get("type", "desconhecido"),
+    )
+
     argument = (
         remaining[0].strip()
         if remaining
@@ -12115,6 +12157,59 @@ def process_telegram_command(message, from_channel=False):
             )
         except Exception as exc:
             send_telegram_message("❌ Não foi possível alterar escrita wiki: " + safe_exception(exc), chat_id=chat_id)
+        return
+
+    if command in ("/pausarcontas", "/retomarcontas"):
+        # Aceita o comando no canal, ou em conversa/grupo desde que o
+        # remetente seja administrador do canal monitorado. O status é
+        # somente leitura e pode ser consultado sem esta validação.
+        authorized = bool(from_channel and is_target_channel(chat))
+        if not authorized:
+            actor_id = (message.get("from") or {}).get("id")
+            authorized = bool(
+                actor_id and telegram_user_is_channel_admin(actor_id)
+            )
+        if not authorized:
+            print("⛔ Comando de monitoramento de contas recusado: remetente não autorizado.")
+            send_telegram_message(
+                "⚠️ Apenas administradores do canal configurado podem alterar os avisos de novas contas.",
+                chat_id=chat_id,
+            )
+            return
+
+        enabled = command == "/retomarcontas"
+        try:
+            set_account_creation_monitor_enabled(enabled)
+            print(
+                "✅ Monitoramento de criação de contas:",
+                "retomado" if enabled else "pausado",
+            )
+            send_telegram_message(
+                "▶️ Avisos de criação de contas retomados."
+                if enabled else
+                "⏸ Avisos de criação de contas pausados.",
+                chat_id=chat_id,
+            )
+        except Exception as exc:
+            print("❌ Falha ao alterar monitoramento de criação de contas:", safe_exception(exc))
+            send_telegram_message(
+                "❌ Não foi possível alterar o monitoramento de novas contas: "
+                + safe_exception(exc),
+                chat_id=chat_id,
+            )
+        return
+
+    if command == "/statuscontas":
+        enabled = account_creation_monitor_enabled()
+        print(
+            "📡 Consulta do monitoramento de contas:",
+            "ativo" if enabled else "pausado",
+        )
+        send_telegram_message(
+            "📡 Avisos de criação de contas: "
+            + ("ativos." if enabled else "pausados."),
+            chat_id=chat_id,
+        )
         return
 
     if command in ("/pausarteste", "/reiniciarteste"):
@@ -14330,6 +14425,20 @@ def wikimedia_loop():
                 if change.get("type") == "log":
                     log_type = change.get("log_type")
                     action = change.get("log_action")
+
+                    if log_type == "newusers":
+                        username = created_account_from_log(change)
+                        if username and account_creation_monitor_enabled():
+                            telegram_queue.put({
+                                "message": (
+                                    "🆕 Conta criada: "
+                                    + user_contributions_link_html(username)
+                                ),
+                                "title": "Nova conta: " + safe_log_text(username, max_length=120),
+                                "parse_mode": "HTML",
+                            })
+                            print("🆕 Criação de conta enfileirada:", safe_log_text(username, max_length=120))
+                        continue
 
                     if log_type == "block":
                         if action in (
