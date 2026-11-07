@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.53"
-BOT_BUILD = "3.53-mark-test-stop-on-original-alert"
+BOT_VERSION = "3.55"
+BOT_BUILD = "3.55-newusers-api-monitor"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -516,6 +516,8 @@ def load_json(path, default):
 # Monitoramento de novas contas na ptwiki. O estado persiste entre reinícios.
 ACCOUNT_CREATION_MONITOR_FILE = data_path("ptwiki_account_creation_monitor.json")
 ACCOUNT_CREATION_MONITOR_LOCK = threading.Lock()
+ACCOUNT_CREATION_CURSOR_FILE = data_path("ptwiki_newusers_log_cursor.json")
+ACCOUNT_CREATION_CURSOR_LOCK = threading.Lock()
 
 
 def account_creation_monitor_enabled():
@@ -537,13 +539,123 @@ def set_account_creation_monitor_enabled(enabled):
 def created_account_from_log(change):
     """Extrai a conta alvo do título Usuário: gravado no log newusers."""
     title = str(change.get("title") or "").strip().replace("_", " ")
-    match = re.match(r"^(?:Usuário|User)\s*:\s*(.+)$", title, flags=re.IGNORECASE)
+    # A ptwiki usa o namespace localizado "Usuário(a)" em títulos de
+    # usuário; outras versões/aliases podem aparecer como "Usuário" ou "User".
+    match = re.match(
+        r"^(?:Usuário(?:\(a\))?|User)\s*:\s*(.+)$",
+        title,
+        flags=re.IGNORECASE,
+    )
     if not match:
         return None
     username = match.group(1).strip()
     if not username or username.casefold().startswith("~"):
         return None
     return username
+
+
+def account_creation_log_monitor():
+    """Monitora diretamente Special:Log/newusers pela Action API da ptwiki."""
+    print("✅ Monitor de criação de contas iniciado pela API de registros.")
+    params = {
+        "action": "query",
+        "format": "json",
+        "formatversion": 2,
+        "list": "logevents",
+        "letype": "newusers",
+        "lelimit": 50,
+        "leprop": "ids|title|type|user|timestamp|details",
+    }
+
+    while True:
+        try:
+            response, data = wikimedia_api_get(
+                params,
+                timeout=25,
+                require_auth_when_available=False,
+            )
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError("Action API: " + safe_log_text(data["error"], max_length=240))
+            events = (data.get("query") or {}).get("logevents") or []
+            events = [item for item in events if isinstance(item, dict)]
+            cursor_data = load_json(ACCOUNT_CREATION_CURSOR_FILE, {})
+            raw_cursor = cursor_data.get("last_log_id") if isinstance(cursor_data, dict) else None
+            try:
+                last_log_id = int(raw_cursor) if raw_cursor is not None else None
+            except (TypeError, ValueError, OverflowError):
+                last_log_id = None
+
+            def log_id(item):
+                try:
+                    return int(item.get("logid") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    return 0
+
+            if last_log_id is None:
+                baseline = max((log_id(item) for item in events), default=0)
+                with ACCOUNT_CREATION_CURSOR_LOCK:
+                    atomic_write_json(ACCOUNT_CREATION_CURSOR_FILE, {
+                        "last_log_id": baseline,
+                        "initialized_at": time.time(),
+                    })
+                print("📍 Cursor de novas contas inicializado em:", baseline)
+            else:
+                pending = [item for item in events if log_id(item) > last_log_id]
+                continuation = data.get("continue") or {}
+                page_params = dict(params)
+
+                # Pagina caso haja mais de 50 criações desde a última consulta.
+                for _ in range(20):
+                    if not continuation or not pending:
+                        break
+                    oldest_id = min(log_id(item) for item in pending)
+                    if oldest_id <= last_log_id:
+                        break
+                    page_params.update(continuation)
+                    _, page_data = wikimedia_api_get(
+                        page_params,
+                        timeout=25,
+                        require_auth_when_available=False,
+                    )
+                    page_items = (page_data.get("query") or {}).get("logevents") or []
+                    page_items = [item for item in page_items if isinstance(item, dict)]
+                    pending.extend(item for item in page_items if log_id(item) > last_log_id)
+                    continuation = page_data.get("continue") or {}
+
+                pending.sort(key=log_id)
+                newest_id = last_log_id
+                enabled = account_creation_monitor_enabled()
+                for item in pending:
+                    item_id = log_id(item)
+                    if item_id <= newest_id:
+                        continue
+                    newest_id = item_id
+                    username = created_account_from_log(item)
+                    if not username:
+                        print(
+                            "⚠️ Registro newusers sem conta reconhecida:",
+                            "id=", item_id,
+                            "ação=", safe_log_text(item.get("action"), max_length=80),
+                            "título=", safe_log_text(item.get("title"), max_length=160),
+                        )
+                    elif enabled:
+                        telegram_queue.put({
+                            "message": "🆕 Conta criada: " + user_contributions_link_html(username),
+                            "title": "Nova conta: " + safe_log_text(username, max_length=120),
+                            "parse_mode": "HTML",
+                        })
+                        print("🆕 Criação de conta enfileirada via API:", safe_log_text(username, max_length=120))
+
+                if newest_id > last_log_id:
+                    with ACCOUNT_CREATION_CURSOR_LOCK:
+                        atomic_write_json(ACCOUNT_CREATION_CURSOR_FILE, {
+                            "last_log_id": newest_id,
+                            "updated_at": time.time(),
+                        })
+        except Exception as exc:
+            print("⚠️ Erro no monitor de criação de contas pela API:", safe_exception(exc))
+
+        time.sleep(20)
 
 
 def ensure_storage():
@@ -2756,6 +2868,8 @@ WIKI_RELEASE_NOTES = {
     "3.51": "Corrige o uso dos comandos do monitoramento de novas contas em conversas e grupos: status disponível para consulta e pausa/retomada autorizadas a administradores do canal configurado.",
     "3.52": "Registra o recebimento, a autorização e o resultado dos comandos de monitoramento de novas contas para facilitar o diagnóstico de mensagens que não chegam ao bot.",
     "3.53": "Ao parar uma observação teste pelo botão, atualiza o alerta original com esse estado e mantém a confirmação separada, identificando nela quem solicitou a parada.",
+    "3.54": "Corrige a extração de contas recém-criadas aceitando o namespace localizado Usuário(a): e registra eventos newusers sem título reconhecido; contas temporárias com nome iniciado por ~ continuam excluídas.",
+    "3.55": "Monitora diretamente o registro Special:Log/newusers pela Action API, com cursor persistente e paginação para não depender da entrega de eventos de log pelo EventStreams; contas temporárias continuam excluídas.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -14475,17 +14589,8 @@ def wikimedia_loop():
                     action = change.get("log_action")
 
                     if log_type == "newusers":
-                        username = created_account_from_log(change)
-                        if username and account_creation_monitor_enabled():
-                            telegram_queue.put({
-                                "message": (
-                                    "🆕 Conta criada: "
-                                    + user_contributions_link_html(username)
-                                ),
-                                "title": "Nova conta: " + safe_log_text(username, max_length=120),
-                                "parse_mode": "HTML",
-                            })
-                            print("🆕 Criação de conta enfileirada:", safe_log_text(username, max_length=120))
+                        # Os avisos de criação são obtidos por um monitor
+                        # próprio da Action API, com cursor persistente.
                         continue
 
                     if log_type == "block":
@@ -17050,6 +17155,7 @@ def main():
 
     threads = [
         ("telegram-sender", telegram_sender),
+        ("account-creation-monitor", account_creation_log_monitor),
         ("analysis-worker", analysis_worker),
         ("block-worker", block_worker),
         ("post-block-observation", post_block_observation_scheduler),
