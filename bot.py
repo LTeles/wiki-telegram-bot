@@ -16093,10 +16093,13 @@ def build_high_risk_header_wikitext(records):
         "'''Navegação:''' "
         f"[[{WIKI_HIGH_RISK_TITLE}|avisos pendentes]] · "
         f"[[{WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE}|arquivo por data]]",
-        '<div style="margin:0.45em 0; padding:0.5em 0.7em; border-left:4px solid #36c; '
-        'background:#eaf3ff">'''Mais recursos de revisão:''' instale o '
-        '[[Usuário:Teles/revisando.js|gadget de revisão]] para habilitar os botões de revisão '
-        'e as ações do Selet nesta página.</div>',
+        (
+            '<div style="margin:0.45em 0; padding:0.5em 0.7em; border-left:4px solid #36c; '
+            'background:#eaf3ff">'
+            "'''Mais recursos de revisão:''' instale o "
+            '[[Usuário:Teles/revisando.js|gadget de revisão]] para habilitar os botões de revisão '
+            'e as ações do Selet nesta página.</div>'
+        ),
     ]
     for year in years:
         links = []
