@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.57"
-BOT_BUILD = "3.57-high-risk-instructions-transclusion"
+BOT_VERSION = "3.58"
+BOT_BUILD = "3.58-clear-float-after-instructions"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2872,7 +2872,7 @@ WIKI_RELEASE_NOTES = {
     "3.55": "Monitora diretamente o registro Special:Log/newusers pela Action API, com cursor persistente e paginação para não depender da entrega de eventos de log pelo EventStreams; contas temporárias continuam excluídas.",
     "3.56": "Restaura no cabeçalho das edições de alto risco o aviso para instalar o gadget de revisão e habilitar os botões de revisão e as ações do Selet.",
     "3.57": "Substitui o aviso textual pela transclusão da subpágina /Instruções, posicionada abaixo do bloco completo de navegação por arquivos e datas.",
-    "3.56": "Restaura no cabeçalho das edições de alto risco o aviso para instalar o gadget de revisão e habilitar os botões de revisão e as ações do Selet.",
+    "3.58": "Limpa os elementos flutuantes após a transclusão de /Instruções para manter o título e o conteúdo principal em largura total.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -16134,6 +16134,7 @@ def build_high_risk_header_wikitext(records):
 
     lines.append("</div>")
     lines.append("{{Usuário:TelesGramBot/Edições de alto risco/Instruções}}")
+    lines.append('<div style="clear:both"></div>')
     lines.append("<noinclude>Cabeçalho automático dos avisos e arquivos do TelesGramBot.</noinclude>")
     return "\n".join(lines) + "\n"
 
