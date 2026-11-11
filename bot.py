@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.56"
-BOT_BUILD = "3.56-high-risk-gadget-banner"
+BOT_VERSION = "3.57"
+BOT_BUILD = "3.57-high-risk-instructions-transclusion"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2870,6 +2870,8 @@ WIKI_RELEASE_NOTES = {
     "3.53": "Ao parar uma observação teste pelo botão, atualiza o alerta original com esse estado e mantém a confirmação separada, identificando nela quem solicitou a parada.",
     "3.54": "Corrige a extração de contas recém-criadas aceitando o namespace localizado Usuário(a): e registra eventos newusers sem título reconhecido; contas temporárias com nome iniciado por ~ continuam excluídas.",
     "3.55": "Monitora diretamente o registro Special:Log/newusers pela Action API, com cursor persistente e paginação para não depender da entrega de eventos de log pelo EventStreams; contas temporárias continuam excluídas.",
+    "3.56": "Restaura no cabeçalho das edições de alto risco o aviso para instalar o gadget de revisão e habilitar os botões de revisão e as ações do Selet.",
+    "3.57": "Substitui o aviso textual pela transclusão da subpágina /Instruções, posicionada abaixo do bloco completo de navegação por arquivos e datas.",
     "3.56": "Restaura no cabeçalho das edições de alto risco o aviso para instalar o gadget de revisão e habilitar os botões de revisão e as ações do Selet.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
@@ -16093,13 +16095,6 @@ def build_high_risk_header_wikitext(records):
         "'''Navegação:''' "
         f"[[{WIKI_HIGH_RISK_TITLE}|avisos pendentes]] · "
         f"[[{WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE}|arquivo por data]]",
-        (
-            '<div style="margin:0.45em 0; padding:0.5em 0.7em; border-left:4px solid #36c; '
-            'background:#eaf3ff">'
-            "'''Mais recursos de revisão:''' instale o "
-            '[[Usuário:Teles/revisando.js|gadget de revisão]] para habilitar os botões de revisão '
-            'e as ações do Selet nesta página.</div>'
-        ),
     ]
     for year in years:
         links = []
@@ -16137,7 +16132,9 @@ def build_high_risk_header_wikitext(records):
         )
         lines.append("</div>")
 
-    lines.append("</div><noinclude>Cabeçalho automático dos avisos e arquivos do TelesGramBot.</noinclude>")
+    lines.append("</div>")
+    lines.append("{{Usuário:TelesGramBot/Edições de alto risco/Instruções}}")
+    lines.append("<noinclude>Cabeçalho automático dos avisos e arquivos do TelesGramBot.</noinclude>")
     return "\n".join(lines) + "\n"
 
 
@@ -17207,3 +17204,4 @@ def main():
 if __name__ == "__main__":
     threading.Thread(target=wiki_write_queue_worker, daemon=True).start()
     main()
+
