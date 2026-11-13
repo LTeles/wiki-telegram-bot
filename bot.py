@@ -34,7 +34,7 @@ def data_path(filename):
 # =========================================================
 
 BOT_VERSION = "4.0"
-BOT_BUILD = "4.0-cope-b-positive-alerts"
+BOT_BUILD = "4.0-cope-b-card-layout"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -15390,6 +15390,15 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
            f'{compact_time}</span>' if compact_time else "")
         + '</div>'
     )
+    cope_b = record.get("cope_b")
+    cope_b_status = ""
+    if isinstance(cope_b, dict) and cope_b.get("label") in ("0", "1"):
+        cope_word = "positivo" if cope_b.get("label") == "1" else "negativo"
+        cope_b_status = f"CoPE-B: {cope_word}"
+        try:
+            cope_b_status += f" (confiança {round(float(cope_b.get('confidence')) * 100)}%)"
+        except (TypeError, ValueError):
+            pass
 
     preview = high_risk_diff_excerpt(record)
     action, actor, _ = high_risk_action(record)
@@ -15436,7 +15445,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         + f"|reviewer={tpl(wiki_safe_text(record.get('manual_reviewer') or ''))}|timestamp={tpl(revision_iso)}"
         + f"|falsepos_available={'1' if false_positive_available else '0'}|falsepos_until={tpl(false_positive_until)}"
         + f"|background={tpl(background)}|risk_bg={tpl(risk_badge_bg)}|risk={risk:.0%}|date={tpl(compact_time)}"
-        + f"|cope_b_positive={'1' if isinstance(record.get('cope_b'), dict) and record['cope_b'].get('label') == '1' else '0'}"
+        + f"|cope_b_status={tpl(cope_b_status)}"
         + f"|article_title={tpl(wiki_safe_text(title))}|username={tpl(wiki_safe_text(username))}"
         + f"|byte_delta={tpl(int(byte_delta) if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool) else '')}|preview={tpl(preview)}"
         + f"|state={tpl(status_text)}|account_state={tpl(wiki_safe_text(record.get('account_block_state')) if record.get('account_block_state') else '')}"
@@ -15498,8 +15507,6 @@ def build_high_risk_entry_template_wikitext():
         'color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>'
         '{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; '
         'color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>'
-        '{{#if:{{{cope_b_positive|0}}}|<div style="position:absolute; top:6.25em; right:0.75em; width:5.2em; '
-        'text-align:center; color:#145c39; font-size:75%; font-weight:bold; line-height:1.15">🚨 CoPE-B: positivo (vandalismo)</div>}}'
         '<div style="padding-right:5.2em; margin-bottom:0.3em">'
         '<small>Artigo:</small> <b>[[{{{article_title|}}}|{{{article_title|}}}]]</b>'
         '{{#if:{{{byte_delta|}}}| <span style="color:{{#ifexpr:{{{byte_delta}}} > 0|#14866d|'
@@ -15539,6 +15546,8 @@ def build_high_risk_entry_template_wikitext():
         'flex-wrap:wrap"><small>\'\'\'Estado:\'\'\' {{{state|Pendente de revisão}}}</small>'
         '{{#if:{{{account_state|}}}|<small style="margin-left:auto; text-align:right; white-space:nowrap">'
         '\'\'\'Conta:\'\'\' {{{account_state}}}</small>}}</div>'
+        '{{#if:{{{cope_b_status|}}}|<div style="margin-top:0.28em; padding-right:5.2em; color:#54595d; '
+        'font-size:90%; overflow-wrap:anywhere"><small>{{{cope_b_status}}}</small></div>}}'
         '{{#if:{{{pattern|}}}|<br>{{{pattern}}}}}'
         '{{#if:{{{timer_timestamp|}}}|<div class="telesgram-timer-source" style="display:none">'
         '<span class="telesgram-age-timer" data-telesgram-timestamp="{{{timer_timestamp}}}">0 min</span></div>}}'
