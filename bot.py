@@ -34,7 +34,7 @@ def data_path(filename):
 # =========================================================
 
 BOT_VERSION = "4.0"
-BOT_BUILD = "4.0-cope-b-labeler-version"
+BOT_BUILD = "4.0-cope-b-positive-alerts"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -1426,11 +1426,12 @@ def false_positive_message(item, fixed=False):
             pass
     cope_b = item.get("cope_b")
     if isinstance(cope_b, dict) and cope_b.get("label") in ("0", "1"):
-        cope_label = "positivo" if cope_b.get("label") == "1" else "negativo"
+        cope_label = ("🚨 positivo (vandalismo)" if cope_b.get("label") == "1"
+                      else "🟢 negativo (não identificado como vandalismo)")
         try:
             cope_confidence = round(float(cope_b.get("confidence")) * 100)
             risk_line += (
-                f"\n🧪 CoPE-B (teste): {cope_label} "
+                f"\n🧪 CoPE-B: {cope_label} "
                 f"(confiança {cope_confidence}%)\n"
             )
         except (TypeError, ValueError):
@@ -2912,7 +2913,7 @@ WIKI_RELEASE_NOTES = {
     "3.57": "Substitui o aviso textual pela transclusão da subpágina /Instruções, posicionada abaixo do bloco completo de navegação por arquivos e datas.",
     "3.58": "Limpa os elementos flutuantes após a transclusão de /Instruções para manter o título e o conteúdo principal em largura total.",
     "3.59": "Adiciona avaliação experimental do CoPE-B às postagens que já seriam publicadas, com limite local persistente de chamadas; o Revert Risk e os critérios atuais continuam determinando o risco e os alertas.",
-    "4.0": "Inicia o piloto do CoPE-B em modo sombra com labeler e versão configuráveis: acrescenta avaliação independente às postagens já aprovadas, sem alterar risco ou critérios atuais; sem teto local de chamadas, respeita HTTP 429 da Zentropi e preserva o alerta se a API falhar.",
+    "4.0": "Inicia o piloto do CoPE-B em modo sombra: acrescenta avaliação independente às edições e permite que classificações positivas sejam publicadas no Telegram e na lista de alto risco da wiki mesmo abaixo dos limiares do Revert Risk; não altera os percentuais, mantém o atraso e os controles de escrita da wiki, não impõe teto local de chamadas e respeita HTTP 429 da Zentropi.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -7023,11 +7024,12 @@ def message_with_status(record, status, reverter=None, deleter=None, patroller=N
 
     cope_b = record.get("cope_b")
     if isinstance(cope_b, dict) and cope_b.get("label") in ("0", "1"):
-        cope_label = "positivo" if cope_b.get("label") == "1" else "negativo"
+        cope_label = ("🚨 positivo (vandalismo)" if cope_b.get("label") == "1"
+                      else "🟢 negativo (não identificado como vandalismo)")
         try:
             cope_confidence = round(float(cope_b.get("confidence")) * 100)
             risk_line += (
-                f"🧪 CoPE-B (teste): {cope_label} "
+                f"🧪 CoPE-B: {cope_label} "
                 f"(confiança {cope_confidence}%)\n"
             )
         except (TypeError, ValueError):
@@ -11962,11 +11964,12 @@ def format_message(change, result, cope_b=None):
         risk_line = f"🤖 Risco de reversão: {revert_score}%"
 
     if isinstance(cope_b, dict) and cope_b.get("label") in ("0", "1"):
-        cope_label = "positivo" if cope_b.get("label") == "1" else "negativo"
+        cope_label = ("🚨 positivo (vandalismo)" if cope_b.get("label") == "1"
+                      else "🟢 negativo (não identificado como vandalismo)")
         try:
             cope_confidence = round(float(cope_b.get("confidence")) * 100)
             risk_line += (
-                f"\n🧪 CoPE-B (teste): {cope_label} "
+                f"\n🧪 CoPE-B: {cope_label} "
                 f"(confiança {cope_confidence}%)"
             )
         except (TypeError, ValueError):
@@ -12116,6 +12119,7 @@ def analysis_worker():
             # Criações de página não podem usar Revert Risk: a própria
             # documentação do modelo exclui a primeira revisão de uma página.
             # Elas seguem por uma avaliação heurística local independente.
+            cope_b = None
             if is_new_page:
                 diff = get_new_revision_content(
                     new_revision
@@ -12130,6 +12134,9 @@ def analysis_worker():
                     "|",
                     title
                 )
+                # CoPE-B também pode autorizar a postagem independentemente
+                # do escore heurístico da criação de página.
+                cope_b = get_cope_b_assessment(change, diff)
             else:
                 revert_risk = get_revert_risk(
                     new_revision
@@ -12145,13 +12152,6 @@ def analysis_worker():
                     title
                 )
 
-                if (
-                    revert_risk
-                    <
-                    REVERT_RISK_THRESHOLD
-                ):
-                    continue
-
                 diff = get_revision_diff(
                     old_revision,
                     new_revision
@@ -12162,6 +12162,15 @@ def analysis_worker():
                     diff,
                     revert_risk
                 )
+                # Para detectar positivos do CoPE-B abaixo de qualquer
+                # limiar do Revert Risk, avaliar todas as edições elegíveis.
+                cope_b = get_cope_b_assessment(change, diff)
+
+                if (
+                    revert_risk < REVERT_RISK_THRESHOLD
+                    and not (isinstance(cope_b, dict) and cope_b.get("label") == "1")
+                ):
+                    continue
 
             print(
                 "📊 Score final:",
@@ -12193,14 +12202,15 @@ def analysis_worker():
                     title
                 )
 
-            if (
-                result["score"]
-                >=
-                VANDALISM_THRESHOLD
-            ):
-                # Consulta adicional e independente. O resultado do CoPE-B
-                # não altera score, limiares, observações ou inclusão no alerta.
-                cope_b = get_cope_b_assessment(change, diff)
+            cope_b_positive = isinstance(cope_b, dict) and cope_b.get("label") == "1"
+            if result["score"] >= VANDALISM_THRESHOLD or cope_b_positive:
+                if cope_b_positive and result["score"] < VANDALISM_THRESHOLD:
+                    print(
+                        "🧪 Edição incluída por CoPE-B positivo, independentemente do risco:",
+                        title,
+                        "| Revert Risk:",
+                        f"{result.get('revert_risk', 0.0):.1%}" if result.get("revert_risk") is not None else "indisponível",
+                    )
 
                 if result["score"] >= 0.98:
                     high_score_case = start_abuse_filter_test_observation(
@@ -12225,7 +12235,7 @@ def analysis_worker():
                 # A publicação wiki segue uma fila independente do Telegram.
                 # O helper aplica o limiar estrito (>80%) e persiste a janela
                 # original de duas horas de forma idempotente.
-                enqueue_high_risk_candidate(change, result, diff)
+                enqueue_high_risk_candidate(change, result, diff, cope_b=cope_b)
                 message = format_message(
                     change,
                     result,
@@ -15426,6 +15436,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         + f"|reviewer={tpl(wiki_safe_text(record.get('manual_reviewer') or ''))}|timestamp={tpl(revision_iso)}"
         + f"|falsepos_available={'1' if false_positive_available else '0'}|falsepos_until={tpl(false_positive_until)}"
         + f"|background={tpl(background)}|risk_bg={tpl(risk_badge_bg)}|risk={risk:.0%}|date={tpl(compact_time)}"
+        + f"|cope_b_positive={'1' if isinstance(record.get('cope_b'), dict) and record['cope_b'].get('label') == '1' else '0'}"
         + f"|article_title={tpl(wiki_safe_text(title))}|username={tpl(wiki_safe_text(username))}"
         + f"|byte_delta={tpl(int(byte_delta) if isinstance(byte_delta, (int, float)) and not isinstance(byte_delta, bool) else '')}|preview={tpl(preview)}"
         + f"|state={tpl(status_text)}|account_state={tpl(wiki_safe_text(record.get('account_block_state')) if record.get('account_block_state') else '')}"
@@ -15440,8 +15451,11 @@ def select_high_risk_records(records):
             revision_id = int(record.get("revision_id"))
         except (TypeError, ValueError):
             continue
-        # O limiar é estrito: 80% exatos não entram; somente risco > 80%.
-        if risk <= WIKI_HIGH_RISK_THRESHOLD:
+        cope_b = record.get("cope_b")
+        cope_b_positive = isinstance(cope_b, dict) and cope_b.get("label") == "1"
+        # O limiar Revert Risk continua estrito; um CoPE-B positivo também
+        # qualifica o registro independentemente do percentual.
+        if risk <= WIKI_HIGH_RISK_THRESHOLD and not cope_b_positive:
             continue
         record["revert_risk"] = risk
         record["revision_id"] = revision_id
@@ -15484,6 +15498,8 @@ def build_high_risk_entry_template_wikitext():
         'color:#fff; font-weight:bold; font-size:185%; line-height:1">{{{risk|-}}}</span>'
         '{{#if:{{{date|}}}|<span class="telesgram-card-date" style="display:block; margin-top:0.38em; '
         'color:#54595d; font-size:88%; line-height:1.25; white-space:nowrap">{{{date}}}</span>}}</div>'
+        '{{#if:{{{cope_b_positive|0}}}|<div style="position:absolute; top:6.25em; right:0.75em; width:5.2em; '
+        'text-align:center; color:#145c39; font-size:75%; font-weight:bold; line-height:1.15">🚨 CoPE-B: positivo (vandalismo)</div>}}'
         '<div style="padding-right:5.2em; margin-bottom:0.3em">'
         '<small>Artigo:</small> <b>[[{{{article_title|}}}|{{{article_title|}}}]]</b>'
         '{{#if:{{{byte_delta|}}}| <span style="color:{{#ifexpr:{{{byte_delta}}} > 0|#14866d|'
@@ -15665,7 +15681,7 @@ def _event_revision_timestamp(change):
     return time.time()
 
 
-def enqueue_high_risk_candidate(change, result, diff):
+def enqueue_high_risk_candidate(change, result, diff, cope_b=None):
     """Persist a two-hour candidate independently from Telegram delivery."""
     if PTWIKI_HIGH_RISK_MODE == "off":
         return False
@@ -15674,7 +15690,8 @@ def enqueue_high_risk_candidate(change, result, diff):
         revision_id = int((change.get("revision") or {}).get("new"))
     except (TypeError, ValueError, OverflowError):
         return False
-    if risk <= WIKI_HIGH_RISK_THRESHOLD:
+    cope_b_positive = isinstance(cope_b, dict) and cope_b.get("label") == "1"
+    if risk <= WIKI_HIGH_RISK_THRESHOLD and not cope_b_positive:
         return False
     revision_timestamp = _event_revision_timestamp(change)
     byte_delta = None
@@ -15700,6 +15717,7 @@ def enqueue_high_risk_candidate(change, result, diff):
         "next_check_at": revision_timestamp + WIKI_HIGH_RISK_DELAY_SECONDS,
         "verification_attempts": 0,
         "revert_risk": risk,
+        "cope_b": cope_b,
         "final_score": result.get("score"),
         "raw_score": result.get("raw_score"),
         "is_new_page": change.get("type") == "new",
@@ -16188,8 +16206,8 @@ def build_high_risk_wikitext(now=None):
     return build_high_risk_page(
         visible,
         "Edições com alto risco de erro",
-        "Esta lista inclui edições da Wikipédia em português com risco "
-        f"superior a {WIKI_HIGH_RISK_THRESHOLD:.0%}.",
+        "Esta lista inclui edições da Wikipédia em português com Revert Risk "
+        f"superior a {WIKI_HIGH_RISK_THRESHOLD:.0%} ou classificadas como positivas pelo CoPE-B.",
     )
 
 
