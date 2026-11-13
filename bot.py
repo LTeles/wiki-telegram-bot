@@ -34,7 +34,7 @@ def data_path(filename):
 # =========================================================
 
 BOT_VERSION = "4.0"
-BOT_BUILD = "4.0-cope-b-shadow-rating"
+BOT_BUILD = "4.0-cope-b-labeler-version"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -64,13 +64,13 @@ REVERT_RISK_API = (
 # resposta nunca entra no cálculo, nos limiares ou nas filas de risco.
 COPE_B_API = "https://api.zentropi.ai/v1/label"
 COPE_B_API_KEY = os.environ.get("COPE_B_API_KEY", "").strip()
-COPE_B_MIN_INTERVAL_SECONDS = 20.0  # no máximo 3 tentativas por minuto
-COPE_B_DAILY_CALL_LIMIT = max(
-    1, int(os.environ.get("COPE_B_DAILY_CALL_LIMIT", "100"))
-)
-COPE_B_STATE_FILE = data_path("cope_b_api_state.json")
+COPE_B_LABELER_ID = os.environ.get("COPE_B_LABELER_ID", "").strip()
+COPE_B_LABELER_VERSION_ID = os.environ.get(
+    "COPE_B_LABELER_VERSION_ID", ""
+).strip()
 _cope_b_call_lock = threading.Lock()
-_cope_b_next_call_at = 0.0
+_cope_b_retry_after_until = 0.0
+_cope_b_consecutive_429s = 0
 COPE_B_VANDALISM_POLICY = (
     "Avalie somente a diferença entre a versão anterior e a nova edição da "
     "Wikipédia em português. Responda positivo (1) apenas quando o conteúdo "
@@ -2912,7 +2912,7 @@ WIKI_RELEASE_NOTES = {
     "3.57": "Substitui o aviso textual pela transclusão da subpágina /Instruções, posicionada abaixo do bloco completo de navegação por arquivos e datas.",
     "3.58": "Limpa os elementos flutuantes após a transclusão de /Instruções para manter o título e o conteúdo principal em largura total.",
     "3.59": "Adiciona avaliação experimental do CoPE-B às postagens que já seriam publicadas, com limite local persistente de chamadas; o Revert Risk e os critérios atuais continuam determinando o risco e os alertas.",
-    "4.0": "Inicia o piloto do CoPE-B em modo sombra: acrescenta uma avaliação independente às postagens já aprovadas pelo detector, sem alterar o risco ou os critérios atuais; limita as chamadas e preserva o alerta se a API falhar.",
+    "4.0": "Inicia o piloto do CoPE-B em modo sombra com labeler e versão configuráveis: acrescenta avaliação independente às postagens já aprovadas, sem alterar risco ou critérios atuais; sem teto local de chamadas, respeita HTTP 429 da Zentropi e preserva o alerta se a API falhar.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -10074,49 +10074,35 @@ def get_revert_risk(revision_id):
         return None
 
 
-def _reserve_cope_b_call():
-    """Aplica limite persistente antes de cada tentativa à API do CoPE-B."""
-    global _cope_b_next_call_at
-    now = time.time()
-    today = datetime.now(timezone.utc).date().isoformat()
-    with _cope_b_call_lock:
-        state = load_json(COPE_B_STATE_FILE, {})
-        if not isinstance(state, dict) or state.get("utc_date") != today:
-            state = {"utc_date": today, "calls": 0, "last_call_at": 0.0}
+def _cope_b_retry_delay(response):
+    """Retorna o Retry-After da Zentropi; usa espera progressiva se ausente."""
+    from email.utils import parsedate_to_datetime
+    global _cope_b_consecutive_429s
+    _cope_b_consecutive_429s += 1
+    retry_after = (getattr(response, "headers", {}) or {}).get("Retry-After", "")
+    try:
+        return max(0.0, float(retry_after))
+    except (TypeError, ValueError):
         try:
-            calls = max(0, int(state.get("calls", 0)))
-            last_call_at = float(state.get("last_call_at", 0.0) or 0.0)
+            retry_date = parsedate_to_datetime(retry_after)
+            if retry_date.tzinfo is None:
+                retry_date = retry_date.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_date - datetime.now(timezone.utc)).total_seconds())
         except (TypeError, ValueError, OverflowError):
-            calls, last_call_at = 0, 0.0
-
-        if calls >= COPE_B_DAILY_CALL_LIMIT:
-            return False, "limite diário local atingido"
-        if now - last_call_at < COPE_B_MIN_INTERVAL_SECONDS:
-            return False, "intervalo mínimo entre chamadas"
-        if time.monotonic() < _cope_b_next_call_at:
-            return False, "intervalo mínimo entre chamadas"
-
-        state.update({"utc_date": today, "calls": calls + 1, "last_call_at": now})
-        atomic_write_json(COPE_B_STATE_FILE, state)
-        _cope_b_next_call_at = time.monotonic() + COPE_B_MIN_INTERVAL_SECONDS
-        return True, None
+            return min(900.0, 30.0 * (2 ** min(_cope_b_consecutive_429s - 1, 5)))
 
 
 def get_cope_b_assessment(change, diff):
     """Consulta CoPE-B para informação paralela; falhas nunca afetam o alerta."""
+    global _cope_b_retry_after_until, _cope_b_consecutive_429s
     if not COPE_B_API_KEY:
         return None
 
-    try:
-        reserved, reason = _reserve_cope_b_call()
-    except Exception as exc:
-        # Falha na persistência do limitador desativa apenas o CoPE-B; nunca
-        # interrompe nem suprime o alerta calculado pelos critérios atuais.
-        print("⚠️ Limitador local do CoPE-B falhou; chamada ignorada:", safe_exception(exc))
-        return None
     revision_id = (change.get("revision") or {}).get("new")
-    if not reserved:
-        print(f"ℹ️ CoPE-B não consultado rev_id={revision_id}: {reason}.")
+    with _cope_b_call_lock:
+        remaining = _cope_b_retry_after_until - time.time()
+    if remaining > 0:
+        print(f"ℹ️ CoPE-B em pausa após HTTP 429 por mais {remaining:.0f}s; alerta Telegram segue normalmente.")
         return None
 
     added = str((diff or {}).get("added") or "")[:MAX_DIFF_CHARS]
@@ -10128,6 +10114,31 @@ def get_cope_b_assessment(change, diff):
         f"TRECHO REMOVIDO:\n{removed or '[nenhum]'}"
     )[:2 * MAX_DIFF_CHARS + 1000]
 
+    # Quando há um labeler salvo, fixa a versão escolhida pelo usuário.
+    # Se apenas um dos IDs estiver configurado, ignora o CoPE-B para evitar
+    # avaliar com uma configuração diferente da pretendida.
+    has_labeler_id = bool(COPE_B_LABELER_ID)
+    has_version_id = bool(COPE_B_LABELER_VERSION_ID)
+    if has_labeler_id != has_version_id:
+        print(
+            f"⚠️ CoPE-B sem consulta rev_id={revision_id}: "
+            "configure juntos COPE_B_LABELER_ID e COPE_B_LABELER_VERSION_ID."
+        )
+        return None
+
+    request_payload = {"content_text": content}
+    if has_labeler_id:
+        request_payload.update({
+            "labeler_id": COPE_B_LABELER_ID,
+            "labeler_version_id": COPE_B_LABELER_VERSION_ID,
+        })
+    else:
+        # Compatibilidade: sem IDs, usa a política inline original do piloto.
+        request_payload.update({
+            "criteria_text": COPE_B_VANDALISM_POLICY,
+            "model": "cope-b-a4b",
+        })
+
     try:
         response = requests.post(
             COPE_B_API,
@@ -10136,17 +10147,17 @@ def get_cope_b_assessment(change, diff):
                 "Authorization": f"Bearer {COPE_B_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={
-                "content_text": content,
-                "criteria_text": COPE_B_VANDALISM_POLICY,
-                "model": "cope-b-a4b",
-            },
+            json=request_payload,
             timeout=(3.05, 6),
         )
         if response.status_code == 429:
-            print(f"⚠️ CoPE-B HTTP 429 rev_id={revision_id}; sem nova tentativa.")
+            delay = _cope_b_retry_delay(response)
+            with _cope_b_call_lock:
+                _cope_b_retry_after_until = max(_cope_b_retry_after_until, time.time() + delay)
+            print(f"⚠️ CoPE-B HTTP 429 rev_id={revision_id}; próxima consulta após {delay:.0f}s. Alerta Telegram segue normalmente.")
             return None
         response.raise_for_status()
+        _cope_b_consecutive_429s = 0
         payload = response.json()
         label = str(payload.get("label", "")).strip()
         confidence = float(payload.get("confidence"))
@@ -10157,7 +10168,8 @@ def get_cope_b_assessment(change, diff):
             "label": label,
             "confidence": confidence,
             "compute_time": payload.get("compute_time"),
-            "model": "cope-b-a4b",
+            "labeler_id": COPE_B_LABELER_ID or None,
+            "labeler_version_id": COPE_B_LABELER_VERSION_ID or None,
         }
         print(
             f"🧪 CoPE-B rev_id={revision_id}: "
