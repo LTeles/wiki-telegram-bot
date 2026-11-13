@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "3.58"
-BOT_BUILD = "3.58-clear-float-after-instructions"
+BOT_VERSION = "4.0"
+BOT_BUILD = "4.0-cope-b-shadow-rating"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -57,6 +57,32 @@ WIKIMEDIA_BOT_PASSWORD = os.environ.get(
 REVERT_RISK_API = (
     "https://api.wikimedia.org/service/lw/inference/v1/"
     "models/revertrisk-multilingual:predict"
+)
+
+# CoPE-B é apenas um sinal informativo em paralelo. A chamada ocorre somente
+# para edições que já passaram pelos critérios atuais para publicação; a
+# resposta nunca entra no cálculo, nos limiares ou nas filas de risco.
+COPE_B_API = "https://api.zentropi.ai/v1/label"
+COPE_B_API_KEY = os.environ.get("COPE_B_API_KEY", "").strip()
+COPE_B_MIN_INTERVAL_SECONDS = 20.0  # no máximo 3 tentativas por minuto
+COPE_B_DAILY_CALL_LIMIT = max(
+    1, int(os.environ.get("COPE_B_DAILY_CALL_LIMIT", "100"))
+)
+COPE_B_STATE_FILE = data_path("cope_b_api_state.json")
+_cope_b_call_lock = threading.Lock()
+_cope_b_next_call_at = 0.0
+COPE_B_VANDALISM_POLICY = (
+    "Avalie somente a diferença entre a versão anterior e a nova edição da "
+    "Wikipédia em português. Responda positivo (1) apenas quando o conteúdo "
+    "adicionado ou removido apresentar sinais claros de vandalismo: apagar "
+    "ou esvaziar conteúdo útil sem justificativa aparente, inserir texto "
+    "sem sentido, insultos ou ataques, spam ou propaganda, ou adulteração "
+    "evidente para prejudicar o artigo. Responda negativo (0) para correções, "
+    "contribuições plausíveis, alterações controversas ou de estilo, erros "
+    "de boa-fé, conteúdo apenas mal referenciado ou mudanças cuja intenção "
+    "não possa ser inferida da diferença. Não classifique como vandalismo "
+    "somente porque a edição pode ser revertida, porque o editor é novo ou "
+    "anônimo, ou porque a mudança não é perfeita."
 )
 
 HEADERS = {
@@ -1339,6 +1365,7 @@ def register_false_positive(record, actor, reporter_user_id=None, reporter_usern
         "edit_comment": record.get("edit_comment"),
         "diff_url": record.get("diff_url"),
         "revert_risk": record.get("revert_risk"),
+        "cope_b": record.get("cope_b"),
         "final_score": record.get("final_score"),
         "telegram_message_id": record.get("message_id"),
         "alert_kind": record.get("alert_kind"),
@@ -1396,6 +1423,17 @@ def false_positive_message(item, fixed=False):
                 f"{round(float(item['revert_risk']) * 100)}%\n"
             )
         except Exception:
+            pass
+    cope_b = item.get("cope_b")
+    if isinstance(cope_b, dict) and cope_b.get("label") in ("0", "1"):
+        cope_label = "positivo" if cope_b.get("label") == "1" else "negativo"
+        try:
+            cope_confidence = round(float(cope_b.get("confidence")) * 100)
+            risk_line += (
+                f"\n🧪 CoPE-B (teste): {cope_label} "
+                f"(confiança {cope_confidence}%)\n"
+            )
+        except (TypeError, ValueError):
             pass
 
     if fixed:
@@ -2873,6 +2911,8 @@ WIKI_RELEASE_NOTES = {
     "3.56": "Restaura no cabeçalho das edições de alto risco o aviso para instalar o gadget de revisão e habilitar os botões de revisão e as ações do Selet.",
     "3.57": "Substitui o aviso textual pela transclusão da subpágina /Instruções, posicionada abaixo do bloco completo de navegação por arquivos e datas.",
     "3.58": "Limpa os elementos flutuantes após a transclusão de /Instruções para manter o título e o conteúdo principal em largura total.",
+    "3.59": "Adiciona avaliação experimental do CoPE-B às postagens que já seriam publicadas, com limite local persistente de chamadas; o Revert Risk e os critérios atuais continuam determinando o risco e os alertas.",
+    "4.0": "Inicia o piloto do CoPE-B em modo sombra: acrescenta uma avaliação independente às postagens já aprovadas pelo detector, sem alterar o risco ou os critérios atuais; limita as chamadas e preserva o alerta se a API falhar.",
 }
 WIKI_RELEASE_HISTORY_FILE = data_path("wiki_release_history.json")
 
@@ -6190,6 +6230,7 @@ def register_posted_edit(item, telegram_message):
         "revision_timestamp": item.get("revision_timestamp"),
         "diff_url": item.get("diff_url"),
         "revert_risk": stats_payload.get("revert_risk"),
+        "cope_b": stats_payload.get("cope_b"),
         "is_new_page": bool(stats_payload.get("is_new_page")),
         "new_page_legitimacy": stats_payload.get("new_page_legitimacy"),
         "raw_score": stats_payload.get("raw_score"),
@@ -6980,6 +7021,18 @@ def message_with_status(record, status, reverter=None, deleter=None, patroller=N
         except Exception:
             pass
 
+    cope_b = record.get("cope_b")
+    if isinstance(cope_b, dict) and cope_b.get("label") in ("0", "1"):
+        cope_label = "positivo" if cope_b.get("label") == "1" else "negativo"
+        try:
+            cope_confidence = round(float(cope_b.get("confidence")) * 100)
+            risk_line += (
+                f"🧪 CoPE-B (teste): {cope_label} "
+                f"(confiança {cope_confidence}%)\n"
+            )
+        except (TypeError, ValueError):
+            pass
+
     edit_link = edit_link_html(diff_url)
 
     if status == "self_reverted":
@@ -7048,6 +7101,7 @@ def message_with_status(record, status, reverter=None, deleter=None, patroller=N
             "edit_comment": record.get("edit_comment"),
             "diff_url": record.get("diff_url"),
             "revert_risk": record.get("revert_risk"),
+            "cope_b": record.get("cope_b"),
             "marked_by": record.get("false_positive_by"),
         }
         return false_positive_message(false_item, fixed=False)
@@ -10020,6 +10074,103 @@ def get_revert_risk(revision_id):
         return None
 
 
+def _reserve_cope_b_call():
+    """Aplica limite persistente antes de cada tentativa à API do CoPE-B."""
+    global _cope_b_next_call_at
+    now = time.time()
+    today = datetime.now(timezone.utc).date().isoformat()
+    with _cope_b_call_lock:
+        state = load_json(COPE_B_STATE_FILE, {})
+        if not isinstance(state, dict) or state.get("utc_date") != today:
+            state = {"utc_date": today, "calls": 0, "last_call_at": 0.0}
+        try:
+            calls = max(0, int(state.get("calls", 0)))
+            last_call_at = float(state.get("last_call_at", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            calls, last_call_at = 0, 0.0
+
+        if calls >= COPE_B_DAILY_CALL_LIMIT:
+            return False, "limite diário local atingido"
+        if now - last_call_at < COPE_B_MIN_INTERVAL_SECONDS:
+            return False, "intervalo mínimo entre chamadas"
+        if time.monotonic() < _cope_b_next_call_at:
+            return False, "intervalo mínimo entre chamadas"
+
+        state.update({"utc_date": today, "calls": calls + 1, "last_call_at": now})
+        atomic_write_json(COPE_B_STATE_FILE, state)
+        _cope_b_next_call_at = time.monotonic() + COPE_B_MIN_INTERVAL_SECONDS
+        return True, None
+
+
+def get_cope_b_assessment(change, diff):
+    """Consulta CoPE-B para informação paralela; falhas nunca afetam o alerta."""
+    if not COPE_B_API_KEY:
+        return None
+
+    try:
+        reserved, reason = _reserve_cope_b_call()
+    except Exception as exc:
+        # Falha na persistência do limitador desativa apenas o CoPE-B; nunca
+        # interrompe nem suprime o alerta calculado pelos critérios atuais.
+        print("⚠️ Limitador local do CoPE-B falhou; chamada ignorada:", safe_exception(exc))
+        return None
+    revision_id = (change.get("revision") or {}).get("new")
+    if not reserved:
+        print(f"ℹ️ CoPE-B não consultado rev_id={revision_id}: {reason}.")
+        return None
+
+    added = str((diff or {}).get("added") or "")[:MAX_DIFF_CHARS]
+    removed = str((diff or {}).get("removed") or "")[:MAX_DIFF_CHARS]
+    content = (
+        f"Título da página: {change.get('title') or ''}\n"
+        f"Resumo da edição: {change.get('comment') or ''}\n\n"
+        f"TRECHO ADICIONADO:\n{added or '[nenhum]'}\n\n"
+        f"TRECHO REMOVIDO:\n{removed or '[nenhum]'}"
+    )[:2 * MAX_DIFF_CHARS + 1000]
+
+    try:
+        response = requests.post(
+            COPE_B_API,
+            headers={
+                **HEADERS,
+                "Authorization": f"Bearer {COPE_B_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "content_text": content,
+                "criteria_text": COPE_B_VANDALISM_POLICY,
+                "model": "cope-b-a4b",
+            },
+            timeout=(3.05, 6),
+        )
+        if response.status_code == 429:
+            print(f"⚠️ CoPE-B HTTP 429 rev_id={revision_id}; sem nova tentativa.")
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        label = str(payload.get("label", "")).strip()
+        confidence = float(payload.get("confidence"))
+        if label not in ("0", "1") or not 0.5 <= confidence <= 1.0:
+            print(f"⚠️ CoPE-B resposta inválida rev_id={revision_id}.")
+            return None
+        result = {
+            "label": label,
+            "confidence": confidence,
+            "compute_time": payload.get("compute_time"),
+            "model": "cope-b-a4b",
+        }
+        print(
+            f"🧪 CoPE-B rev_id={revision_id}: "
+            f"{'positivo' if label == '1' else 'negativo'} "
+            f"(confiança {confidence:.0%})."
+        )
+        return result
+    except Exception as exc:
+        # Não registrar o corpo enviado, cabeçalhos ou a chave da API.
+        print(f"⚠️ Erro CoPE-B rev_id={revision_id}:", safe_exception(exc))
+        return None
+
+
 BAD_WORDS = [
     "merda",
     "porra",
@@ -11750,7 +11901,7 @@ def format_watched_message(change):
     )
 
 
-def format_message(change, result):
+def format_message(change, result, cope_b=None):
     final_score = round(
         result["score"] * 100
     )
@@ -11797,6 +11948,17 @@ def format_message(change, result):
             result["revert_risk"] * 100
         )
         risk_line = f"🤖 Risco de reversão: {revert_score}%"
+
+    if isinstance(cope_b, dict) and cope_b.get("label") in ("0", "1"):
+        cope_label = "positivo" if cope_b.get("label") == "1" else "negativo"
+        try:
+            cope_confidence = round(float(cope_b.get("confidence")) * 100)
+            risk_line += (
+                f"\n🧪 CoPE-B (teste): {cope_label} "
+                f"(confiança {cope_confidence}%)"
+            )
+        except (TypeError, ValueError):
+            pass
 
     return (
         f"{heading}\n\n"
@@ -12024,6 +12186,10 @@ def analysis_worker():
                 >=
                 VANDALISM_THRESHOLD
             ):
+                # Consulta adicional e independente. O resultado do CoPE-B
+                # não altera score, limiares, observações ou inclusão no alerta.
+                cope_b = get_cope_b_assessment(change, diff)
+
                 if result["score"] >= 0.98:
                     high_score_case = start_abuse_filter_test_observation(
                         username,
@@ -12050,7 +12216,8 @@ def analysis_worker():
                 enqueue_high_risk_candidate(change, result, diff)
                 message = format_message(
                     change,
-                    result
+                    result,
+                    cope_b=cope_b,
                 )
 
                 telegram_queue.put(
@@ -12066,6 +12233,7 @@ def analysis_worker():
                             "revert_risk": result[
                                 "revert_risk"
                             ],
+                            "cope_b": cope_b,
                             "is_new_page": is_new_page,
                             "new_page_legitimacy": result.get("new_page_legitimacy"),
                             "raw_score": result.get("raw_score"),
