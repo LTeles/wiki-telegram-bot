@@ -16386,6 +16386,25 @@ def revalidate_approved_high_risk_candidates(now=None):
                             reason, "verification_inconclusive"
                         )
                     archived["prepublish_status_inferred"] = True
+                    evidence = result.get("evidence")
+                    if not isinstance(evidence, dict):
+                        evidence = {}
+                    actor_fields = {
+                        "reverted": ("reverted_by", "reverted_at"),
+                        "patrolled": ("patrolled_by", "patrolled_at"),
+                        "deleted": ("deleted_by", "deleted_at"),
+                        "resolved_no_action": ("resolved_by", "resolved_at"),
+                        "false_positive": ("false_positive_by", "false_positive_at"),
+                        "manual_vandalism": ("manual_reviewer", "manual_reviewed_at"),
+                        "manual_clean": ("manual_reviewer", "manual_reviewed_at"),
+                    }
+                    actor_key, timestamp_key = actor_fields.get(
+                        archived["status"], (None, None)
+                    )
+                    if actor_key and evidence.get("actor"):
+                        archived[actor_key] = evidence["actor"]
+                    if timestamp_key and evidence.get("timestamp"):
+                        archived[timestamp_key] = evidence["timestamp"]
                 archived["last_checked_at"] = now
                 archived_day = archived.get("archive_date")
                 changed_archive = True
