@@ -34,7 +34,7 @@ def data_path(filename):
 # =========================================================
 
 BOT_VERSION = "4.2"
-BOT_BUILD = "4.2-pattern-validation-archive-colors"
+BOT_BUILD = "4.2-pattern-validation-main-pending"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2850,7 +2850,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
-    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Corrige criação e sincronização dos arquivos diários, preserva cards resolvidos e colore o índice por pendências e faixa de risco. Sem alteração dos alertas.",
+    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Corrige criação e sincronização dos arquivos diários, preserva cards resolvidos, colore o índice por pendências e mantém verificações inconclusivas visíveis como pendentes. Sem alteração dos alertas.",
     "4.1": "Amplia o aprendizado por contexto sem limite de exemplos, persiste modelo e catálogo, separa avaliações manuais de falsos positivos e adiciona página de padrões e consultas /padroes, /aprendizado e /analisepadrao. O aprendizado permanece informativo.",
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
     "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
@@ -15042,8 +15042,6 @@ def high_risk_action(record):
         return "Resolvido manualmente: edição indevida", record.get("manual_reviewer"), record.get("manual_reviewed_at")
     if status == "manual_clean":
         return "Resolvido manualmente: edição legítima", record.get("manual_reviewer"), record.get("manual_reviewed_at")
-    if status == "verification_inconclusive":
-        return "Verificação inconclusiva", None, record.get("last_checked_at")
     return None, None, None
 
 
@@ -15670,7 +15668,9 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         if false_positive_deadline > 0 else ""
     )
     template_status = record.get("status") or "pending"
-    if action:
+    if template_status == "verification_inconclusive":
+        status_text = "Verificação inconclusiva · continua pendente"
+    elif action:
         status_text = (
             f"{action} por {high_risk_account_link(actor)}" if actor else action
         )
