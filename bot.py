@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.1"
-BOT_BUILD = "4.1-pattern-learning"
+BOT_VERSION = "4.2"
+BOT_BUILD = "4.2-pattern-validation"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2850,6 +2850,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Sem alteração dos alertas.",
     "4.1": "Amplia o aprendizado por contexto sem limite de exemplos, persiste modelo e catálogo, separa avaliações manuais de falsos positivos e adiciona página de padrões e consultas /padroes, /aprendizado e /analisepadrao. O aprendizado permanece informativo.",
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
     "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
@@ -12297,6 +12298,7 @@ def commands_message():
         "📡 /status — mostra o estado do bot.\n"
         "📊 /padroes — padrões estruturais.\n"
         "🧠 /aprendizado — base de treinamento.\n"
+        "📈 /validacao — desempenho retrospectivo.\n"
         "🔎 /analisepadrao <revid> — análise experimental de revisão arquivada.\n"
         "⏸ /pausarwiki — pausa toda escrita automatizada na Wikipédia em português.\n"
         "▶️ /reiniciarwiki — retoma toda escrita automatizada na Wikipédia em português.\n"
@@ -12432,7 +12434,7 @@ def process_telegram_command(message, from_channel=False):
         else ""
     )
 
-    if command in ("/padroes", "/aprendizado", "/analisepadrao"):
+    if command in ("/padroes", "/aprendizado", "/analisepadrao", "/validacao"):
         if not is_target_channel(chat):
             send_telegram_message("Consulta disponível no canal configurado.", chat_id=chat_id)
             return
@@ -15099,6 +15101,7 @@ HIGH_RISK_PATTERN_MIN_PER_CLASS = 3
 HIGH_RISK_PATTERN_MAX_SAMPLES_PER_CLASS = None
 HIGH_RISK_PATTERN_VERSION = 3
 HIGH_RISK_PATTERN_MODEL_FILE = data_path("pattern_model.json")
+HIGH_RISK_PATTERN_VALIDATION_FILE = data_path("pattern_validation.json")
 HIGH_RISK_PATTERN_CATALOG_FILE = data_path("pattern_catalog.json")
 HIGH_RISK_PATTERN_PERSIST_LOCK = threading.Lock()
 HIGH_RISK_PATTERN_CONTEXT_MIN = 20
@@ -15198,10 +15201,8 @@ def high_risk_pattern_features(record):
     return features
 
 
-def train_high_risk_pattern_model():
-    """Aprende apenas de diffs arquivados com um dos quatro rótulos definidos."""
-    with high_risk_archive_lock:
-        records = [dict(item) for item in high_risk_archive.values()]
+def build_high_risk_pattern_model(records):
+    """Constrói modelo em memória sem persistir dados."""
 
     def build(rows):
         samples = {"vandalismo": [], "sem_vandalismo": []}
@@ -15224,6 +15225,12 @@ def train_high_risk_pattern_model():
                 "ready": all(len(v) >= HIGH_RISK_PATTERN_MIN_PER_CLASS for v in samples.values())}
     model = build(records)
     model["contexts"] = {group: build([r for r in records if high_risk_pattern_context(r)==group]) for group in ("artigos", "discussoes", "outros")}
+    return model
+
+def train_high_risk_pattern_model():
+    with high_risk_archive_lock:
+        records = [dict(item) for item in high_risk_archive.values()]
+    model = build_high_risk_pattern_model(records)
     try:
         persist_high_risk_pattern_model(model)
     except Exception as exc:
@@ -15280,8 +15287,91 @@ def pattern_catalog_snapshot():
     return data
 
 
+def pattern_validation_timestamp(value):
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) else None
+    return parse_mw_timestamp(value)
+
+
+def pattern_validation_metrics(pairs):
+    a, b = "vandalismo", "sem_vandalismo"
+    tp = sum(y == a and p == a for y,p in pairs)
+    tn = sum(y == b and p == b for y,p in pairs)
+    fp = sum(y == b and p == a for y,p in pairs)
+    fn = sum(y == a and p == b for y,p in pairs)
+    ua = sum(y == a and p is None for y,p in pairs)
+    ub = sum(y == b and p is None for y,p in pairs)
+    def ratio(n,d): return n/d if d else None
+    return dict(tp=tp, tn=tn, fp=fp, fn=fn, inconclusive_positive=ua,
+                inconclusive_negative=ub, total=len(pairs),
+                sensitivity=ratio(tp,tp+fn), specificity=ratio(tn,tn+fp),
+                ppv=ratio(tp,tp+fp), npv=ratio(tn,tn+fn),
+                f1=ratio(2*tp,2*tp+fp+fn), coverage=ratio(tp+tn+fp+fn,len(pairs)))
+
+
+def run_pattern_validation():
+    with high_risk_archive_lock:
+        records = [dict(r) for r in high_risk_archive.values()]
+    fields = {"reverted":"reverted_at", "deleted":"deleted_at", "patrolled":"patrolled_at", "false_positive":"false_positive_at", "manual_clean":"manual_reviewed_at", "manual_vandalism":"manual_reviewed_at"}
+    rows = []
+    for r in records:
+        t = pattern_validation_timestamp(r.get("revision_timestamp"))
+        known = pattern_validation_timestamp(r.get(fields.get(r.get("status"), "")))
+        if t is not None and known is not None and known >= t and high_risk_pattern_label(r.get("status")) and high_risk_pattern_features(r):
+            rows.append((t,known,r))
+    rows.sort(key=lambda x:x[0])
+    result = {"generated_at":datetime.now(timezone.utc).isoformat(), "version":BOT_VERSION, "eligible":len(rows), "excluded_missing_or_ineligible":len(records)-len(rows), "groups":{}}
+    if len(rows) >= 10:
+        cutoff = rows[int(len(rows)*0.8)][0]
+        test = [r for t,k,r in rows if t >= cutoff]
+        # Conservative separation: no shared author or page across train/test.
+        def key(v): return str(v or "").replace("_"," ").strip().casefold()
+        users = {key(r.get("username")) for r in test} - {""}
+        titles = {key(r.get("title")) for r in test} - {""}
+        prior = [r for t,k,r in rows if t < cutoff and k < cutoff]
+        train = [r for r in prior if key(r.get("username")) not in users and key(r.get("title")) not in titles]
+        model = build_high_risk_pattern_model(train)
+        result.update(cutoff=datetime.fromtimestamp(cutoff,timezone.utc).isoformat(), train=len(train), test=len(test), excluded_overlap=len(prior)-len(train), train_counts=model["counts"], ready=model["ready"])
+        if model["ready"]:
+            groups = {g:{"pattern":[],"risk":[],"pattern_paired":[],"risk_paired":[]} for g in ("geral","artigos","discussoes","outros")}
+            for r in test:
+                y = high_risk_pattern_label(r.get("status"))
+                p = classify_high_risk_pattern(r,model)["label"]
+                try:
+                    risk = float(r.get("revert_risk"))
+                    q = ("vandalismo" if risk >= .8 else "sem_vandalismo") if 0 <= risk <= 1 else None
+                except (TypeError,ValueError): q = None
+                for g in ("geral",high_risk_pattern_context(r)):
+                    groups[g]["pattern"].append((y,p)); groups[g]["risk"].append((y,q))
+                    if p is not None and q is not None:
+                        groups[g]["pattern_paired"].append((y,p)); groups[g]["risk_paired"].append((y,q))
+            result["groups"] = {g:{k:pattern_validation_metrics(v) for k,v in d.items()} for g,d in groups.items()}
+    old = load_json(HIGH_RISK_PATTERN_VALIDATION_FILE,{})
+    history = old.get("history",[]) if isinstance(old,dict) else []
+    if not isinstance(history,list): history=[]
+    atomic_write_json(HIGH_RISK_PATTERN_VALIDATION_FILE,{"latest":result,"history":(history+[result])[-365:]})
+    return result
+
+
+def pattern_validation_summary():
+    data = load_json(HIGH_RISK_PATTERN_VALIDATION_FILE,{})
+    r = data.get("latest",{}) if isinstance(data,dict) else {}
+    if not r: return "Validação ainda indisponível."
+    lines = ["Validação temporal retrospectiva (UTC): " + str(r.get("generated_at","")),
+             f"Elegíveis: {r.get('eligible',0)}; treino: {r.get('train',0)}; teste: {r.get('test',0)}; excluídos por autor/página compartilhados: {r.get('excluded_overlap',0)}.",
+             "Métricas condicionadas às classificações conclusivas; cobertura inclui todos os casos. Revert Risk: limiar fixo de 80%. Amostra selecionada por alertas; rótulos operacionais, não padrão-ouro."]
+    if not r.get("ready"): lines.append("Treino insuficiente após separação temporal.")
+    def pct(v): return "N/D" if v is None else f"{v:.1%}"
+    for g,d in r.get("groups",{}).items():
+        lines.append(g.capitalize())
+        for k,label in (("pattern","Padrões"),("risk","Revert Risk"),("pattern_paired","Padrões (pareados)"),("risk_paired","Risk (pareados)")):
+            m=d[k]
+            lines.append(f"{label}: n={m['total']}; VP={m['tp']} VN={m['tn']} FP={m['fp']} FN={m['fn']}; inconclusivos={m['inconclusive_positive']+m['inconclusive_negative']}; sens. {pct(m['sensitivity'])}; esp. {pct(m['specificity'])}; VPP {pct(m['ppv'])}; VPN {pct(m['npv'])}; F1 {pct(m['f1'])}; cobertura {pct(m['coverage'])}.")
+    return "\n".join(lines)
+
+
 def build_pattern_wikitext(data):
-    lines = ["__NOTOC__", "Aprendizado experimental de padrões em edições arquivadas. Sem alteração do risco ou dos alertas. Frequências descritivas, não probabilidades de vandalismo. A amostra é selecionada por alertas e não representa todas as edições.", "Atualização (UTC): " + str(data.get("generated_at", "")), "Validação retrospectiva: ainda não disponível."]
+    lines = ["__NOTOC__", "Aprendizado experimental de padrões em edições arquivadas. Sem alteração do risco ou dos alertas. Frequências descritivas, não probabilidades de vandalismo. A amostra é selecionada por alertas e não representa todas as edições.", "Atualização (UTC): " + str(data.get("generated_at", "")), "== Validação retrospectiva ==", *["* " + line for line in pattern_validation_summary().splitlines()]]
     for key in ("geral", "artigos", "discussoes", "outros"):
         group = data["groups"].get(key, {})
         counts = group.get("counts", {})
@@ -15299,6 +15389,10 @@ def pattern_publication_worker():
         try:
             if high_risk_publish_enabled() and not high_risk_writing_paused():
                 train_high_risk_pattern_model()
+                try:
+                    run_pattern_validation()
+                except Exception as exc:
+                    print("Falha na validação de padrões:", safe_exception(exc))
                 queue_wiki_edit(WIKI_PATTERN_TITLE, build_pattern_wikitext(pattern_catalog_snapshot()), "Atualizando catálogo de padrões de edições")
         except Exception as exc:
             print("⚠️ Falha na publicação de padrões:", safe_exception(exc))
@@ -15307,6 +15401,16 @@ def pattern_publication_worker():
 
 def process_pattern_command(command, argument, chat_id):
     try:
+        if command == "/validacao":
+            message = pattern_validation_summary()
+            chunk = ""
+            for line in message.splitlines():
+                if len(chunk)+len(line)>3000:
+                    send_telegram_message(chunk, chat_id=chat_id)
+                    chunk = ""
+                chunk += line + "\n"
+            if chunk: send_telegram_message(chunk, chat_id=chat_id)
+            return
         if command == "/analisepadrao":
             if not re.fullmatch(r"[1-9][0-9]{0,19}", argument):
                 send_telegram_message("Uso: /analisepadrao <revid>", chat_id=chat_id)
@@ -15330,7 +15434,7 @@ def process_pattern_command(command, argument, chat_id):
             if command == "/padroes":
                 for heading, rows in pattern_public_summary(data["groups"].get("geral", {})):
                     message += "\n\n" + heading + "\n" + "\n".join(rows)
-            message += "\nValidação retrospectiva pendente."
+            message += "\nConsulte /validacao para o desempenho retrospectivo."
         send_telegram_message(message, chat_id=chat_id)
     except Exception as exc:
         print("⚠️ Consulta de padrões:", safe_exception(exc))
