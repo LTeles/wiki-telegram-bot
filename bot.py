@@ -15398,7 +15398,8 @@ def pattern_publication_worker():
                 queue_wiki_edit(WIKI_PATTERN_TITLE, build_pattern_wikitext(pattern_catalog_snapshot()), "Atualizando catálogo de padrões de edições")
         except Exception as exc:
             print("⚠️ Falha na publicação de padrões:", safe_exception(exc))
-        time.sleep(7200)
+        # Recalcula e publica o catálogo uma vez por dia.
+        time.sleep(86400)
 
 
 def process_pattern_command(command, argument, chat_id):
