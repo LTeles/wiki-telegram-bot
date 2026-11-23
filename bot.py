@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.0"
-BOT_BUILD = "4.0-cope-b-card-layout"
+BOT_VERSION = "4.1"
+BOT_BUILD = "4.1-pattern-learning"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -167,6 +167,7 @@ WIKI_WRITE_ENABLED = True
 WIKI_ALLOWED_TITLE_PREFIX = "Usuário:TelesGramBot/"
 WIKI_STATUS_TITLE = "Usuário:TelesGramBot/Status"
 WIKI_STATISTICS_TITLE = "Usuário:TelesGramBot/Estatísticas"
+WIKI_PATTERN_TITLE = "Usuário:TelesGramBot/Padrões de edições"
 WIKI_ADJUSTMENTS_TITLE = "Usuário:TelesGramBot/Ajustes"
 WIKI_HIGH_RISK_TITLE = "Usuário:TelesGramBot/Edições de alto risco"
 WIKI_HIGH_RISK_SUMMARY_TITLE = "Usuário:TelesGramBot/Resumo_edicoes_de_alto_risco"
@@ -2258,17 +2259,22 @@ def process_wiki_write_queue_once():
 
 
 def wiki_write_queue_worker():
-    wiki_record_release()
-    try:
-        queue_current_adjustments_log()
-    except Exception as exc:
-        print("⚠️ Falha ao preparar /Ajustes:", safe_exception(exc))
+    last_adjustments_attempt = 0
+    adjustments_ready = False
     mark_wiki_page_pending(WIKI_STATUS_TITLE)
     mark_wiki_page_pending(WIKI_STATISTICS_TITLE)
     mark_wiki_page_pending("Usuário:TelesGramBot/Sobre")  # Inventário apenas; sem criação/publicação automática.
     # O agendamento usa relógio persistido: reiniciar não provoca publicação extra.
     while True:
         try:
+            if not adjustments_ready and time.time() - last_adjustments_attempt >= 300:
+                last_adjustments_attempt = time.time()
+                try:
+                    wiki_record_release()
+                    queue_current_adjustments_log()
+                    adjustments_ready = True
+                except Exception as exc:
+                    print("⚠️ Falha ao preparar /Ajustes:", safe_exception(exc))
             state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
             legacy_title = "Usuário:TelesGramBot/Revisores"
             if any(item.get("title") == legacy_title for item in state.get("pending", [])):
@@ -2844,6 +2850,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.1": "Amplia o aprendizado por contexto sem limite de exemplos, persiste modelo e catálogo, separa avaliações manuais de falsos positivos e adiciona página de padrões e consultas /padroes, /aprendizado e /analisepadrao. O aprendizado permanece informativo.",
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
     "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
     "2.50": "Calibração de traduções equivalentes de datas em referências e mudanças exclusivamente de espaços/linhas vazias.",
@@ -12288,6 +12295,9 @@ def commands_message():
         "🔎 /falsonegativo ID ou LINK — registra uma revisão que o detector deixou passar.\n"
         "🧪 /falsosnegativos — mostra a base de calibração de falsos negativos.\n"
         "📡 /status — mostra o estado do bot.\n"
+        "📊 /padroes — padrões estruturais.\n"
+        "🧠 /aprendizado — base de treinamento.\n"
+        "🔎 /analisepadrao <revid> — análise experimental de revisão arquivada.\n"
         "⏸ /pausarwiki — pausa toda escrita automatizada na Wikipédia em português.\n"
         "▶️ /reiniciarwiki — retoma toda escrita automatizada na Wikipédia em português.\n"
         "⏸ /pausarteste — alias legado: pausa somente a lista de alto risco na ptwiki.\n"
@@ -12421,6 +12431,13 @@ def process_telegram_command(message, from_channel=False):
         if remaining
         else ""
     )
+
+    if command in ("/padroes", "/aprendizado", "/analisepadrao"):
+        if not is_target_channel(chat):
+            send_telegram_message("Consulta disponível no canal configurado.", chat_id=chat_id)
+            return
+        process_pattern_command(command, argument, chat_id)
+        return
 
     # Barreira central para comandos que alteram estado. As verificações
     # específicas existentes em cada comando permanecem como defesa em
@@ -15243,6 +15260,83 @@ def persist_high_risk_pattern_model(model):
         atomic_write_json(HIGH_RISK_PATTERN_CATALOG_FILE, {**metadata, "groups": {k: catalog(v) for k, v in groups.items()}})
 
 
+def pattern_public_summary(catalog, limit=5):
+    labels = {"shape:large_removal": "Remoção extensa", "shape:blanking": "Remoção sem acréscimo", "shape:many_exclamation_marks": "Múltiplas exclamações", "shape:repeated_character_run": "Caracteres repetidos", "shape:changed_year": "Alteração de ano", "shape:changed_number": "Alteração numérica", "shape:changed_negation": "Alteração de negação"}
+    for side, name in (("add", "Acréscimo"), ("remove", "Remoção")):
+        for key, desc in (("has_url", "URL"), ("has_reference", "referência"), ("has_category", "categoria"), ("size:short", "trecho curto"), ("size:medium", "trecho médio"), ("size:long", "trecho longo")):
+            labels[side + ":" + key] = name + ": " + desc
+    rows = [r for r in catalog.get("patterns", []) if r.get("feature") in labels and r.get("difference") is not None]
+    result = []
+    for positive in (True, False):
+        selected = sorted((r for r in rows if (r["difference"] > 0 if positive else r["difference"] < 0)), key=lambda r: abs(r["difference"]), reverse=True)[:limit]
+        result.append(("Mais frequentes nas indevidas" if positive else "Mais frequentes nas legítimas", [f"{labels[r['feature']]} — indevidas {r['counts']['vandalismo']} ({r['frequency']['vandalismo']:.1%}); legítimas {r['counts']['sem_vandalismo']} ({r['frequency']['sem_vandalismo']:.1%})" for r in selected]))
+    return result
+
+
+def pattern_catalog_snapshot():
+    data = load_json(HIGH_RISK_PATTERN_CATALOG_FILE, {})
+    if not isinstance(data, dict) or not data.get("groups"):
+        raise ValueError("Catálogo ainda indisponível; aguarde a atualização do modelo.")
+    return data
+
+
+def build_pattern_wikitext(data):
+    lines = ["__NOTOC__", "Aprendizado experimental de padrões em edições arquivadas. Sem alteração do risco ou dos alertas. Frequências descritivas, não probabilidades de vandalismo. A amostra é selecionada por alertas e não representa todas as edições.", "Atualização (UTC): " + str(data.get("generated_at", "")), "Validação retrospectiva: ainda não disponível."]
+    for key in ("geral", "artigos", "discussoes", "outros"):
+        group = data["groups"].get(key, {})
+        counts = group.get("counts", {})
+        lines.extend(["== " + key.capitalize() + " ==", f"* Indevidas: {counts.get('vandalismo', 0)}; legítimas: {counts.get('sem_vandalismo', 0)}"])
+        for heading, rows in pattern_public_summary(group):
+            lines.append("=== " + heading + " ===")
+            lines.extend("* " + row for row in rows)
+            if not rows:
+                lines.append("* Sem dados suficientes.")
+    return "\n".join(lines)
+
+
+def pattern_publication_worker():
+    while True:
+        try:
+            if high_risk_publish_enabled() and not high_risk_writing_paused():
+                train_high_risk_pattern_model()
+                queue_wiki_edit(WIKI_PATTERN_TITLE, build_pattern_wikitext(pattern_catalog_snapshot()), "Atualizando catálogo de padrões de edições")
+        except Exception as exc:
+            print("⚠️ Falha na publicação de padrões:", safe_exception(exc))
+        time.sleep(7200)
+
+
+def process_pattern_command(command, argument, chat_id):
+    try:
+        if command == "/analisepadrao":
+            if not re.fullmatch(r"[1-9][0-9]{0,19}", argument):
+                send_telegram_message("Uso: /analisepadrao <revid>", chat_id=chat_id)
+                return
+            with high_risk_archive_lock:
+                record = next((dict(r) for r in high_risk_archive.values() if str(r.get("revision_id")) == argument), None)
+            if record is None:
+                send_telegram_message("Revisão não encontrada no arquivo de alto risco.", chat_id=chat_id)
+                return
+            result = classify_high_risk_pattern(record, train_high_risk_pattern_model())
+            label = {"vandalismo": "indevida", "sem_vandalismo": "legítima"}.get(result["label"], "inconclusiva")
+            features = high_risk_pattern_features(record)
+            structural = sorted(f for f in features if ":word:" not in f and ":pair:" not in f)
+            message = f"Revisão {argument} — contexto: {high_risk_pattern_context(record)}\nClassificação experimental: {label}\nSemelhança com indevidas: {result['vandalismo_similarity']:.1%}\nSemelhança com legítimas: {result['sem_vandalismo_similarity']:.1%}\nSinais estruturais: " + (", ".join(structural) or "nenhum") + "\nNão altera o risco; semelhanças não são probabilidades."
+        else:
+            data = pattern_catalog_snapshot()
+            message = "Aprendizado experimental — " + str(data.get("generated_at", ""))
+            for key, group in data["groups"].items():
+                counts = group.get("counts", {})
+                message += f"\n{key}: {counts.get('vandalismo', 0)} indevidas / {counts.get('sem_vandalismo', 0)} legítimas"
+            if command == "/padroes":
+                for heading, rows in pattern_public_summary(data["groups"].get("geral", {})):
+                    message += "\n\n" + heading + "\n" + "\n".join(rows)
+            message += "\nValidação retrospectiva pendente."
+        send_telegram_message(message, chat_id=chat_id)
+    except Exception as exc:
+        print("⚠️ Consulta de padrões:", safe_exception(exc))
+        send_telegram_message("Consulta de padrões temporariamente indisponível.", chat_id=chat_id)
+
+
 def high_risk_pattern_similarity(left, right, idf):
     union = left | right
     if not union:
@@ -17434,6 +17528,7 @@ def main():
         ("pending-alerts-summary", pending_alerts_summary_scheduler),
         ("pending-resolution-reconciliation", pending_resolution_reconciliation_scheduler),
         ("ptwiki-high-risk-delay", ptwiki_high_risk_worker),
+        ("pattern-publication", pattern_publication_worker),
         ("manual-review-http", manual_review_http_server),
     ]
 
