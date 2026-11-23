@@ -34,7 +34,7 @@ def data_path(filename):
 # =========================================================
 
 BOT_VERSION = "4.2"
-BOT_BUILD = "4.2-pattern-validation"
+BOT_BUILD = "4.2-pattern-validation-archive-fix"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2114,7 +2114,7 @@ def wiki_edit_page(title, wikitext, summary, write_class="general"):
         if create and not (
             WIKI_CREATE_ENABLED
             and (
-                title in (WIKI_STATUS_TITLE, WIKI_STATISTICS_TITLE, WIKI_ADJUSTMENTS_TITLE)
+                title in (WIKI_STATUS_TITLE, WIKI_STATISTICS_TITLE, WIKI_ADJUSTMENTS_TITLE, WIKI_PATTERN_TITLE)
                 or wiki_report_creation_allowed(title)
                 or wiki_high_risk_title_is_allowed(title)
             )
@@ -2850,7 +2850,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
-    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Sem alteração dos alertas.",
+    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Corrige criação e sincronização dos arquivos diários e preserva cards resolvidos. Sem alteração dos alertas.",
     "4.1": "Amplia o aprendizado por contexto sem limite de exemplos, persiste modelo e catálogo, separa avaliações manuais de falsos positivos e adiciona página de padrões e consultas /padroes, /aprendizado e /analisepadrao. O aprendizado permanece informativo.",
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
     "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
@@ -15042,6 +15042,8 @@ def high_risk_action(record):
         return "Resolvido manualmente: edição indevida", record.get("manual_reviewer"), record.get("manual_reviewed_at")
     if status == "manual_clean":
         return "Resolvido manualmente: edição legítima", record.get("manual_reviewer"), record.get("manual_reviewed_at")
+    if status == "verification_inconclusive":
+        return "Verificação inconclusiva", None, record.get("last_checked_at")
     return None, None, None
 
 
@@ -16224,6 +16226,10 @@ def _archive_approved_candidate(candidate):
     with high_risk_archive_lock:
         high_risk_archive[revision_id] = record
     save_high_risk_archive()
+    queue_high_risk_daily_archive_update(
+        record["archive_date"],
+        "Publicando revisão aprovada no arquivo de " + record["archive_date"],
+    )
 
 
 def _cleanup_high_risk_candidate_state(state, now):
@@ -16346,8 +16352,49 @@ def revalidate_approved_high_risk_candidates(now=None):
                 live["next_check_at"] = now + WIKI_HIGH_RISK_RETRY_SECONDS
             _save_high_risk_candidate_state(state)
         with high_risk_archive_lock:
-            if high_risk_archive.pop(str(revision_id), None) is not None:
+            archived = high_risk_archive.get(str(revision_id))
+            if isinstance(archived, dict):
+                posted = _candidate_posted_record(revision_id)
+                posted_status = posted.get("status") if posted else None
+                if posted_status and high_risk_action(posted)[0] is not None:
+                    for field in (
+                        "status", "reverted_by", "reverted_at", "patrolled_by",
+                        "patrolled_at", "deleted_by", "deleted_at", "resolved_at",
+                        "resolved_by", "false_positive_at", "false_positive_by",
+                        "manual_reviewer", "manual_reviewed_at",
+                    ):
+                        if field in posted:
+                            archived[field] = posted.get(field)
+                    archived.pop("prepublish_status_inferred", None)
+                else:
+                    reason = str(result.get("reason") or "")
+                    status_by_reason = {
+                        "manually_patrolled": "patrolled",
+                        "reverted_tag": "reverted",
+                        "superseded": "resolved_no_action",
+                        "deleted": "deleted",
+                    }
+                    if result.get("decision") == "suppress" and reason in {
+                        "reverted", "self_reverted", "patrolled", "deleted",
+                        "resolved_no_action", "false_positive",
+                        "manual_vandalism", "manual_clean",
+                    }:
+                        archived["status"] = reason
+                    else:
+                        archived["status"] = status_by_reason.get(
+                            reason, "verification_inconclusive"
+                        )
+                    archived["prepublish_status_inferred"] = True
+                archived["last_checked_at"] = now
+                archived_day = archived.get("archive_date")
                 changed_archive = True
+            else:
+                archived_day = None
+        if archived_day:
+            queue_high_risk_daily_archive_update(
+                archived_day,
+                "Atualizando desfecho da revisão no arquivo de " + archived_day,
+            )
     if changed_archive:
         save_high_risk_archive()
     return ready
@@ -16424,7 +16471,15 @@ def sync_high_risk_archive():
                 "account_block_state",
             ):
                 if key in record:
+                    if (
+                        key == "status"
+                        and record.get(key) is None
+                        and archived.get("prepublish_status_inferred") is True
+                    ):
+                        continue
                     updated[key] = record.get(key)
+                    if key == "status" and record.get(key):
+                        updated.pop("prepublish_status_inferred", None)
             if updated != archived:
                 high_risk_archive[str(revision_id)] = updated
                 changed = True
@@ -16440,6 +16495,29 @@ def ptwiki_publishable_high_risk_records():
             dict(record) for record in high_risk_archive.values()
             if record.get("ptwiki_delay_verified") is True
         ]
+
+
+def queue_high_risk_daily_archive_update(day, summary=None, priority=True):
+    """Queue the affected UTC day promptly whenever its archived content changes."""
+    day = str(day or "")
+    try:
+        if datetime.strptime(day, "%Y-%m-%d").strftime("%Y-%m-%d") != day:
+            return False
+    except ValueError:
+        return False
+    records = ptwiki_publishable_high_risk_records()
+    day_records = [record for record in records if record.get("archive_date") == day]
+    revision_ids = [
+        int(record["revision_id"]) for record in day_records
+        if record.get("revision_id")
+    ]
+    return queue_high_risk_wiki_edit(
+        WIKI_HIGH_RISK_ARCHIVE_PREFIX + day,
+        build_high_risk_daily_wikitext(day, day_records),
+        summary or "Sincronizando arquivo de " + day,
+        priority=priority,
+        publication_revision_ids=revision_ids,
+    )
 
 
 def current_high_risk_main_page_records(now=None):
@@ -16531,11 +16609,14 @@ HIGH_RISK_MONTH_ABBREVIATIONS = (
 
 
 def high_risk_archive_days(records):
-    return sorted({
+    days = {
         str(item.get("archive_date"))
         for item in records
         if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", str(item.get("archive_date") or ""))
-    })
+    }
+    # Keep today's UTC archive available even before its first approved card.
+    days.add(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    return sorted(days)
 
 
 def build_high_risk_header_wikitext(records):
@@ -17008,6 +17089,10 @@ def reconcile_recent_high_risk_daily_pages():
                 atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
             if queue_high_risk_wiki_edit(
                 title, expected, "Sincronizando estado das revisões de alto risco",
+                publication_revision_ids=[
+                    int(record["revision_id"]) for record in records
+                    if record.get("archive_date") == day and record.get("revision_id")
+                ],
             ):
                 queued += 1
         except Exception as exc:
@@ -17054,12 +17139,16 @@ def queue_high_risk_wiki_pages():
     # A sincronização periódica toca apenas o arquivo do dia atual. Arquivos antigos
     # continuam sendo atualizados de forma direcionada quando uma edição daquele dia
     # realmente muda de estado (por exemplo, revisão manual).
-    current_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if current_day in high_risk_archive_days(archived):
+    for current_day in high_risk_archive_days(archived)[-7:]:
+        day_records = [x for x in archived if x.get("archive_date") == current_day]
         queued_any = queue_high_risk_wiki_edit(
             WIKI_HIGH_RISK_ARCHIVE_PREFIX + current_day,
-            build_high_risk_daily_wikitext(current_day, [x for x in archived if x.get("archive_date") == current_day]),
+            build_high_risk_daily_wikitext(current_day, day_records),
             "Atualizando arquivo de " + current_day,
+            publication_revision_ids=[
+                int(item["revision_id"]) for item in day_records
+                if item.get("revision_id")
+            ],
         ) or queued_any
     queued_any = queue_high_risk_wiki_edit(
         WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE,
