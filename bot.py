@@ -34,7 +34,7 @@ def data_path(filename):
 # =========================================================
 
 BOT_VERSION = "4.2"
-BOT_BUILD = "4.2-pattern-validation-archive-fix"
+BOT_BUILD = "4.2-pattern-validation-archive-colors"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2850,7 +2850,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
-    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Corrige criação e sincronização dos arquivos diários e preserva cards resolvidos. Sem alteração dos alertas.",
+    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Corrige criação e sincronização dos arquivos diários, preserva cards resolvidos e colore o índice por pendências e faixa de risco. Sem alteração dos alertas.",
     "4.1": "Amplia o aprendizado por contexto sem limite de exemplos, persiste modelo e catálogo, separa avaliações manuais de falsos positivos e adiciona página de padrões e consultas /padroes, /aprendizado e /analisepadrao. O aprendizado permanece informativo.",
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
     "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
@@ -16639,17 +16639,55 @@ def high_risk_archive_days(records):
     return sorted(days)
 
 
+def high_risk_archive_created_days():
+    """Return daily archives whose publication was confirmed or remotely verified."""
+    state = load_json(WIKI_WRITE_QUEUE_FILE, {})
+    published = state.get("published_hashes", {}) if isinstance(state, dict) else {}
+    prefix = WIKI_HIGH_RISK_ARCHIVE_PREFIX
+    created = set()
+    if isinstance(published, dict):
+        for title in published:
+            if not isinstance(title, str) or not title.startswith(prefix):
+                continue
+            day = title[len(prefix):]
+            try:
+                if datetime.strptime(day, "%Y-%m-%d").strftime("%Y-%m-%d") == day:
+                    created.add(day)
+            except ValueError:
+                continue
+    return created
+
+
+def high_risk_archive_day_background(day, records, created_days):
+    """Color a day by its most severe unresolved archived card."""
+    if day not in created_days:
+        return "#eaecf0"  # Gray: daily archive not yet confirmed as created.
+    day_records = [record for record in records if record.get("archive_date") == day]
+    if not day_records:
+        return "#eaecf0"
+    pending = [record for record in day_records if high_risk_action(record)[0] is None]
+    if not pending:
+        return "#d8ecff"  # Blue: every archived card has a recorded outcome.
+    risks = []
+    for record in pending:
+        try:
+            risks.append(float(record.get("revert_risk") or 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    highest = max(risks, default=0.0)
+    if highest >= 0.95:
+        return "#f8d7da"  # Red: at least one pending card is red.
+    if highest >= 0.90:
+        return "#ffd8a8"  # Orange: highest pending card is orange.
+    return "#fff3cd"  # Yellow: highest pending card is yellow.
+
+
 def build_high_risk_header_wikitext(records):
     days = high_risk_archive_days(records)
     available = set(days)
     months = sorted({day[:7] for day in days})
     years = sorted({day[:4] for day in days}, reverse=True)
-    pending_days = {
-        str(record.get("archive_date") or "")
-        for record in records
-        if str(record.get("archive_date") or "") in available
-        and high_risk_action(record)[0] is None
-    }
+    created_days = high_risk_archive_created_days()
 
     # Sete datas mais recentes com arquivo, em ordem crescente da esquerda para a direita.
     recent_days = sorted(days, reverse=True)[:7]
@@ -16680,7 +16718,7 @@ def build_high_risk_header_wikitext(records):
         lines.append('<div style="text-align:center; margin-top:0.45em; line-height:1">')
         lines.append('<span style="display:inline-flex; align-items:stretch; justify-content:center; gap:0">')
         for day in recent_days:
-            day_bg = "#fff3cd" if day in pending_days else "#d8ecff"
+            day_bg = high_risk_archive_day_background(day, records, created_days)
             try:
                 day_label = datetime.strptime(day, "%Y-%m-%d").strftime("%d/%m")
             except ValueError:
@@ -16708,18 +16746,13 @@ def build_high_risk_header_wikitext(records):
 def build_high_risk_archive_index_wikitext(records):
     days = high_risk_archive_days(records)
     available = set(days)
-    pending_days = {
-        str(record.get("archive_date") or "")
-        for record in records
-        if str(record.get("archive_date") or "") in available
-        and high_risk_action(record)[0] is None
-    }
+    created_days = high_risk_archive_created_days()
     months = sorted({day[:7] for day in days}, reverse=True)
     lines = [
         "__NOINDEX__",
         high_risk_header_transclusion(),
         "= Arquivo de edições de alto risco =",
-        "Os dias com arquivo disponível aparecem como links. Amarelo indica que ainda há revisão pendente; azul indica que não há pendências. As semanas começam na segunda-feira.",
+        "Cinza: arquivo diário ainda não criado ou sem cards. Amarelo, laranja e vermelho: maior faixa de risco entre os cards pendentes do dia. Azul: todos os cards do dia foram resolvidos. As semanas começam na segunda-feira.",
     ]
     if not months:
         lines.append("''Ainda não há arquivos diários.''")
@@ -16740,14 +16773,14 @@ def build_high_risk_archive_index_wikitext(records):
                     cells.append("")
                     continue
                 day = f"{year:04d}-{month:02d}-{day_number:02d}"
-                if day in available:
-                    day_bg = "#fff3cd" if day in pending_days else "#d8ecff"
+                day_bg = high_risk_archive_day_background(day, records, created_days)
+                if day in available and day in created_days:
                     cells.append(
                         f'style="background:{day_bg}" | '
                         + f"[[{WIKI_HIGH_RISK_ARCHIVE_PREFIX}{day}|'''{day_number}''']]"
                     )
                 else:
-                    cells.append(str(day_number))
+                    cells.append(f'style="background:#eaecf0" | {day_number}')
             lines.extend(["|-", "| " + " || ".join(cells)])
         lines.append("|}")
     return "\n".join(lines) + "\n"
@@ -17100,7 +17133,14 @@ def reconcile_recent_high_risk_daily_pages():
             if current is None and not page.get("missing"):
                 raise RuntimeError("Conteúdo remoto indisponível")
             if current == expected:
-                # The local hash may be stale; do not rewrite an identical page.
+                # Record an existing archive even if created manually or before
+                # the local publication hash was initialized.
+                with WIKI_WRITE_LOCK:
+                    state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": []})
+                    state.setdefault("published_hashes", {})[title] = hashlib.sha256(
+                        expected.encode("utf-8")
+                    ).hexdigest()
+                    atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
                 continue
             # Clear stale local hash so a missed publication can be retried.
             with WIKI_WRITE_LOCK:
