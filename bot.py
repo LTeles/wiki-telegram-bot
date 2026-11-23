@@ -14053,7 +14053,10 @@ def process_edit_action_callback(callback):
         preview_record.pop("false_positive_by", None)
         preview_record["status"] = effective_status
 
-        if effective_status in terminal_statuses:
+        if effective_status in ("manual_clean", "manual_vandalism"):
+            restored_text = manual_review_telegram_text(preview_record)
+            restored_markup = tracked_edit_reply_markup(revision_id, preview_record.get("alert_kind", "normal"), include_resolution_buttons=False)
+        elif effective_status in terminal_statuses:
             restored_text = message_with_status(
                 preview_record,
                 effective_status,
@@ -14123,8 +14126,8 @@ def process_edit_action_callback(callback):
         with posted_edits_lock:
             live = posted_edits.get(str(revision_id))
             if live:
-                live.pop("false_positive_at", None)
-                live.pop("false_positive_by", None)
+                live["false_positive_at"] = None
+                live["false_positive_by"] = None
                 if live.get("status") == "false_positive":
                     live["status"] = None
                 live["reply_markup"] = restored_markup
@@ -14150,7 +14153,7 @@ def process_edit_action_callback(callback):
                     revision_id,
                     record.get("patrolled_at") or time.time()
                 )
-            elif effective_status == "resolved_no_action":
+            elif effective_status in ("resolved_no_action", "manual_clean", "manual_vandalism"):
                 mark_detection_stat_resolved_no_action(
                     revision_id,
                     record.get("resolved_at") or time.time()
@@ -14162,6 +14165,16 @@ def process_edit_action_callback(callback):
                 f"Falha ao restaurar estatística após desmarcar falso positivo "
                 f"{revision_id}: {exc}"
             )
+
+        with high_risk_archive_lock:
+            archived = high_risk_archive.get(str(revision_id))
+            if isinstance(archived, dict):
+                archived["false_positive_at"] = None
+                archived["false_positive_by"] = None
+                if archived.get("status") == "false_positive":
+                    archived["status"] = effective_status
+        save_high_risk_archive()
+        queue_high_risk_manual_refresh(revision_id)
 
         auxiliary_message_id = callback_message.get("message_id")
         if auxiliary_message_id and auxiliary_message_id != record.get("message_id"):
@@ -15007,9 +15020,9 @@ def high_risk_action(record):
     if status == "false_positive":
         return "Marcado como falso positivo", None, record.get("false_positive_at")
     if status == "manual_vandalism":
-        return "Resolvido manualmente: edição incorreta", record.get("manual_reviewer"), record.get("manual_reviewed_at")
+        return "Resolvido manualmente: edição indevida", record.get("manual_reviewer"), record.get("manual_reviewed_at")
     if status == "manual_clean":
-        return "Resolvido manualmente: edição válida", record.get("manual_reviewer"), record.get("manual_reviewed_at")
+        return "Resolvido manualmente: edição legítima", record.get("manual_reviewer"), record.get("manual_reviewed_at")
     return None, None, None
 
 
@@ -15066,7 +15079,12 @@ def high_risk_diff_excerpt(record, limit=360):
 
 
 HIGH_RISK_PATTERN_MIN_PER_CLASS = 3
-HIGH_RISK_PATTERN_MAX_SAMPLES_PER_CLASS = 300
+HIGH_RISK_PATTERN_MAX_SAMPLES_PER_CLASS = None
+HIGH_RISK_PATTERN_VERSION = 3
+HIGH_RISK_PATTERN_MODEL_FILE = data_path("pattern_model.json")
+HIGH_RISK_PATTERN_CATALOG_FILE = data_path("pattern_catalog.json")
+HIGH_RISK_PATTERN_PERSIST_LOCK = threading.Lock()
+HIGH_RISK_PATTERN_CONTEXT_MIN = 20
 HIGH_RISK_PATTERN_MIN_MATCH = 0.03
 HIGH_RISK_PATTERN_MIN_MARGIN = 0.01
 
@@ -15091,11 +15109,29 @@ def high_risk_pattern_label(status):
     return None
 
 
+def high_risk_pattern_context(record):
+    prefix, separator, _ = str(record.get("title") or "").partition(":")
+    if not separator:
+        return "artigos"
+    prefix = prefix.casefold()
+    if prefix == "discussão" or " discussão" in prefix or prefix.startswith("discussão de "):
+        return "discussoes"
+    if prefix in {"usuário", "usuário(a)", "usuária", "ajuda", "wikipédia", "portal", "categoria", "ficheiro", "arquivo", "predefinição", "mediawiki", "módulo", "livro", "tópico"}:
+        return "outros"
+    return "artigos"
+
+
 def high_risk_pattern_features(record):
     """Extrai palavras, pares de palavras e formas simples do diff."""
     added = str(record.get("diff_added") or "")[:MAX_DIFF_CHARS]
     removed = str(record.get("diff_removed") or "")[:MAX_DIFF_CHARS]
     features = set()
+    # Remove signatures and reference markup from lexical features, retaining structural signals.
+    def lexical_text(text):
+        text = re.sub(r"\[\[(?:usuário(?:\(a\))?(?: discussão)?|user(?: talk)?|especial:contribuições):[^\]]*\]\]", " ", text, flags=re.I)
+        text = re.sub(r"\b\d{1,2}:\d{2}[^\n]{0,70}\(UTC\)", " ", text, flags=re.I)
+        text = re.sub(r"<ref\b[^>]*>.*?</ref\s*>|<ref\b[^>]*/>|https?://[^\s<>]+", " ", text, flags=re.I|re.S)
+        return re.sub(r"\b(?:citar|cite|url|https|www|acessodata|ref)\b", " ", text, flags=re.I)
 
     def normalized_words(text):
         normalized = unicodedata.normalize("NFKC", text).casefold()
@@ -15104,12 +15140,12 @@ def high_risk_pattern_features(record):
         for word in words:
             folded = unicodedata.normalize("NFKD", word)
             word = "".join(ch for ch in folded if not unicodedata.combining(ch))
-            if len(word) >= 3 and word not in HIGH_RISK_PATTERN_STOPWORDS:
+            if len(word) >= 3 and not word.isdigit() and word not in HIGH_RISK_PATTERN_STOPWORDS:
                 result.append(word)
         return result[:180]
 
     for side, text in (("add", added), ("remove", removed)):
-        words = normalized_words(text)
+        words = normalized_words(lexical_text(text))
         for word in set(words):
             features.add(f"{side}:word:{word}")
         for first, second in zip(words, words[1:]):
@@ -15135,6 +15171,13 @@ def high_risk_pattern_features(record):
         features.add("shape:many_exclamation_marks")
     if re.search(r"(.)\1{5,}", added, flags=re.DOTALL):
         features.add("shape:repeated_character_run")
+    for pattern, code in ((r"\b(?:18|19|20)\d{2}\b", "year"), (r"\b\d+(?:[.,]\d+)?\b", "number"), (r"\b(?:não|nunca|jamais|nem)\b", "negation")):
+        before = Counter(re.findall(pattern, lexical_text(removed), flags=re.I))
+        after = Counter(re.findall(pattern, lexical_text(added), flags=re.I))
+        if before != after and before and after:
+            features.add("shape:changed_" + code)
+        elif code == "negation" and before != after:
+            features.add("shape:changed_negation")
     return features
 
 
@@ -15143,53 +15186,61 @@ def train_high_risk_pattern_model():
     with high_risk_archive_lock:
         records = [dict(item) for item in high_risk_archive.values()]
 
-    by_label = {"vandalismo": [], "sem_vandalismo": []}
-    for record in records:
-        label = high_risk_pattern_label(record.get("status"))
-        if not label:
-            continue
-        features = high_risk_pattern_features(record)
-        if not features:
-            continue
-        try:
-            timestamp = float(
-                record.get("reverted_at")
-                or record.get("deleted_at")
-                or record.get("patrolled_at")
-                or record.get("false_positive_at")
-                or record.get("posted_at")
-                or 0
-            )
-        except (TypeError, ValueError):
-            timestamp = 0.0
-        by_label[label].append((timestamp, features))
+    def build(rows):
+        samples = {"vandalismo": [], "sem_vandalismo": []}
+        ids = {key: [] for key in samples}
+        for record in rows:
+            label = high_risk_pattern_label(record.get("status"))
+            if not label:
+                continue
+            features = high_risk_pattern_features(record)
+            if features:
+                samples[label].append(features)
+                ids[label].append(str(record.get("revision_id") or ""))
+        df = Counter()
+        for items in samples.values():
+            for features in items:
+                df.update(features)
+        total = sum(map(len, samples.values()))
+        return {"samples": samples, "ids": ids, "counts": {k: len(v) for k,v in samples.items()},
+                "idf": {k: math.log((total+1)/(v+1))+1 for k,v in df.items()},
+                "ready": all(len(v) >= HIGH_RISK_PATTERN_MIN_PER_CLASS for v in samples.values())}
+    model = build(records)
+    model["contexts"] = {group: build([r for r in records if high_risk_pattern_context(r)==group]) for group in ("artigos", "discussoes", "outros")}
+    try:
+        persist_high_risk_pattern_model(model)
+    except Exception as exc:
+        print("Falha ao persistir padrões:", safe_exception(exc))
+    return model
 
-    samples = {}
-    for label, items in by_label.items():
-        items.sort(key=lambda item: item[0], reverse=True)
-        samples[label] = [
-            features for _, features in items[:HIGH_RISK_PATTERN_MAX_SAMPLES_PER_CLASS]
-        ]
 
-    document_frequency = Counter()
-    total_documents = sum(len(items) for items in samples.values())
-    for items in samples.values():
-        for features in items:
-            document_frequency.update(features)
+def persist_high_risk_pattern_model(model):
+    """Snapshots derivados; o arquivo histórico permanece a fonte de verdade."""
+    def serializable(group):
+        return {**group, "samples": {k: [sorted(x) for x in v] for k, v in group["samples"].items()}}
 
-    inverse_document_frequency = {
-        feature: math.log((total_documents + 1) / (frequency + 1)) + 1.0
-        for feature, frequency in document_frequency.items()
-    }
-    return {
-        "samples": samples,
-        "counts": {label: len(items) for label, items in samples.items()},
-        "idf": inverse_document_frequency,
-        "ready": all(
-            len(samples[label]) >= HIGH_RISK_PATTERN_MIN_PER_CLASS
-            for label in ("vandalismo", "sem_vandalismo")
-        ),
-    }
+    def catalog(group):
+        counts = group["counts"]
+        frequencies = {k: Counter(f for sample in v for f in sample) for k, v in group["samples"].items()}
+        a, b = "vandalismo", "sem_vandalismo"
+        rows = []
+        for feature in sorted(set(frequencies[a]) | set(frequencies[b])):
+            n, m = frequencies[a][feature], frequencies[b][feature]
+            if n + m < 3:
+                continue
+            pa = n / counts[a] if counts[a] else None
+            pb = m / counts[b] if counts[b] else None
+            rows.append({"feature": feature, "counts": {a: n, b: m}, "frequency": {a: pa, b: pb},
+                         "difference": pa - pb if pa is not None and pb is not None else None})
+        rows.sort(key=lambda r: abs(r["difference"] or 0), reverse=True)
+        return {"counts": counts, "patterns": rows}
+
+    groups = {"geral": {k: v for k, v in model.items() if k != "contexts"}, **model.get("contexts", {})}
+    stamp = datetime.now(timezone.utc).isoformat()
+    metadata = {"version": HIGH_RISK_PATTERN_VERSION, "generated_at": stamp}
+    with HIGH_RISK_PATTERN_PERSIST_LOCK:
+        atomic_write_json(HIGH_RISK_PATTERN_MODEL_FILE, {**metadata, "groups": {k: serializable(v) for k, v in groups.items()}})
+        atomic_write_json(HIGH_RISK_PATTERN_CATALOG_FILE, {**metadata, "groups": {k: catalog(v) for k, v in groups.items()}})
 
 
 def high_risk_pattern_similarity(left, right, idf):
@@ -15204,6 +15255,10 @@ def high_risk_pattern_similarity(left, right, idf):
 
 
 def classify_high_risk_pattern(record, model):
+    context = high_risk_pattern_context(record)
+    local = model.get("contexts", {}).get(context, {})
+    if local and all(n >= HIGH_RISK_PATTERN_CONTEXT_MIN for n in local.get("counts", {}).values()):
+        model = local
     features = high_risk_pattern_features(record)
     counts = model.get("counts", {})
     result = {
@@ -15221,7 +15276,8 @@ def classify_high_risk_pattern(record, model):
         similarities = sorted(
             (
                 high_risk_pattern_similarity(features, sample, idf)
-                for sample in model.get("samples", {}).get(label, [])
+                for i, sample in enumerate(model.get("samples", {}).get(label, []))
+                if not record.get("revision_id") or str(record["revision_id"]) != model.get("ids", {}).get(label, [""] * len(model.get("samples", {}).get(label, [])))[i]
             ),
             reverse=True,
         )
@@ -15244,7 +15300,7 @@ def classify_high_risk_pattern(record, model):
 def high_risk_pattern_annotation(record, model):
     label = high_risk_pattern_label(record.get("status"))
     if label:
-        label_text = "edição incorreta" if label == "vandalismo" else "edição válida"
+        label_text = "edição indevida" if label == "vandalismo" else "edição legítima"
         return (
             "<small>'''Rótulo registrado para aprendizagem:''' "
             + label_text + "</small>"
@@ -15268,7 +15324,7 @@ def high_risk_pattern_annotation(record, model):
     return (
         "<small>'''Padrão IA (sem alterar o risco):''' "
         + assessment
-        + f" · risco de erro {vandalismo:.0%}, padrão válido {sem_vandalismo:.0%}</small>"
+        + f" · semelhança com indevidas {vandalismo:.0%}, com legítimas {sem_vandalismo:.0%}</small>"
     )
 
 
@@ -15402,7 +15458,9 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
 
     preview = high_risk_diff_excerpt(record)
     action, actor, _ = high_risk_action(record)
-    false_positive_available = high_risk_false_positive_is_available(record)
+    false_positive_available = (high_risk_false_positive_is_available(record)
+        and not record.get("false_positive_at")
+        and record.get("status") in (None, "pending", "manual_clean"))
     false_positive_deadline = high_risk_false_positive_deadline(record)
     false_positive_until = (
         datetime.fromtimestamp(false_positive_deadline, timezone.utc).strftime(
@@ -15419,6 +15477,8 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         status_text = "Pendente de revisão"
     else:
         status_text = "Pendente de revisão · prazo para falso positivo encerrado"
+    if template_status == "manual_clean" and record.get("false_positive_at"):
+        status_text += " · Falso positivo reportado"
     pattern_line = high_risk_pattern_annotation(record, pattern_model or {}) if include_pattern else ""
     background = high_risk_background(record)
     timer_wikitext = ""
@@ -15570,7 +15630,7 @@ def build_high_risk_page(records, heading, introduction, include_dynamic_learnin
     ]
     if include_dynamic_learning:
         lines.extend([
-            "Treino de padrões: revertida/eliminada = edição incorreta; patrulhada/falso positivo = edição válida. "
+            "Treino experimental por contexto: reversão/eliminação e confirmação de edição indevida são exemplos de edições indevidas; patrulhamento, falso positivo e confirmação de edição legítima são exemplos de edições legítimas. "
             "Autorrevertidas e outros estados ficam fora do treino.",
             "A semelhança de padrões é informativa; não altera o risco calculado nem confirma sozinha o caso.",
             "",
@@ -16515,6 +16575,8 @@ def apply_high_risk_manual_decision(decision):
         current_status = archived.get("status")
         previous_status = archived.get("manual_previous_status")
     action = decision["action"]
+    if action == "undo" and current_status == "manual_clean" and archived.get("false_positive_at"):
+        return False  # Desmarcar o falso positivo primeiro pelo Telegram.
     changed_status = False
     new_status = current_status
     if action in ("vandalism", "clean") and high_risk_action(archived)[0] is None:
@@ -16607,9 +16669,9 @@ def manual_review_telegram_text(record):
     reviewer = html.escape(str(record.get("manual_reviewer") or ""))
     base = message_with_status(record, "pending") or record.get("base_message", "").rstrip()
     if status == "manual_vandalism":
-        return base + " — 🚨 <b>Resolvido manualmente: edição incorreta</b> — Revisor: " + reviewer
+        return base + " — 🚨 <b>Resolvido manualmente: edição indevida</b> — Revisor: " + reviewer
     if status == "manual_clean":
-        return base + " — ✅ <b>Resolvido manualmente: edição válida</b> — Revisor: " + reviewer
+        return base + " — ✅ <b>Resolvido manualmente: edição legítima</b> — Revisor: " + reviewer
     return base
 
 
@@ -16995,31 +17057,16 @@ def apply_wiki_false_positive(revid, actor):
     with posted_edits_lock:
         live = posted_edits.get(key)
         if not isinstance(live, dict):
-            with high_risk_archive_lock:
-                archived = high_risk_archive.get(key)
-                if not isinstance(archived, dict):
-                    raise RuntimeError("Não encontrei os dados deste alerta")
-                if archived.get("status") in ("false_positive", "falsepos"):
-                    raise RuntimeError("Este alerta já está marcado como falso positivo")
-                if archived.get("status") in ("clean", "vandalism", "reverted", "approved"):
-                    raise RuntimeError("Este alerta já foi resolvido")
-                archived["manual_previous_status"] = archived.get("status")
-                archived["status"] = "false_positive"
-                archived["false_positive_at"] = time.time()
-                archived["false_positive_by"] = actor
-                archived["manual_reviewer"] = actor
-                archived["manual_reviewed_at"] = datetime.now(timezone.utc).isoformat()
-            save_high_risk_archive()
-            queue_high_risk_manual_refresh(revision_id)
-            return True
+            raise RuntimeError("Alerta indisponível; tente novamente")
         if live.get("alert_kind", "normal") != "normal":
             raise RuntimeError("Falso positivo só pode ser marcado em alertas do detector")
-        if live.get("status"):
-            if live.get("status") == "false_positive":
-                raise RuntimeError("Este alerta já está marcado como falso positivo")
+        if live.get("false_positive_at") or live.get("status") == "false_positive":
+            raise RuntimeError("Este alerta já está marcado como falso positivo")
+        if live.get("status") not in (None, "pending", "manual_clean"):
             raise RuntimeError("Este alerta já foi resolvido")
 
-        live["status"] = "false_positive"
+        if live.get("status") != "manual_clean":
+            live["status"] = "false_positive"
         live["false_positive_at"] = time.time()
         live["false_positive_by"] = actor
         live["reply_markup"] = reply_markup_without_resolution_buttons(
@@ -17035,7 +17082,8 @@ def apply_wiki_false_positive(revid, actor):
     with high_risk_archive_lock:
         archived = high_risk_archive.get(key)
         if isinstance(archived, dict):
-            archived["status"] = "false_positive"
+            if archived.get("status") != "manual_clean":
+                archived["status"] = "false_positive"
             archived["false_positive_at"] = record.get("false_positive_at")
             archived["false_positive_by"] = actor
     save_high_risk_archive()
