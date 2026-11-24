@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.4"
-BOT_BUILD = "4.2.4-cope-positive-page-archive-routing"
+BOT_VERSION = "4.2.5"
+BOT_BUILD = "4.2.5-nochange-publication-tracking"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2168,9 +2168,18 @@ def wiki_edit_page(title, wikitext, summary, write_class="general"):
                     raise RuntimeError("API edit recusou publicação após retry spam-safe: " + str(data["error"]))
             else:
                 raise RuntimeError("API edit recusou publicação: " + str(error))
-        if data.get("edit", {}).get("result") != "Success":
-            raise RuntimeError("API edit não confirmou sucesso: " + str(data.get("edit")))
-        return True
+        edit_result = data.get("edit", {})
+        if edit_result.get("result") != "Success":
+            raise RuntimeError("API edit não confirmou sucesso: " + str(edit_result))
+        if edit_result.get("nochange") is True:
+            return {"nochange": True, "newrevid": edit_result.get("newrevid")}
+        new_revision_id = edit_result.get("newrevid")
+        if not new_revision_id:
+            raise RuntimeError(
+                "API edit retornou Success sem nochange nem newrevid: "
+                + str(edit_result)
+            )
+        return {"nochange": False, "newrevid": new_revision_id}
 
 
 def process_wiki_write_queue_once():
@@ -2212,10 +2221,12 @@ def process_wiki_write_queue_once():
             return False
         try:
             item = prepare_high_risk_write_item(item)
-            success = wiki_edit_page(
+            outcome = wiki_edit_page(
                 item["title"], item["text"], item["summary"],
                 write_class=item.get("write_class", "general"),
             )
+            success = bool(outcome)
+            nochange = bool(outcome.get("nochange")) if isinstance(outcome, dict) else False
         except Exception as exc:
             print("⚠️ Falha na escrita wiki:", safe_exception(exc))
             state = load_json(WIKI_WRITE_QUEUE_FILE, state)
@@ -2235,7 +2246,13 @@ def process_wiki_write_queue_once():
                     )
             return False
         if success:
-            print("✅ Publicação wiki confirmada:", item["title"])
+            if nochange:
+                print("ℹ️ Página wiki já estava sincronizada; nenhuma nova revisão:", item["title"])
+            else:
+                print(
+                    "✅ Publicação wiki confirmada:", item["title"],
+                    "| revid=", outcome.get("newrevid"),
+                )
             state = load_json(WIKI_WRITE_QUEUE_FILE, state)
             state["last_success_at"] = time.time()
             state.setdefault("published_hashes", {})[item["title"]] = hashlib.sha256(
@@ -2851,6 +2868,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.5": "Distingue edição wiki efetiva de resposta sem alteração (nochange), confirma revisões pelo newrevid e marca como publicadas apenas as revisões realmente incluídas na página principal.",
     "4.2.4": "Reconcilia a página principal e os sete arquivos diários mais recentes com o conteúdo remoto, corrige datas de arquivo e mantém pendências recentes na principal; também aceita positivos CoPE-B sem Revert Risk numérico.",
     "4.2.3": "Garante no máximo uma atualização diária do catálogo experimental entre reinícios e instâncias simultâneas, com estado persistente e nova tentativa após falhas.",
     "4.2.2": "Usa cache do modelo experimental de padrões entre atualizações da página principal; o retreinamento e a publicação seguem o ciclo diário. Mantém o aprendizado fora do cálculo de risco e inclui os ajustes de enfileiramento da 4.2.1.",
@@ -16624,13 +16642,20 @@ def prepare_high_risk_write_item(item):
     if item.get("write_class") != "high_risk":
         return item
     prepared = dict(item)
-    ready = revalidate_approved_high_risk_candidates()
+    revalidate_approved_high_risk_candidates()
     sync_high_risk_archive()
     archived = ptwiki_publishable_high_risk_records()
     title = prepared.get("title")
     if title == WIKI_HIGH_RISK_TITLE:
-        prepared["text"] = build_high_risk_wikitext()
-        prepared["publication_revision_ids"] = ready
+        main_records = current_high_risk_main_page_records()
+        prepared["text"] = build_high_risk_wikitext(records=main_records)
+        prepared["publication_revision_ids"] = [
+            int(record["revision_id"])
+            for record in select_high_risk_records(
+                [dict(record) for record in main_records]
+            )
+            if record.get("revision_id")
+        ]
     elif title == WIKI_HIGH_RISK_SUMMARY_TITLE:
         prepared["text"] = build_high_risk_summary_wikitext()
     elif title == WIKI_HIGH_RISK_HEADER_TITLE:
@@ -16792,8 +16817,8 @@ def current_high_risk_main_page_records(now=None):
     ]
 
 
-def build_high_risk_wikitext(now=None):
-    visible = current_high_risk_main_page_records(now=now)
+def build_high_risk_wikitext(now=None, records=None):
+    visible = records if records is not None else current_high_risk_main_page_records(now=now)
     return build_high_risk_page(
         visible,
         "Edições com alto risco de erro",
