@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.3"
-BOT_BUILD = "4.2.3-persistent-daily-pattern-publication"
+BOT_VERSION = "4.2.4"
+BOT_BUILD = "4.2.4-cope-positive-page-archive-routing"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2851,6 +2851,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.4": "Reconcilia a página principal e os sete arquivos diários mais recentes com o conteúdo remoto, corrige datas de arquivo e mantém pendências recentes na principal; também aceita positivos CoPE-B sem Revert Risk numérico.",
     "4.2.3": "Garante no máximo uma atualização diária do catálogo experimental entre reinícios e instâncias simultâneas, com estado persistente e nova tentativa após falhas.",
     "4.2.2": "Usa cache do modelo experimental de padrões entre atualizações da página principal; o retreinamento e a publicação seguem o ciclo diário. Mantém o aprendizado fora do cálculo de risco e inclui os ajustes de enfileiramento da 4.2.1.",
     "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Mantém candidatos com verificação inconclusiva no arquivo e na página principal como pendentes, com controles de avaliação manual; sincroniza arquivos diários, preserva cards resolvidos e colore o índice por pendências e faixa de risco. Sem alteração dos alertas.",
@@ -15820,15 +15821,20 @@ def select_high_risk_records(records):
     eligible = []
     for record in records:
         try:
-            risk = float(record.get("revert_risk"))
             revision_id = int(record.get("revision_id"))
         except (TypeError, ValueError):
             continue
+        try:
+            risk = float(record.get("revert_risk"))
+            if not math.isfinite(risk):
+                risk = None
+        except (TypeError, ValueError, OverflowError):
+            risk = None
         cope_b = record.get("cope_b")
         cope_b_positive = isinstance(cope_b, dict) and cope_b.get("label") == "1"
         # O limiar Revert Risk continua estrito; um CoPE-B positivo também
         # qualifica o registro independentemente do percentual.
-        if risk <= WIKI_HIGH_RISK_THRESHOLD and not cope_b_positive:
+        if not cope_b_positive and (risk is None or risk <= WIKI_HIGH_RISK_THRESHOLD):
             continue
         record["revert_risk"] = risk
         record["revision_id"] = revision_id
@@ -16390,7 +16396,9 @@ def _archive_deferred_candidate(candidate, result, now=None):
         record["ptwiki_verified_at"] = candidate.get("last_checked_at") or now
         record["ptwiki_verification"] = result
         record["last_checked_at"] = now
-        record["archive_date"] = record.get("archive_date") or high_risk_record_date(record)
+        # A data do arquivo pertence ao timestamp da revisão, não à data em
+        # que a verificação terminou nem a uma data antiga persistida.
+        record["archive_date"] = high_risk_record_date(record)
 
         if status == "verification_inconclusive":
             record["prepublish_status_inferred"] = True
@@ -16696,6 +16704,33 @@ def sync_high_risk_archive():
                 changed = True
     if changed:
         save_high_risk_archive()
+    return changed
+
+
+def normalize_high_risk_archive_dates():
+    """Move any misdated local records back to the UTC day of their revision."""
+    changed = False
+    affected_days = set()
+    with high_risk_archive_lock:
+        for record in high_risk_archive.values():
+            if not isinstance(record, dict):
+                continue
+            expected_day = high_risk_record_date(record)
+            current_day = str(record.get("archive_date") or "")
+            if current_day == expected_day:
+                continue
+            if current_day:
+                affected_days.add(current_day)
+            affected_days.add(expected_day)
+            record["archive_date"] = expected_day
+            changed = True
+    if changed:
+        save_high_risk_archive()
+        for day in sorted(affected_days):
+            queue_high_risk_daily_archive_update(
+                day,
+                "Corrigindo data da revisão no arquivo de " + day,
+            )
     return changed
 
 
@@ -17286,7 +17321,7 @@ HIGH_RISK_HOURLY_RECONCILE_SECONDS = 3600
 
 
 def reconcile_recent_high_risk_daily_pages():
-    """Hourly repair of the seven newest daily archives, even without new alerts.
+    """Hourly repair of the main page and seven newest daily archives.
 
     Compare the actual wiki content, not only the local published-hash cache.
     This detects missed edits and out-of-band changes without generating no-op edits.
@@ -17294,14 +17329,27 @@ def reconcile_recent_high_risk_daily_pages():
     if not high_risk_publish_enabled() or high_risk_writing_paused():
         return 0
     sync_high_risk_archive()
+    normalize_high_risk_archive_dates()
     records = ptwiki_publishable_high_risk_records()
     days = high_risk_archive_days(records)[-7:]
-    queued = 0
-    for day in days:
-        title = WIKI_HIGH_RISK_ARCHIVE_PREFIX + day
-        expected = build_high_risk_daily_wikitext(
+    main_records = current_high_risk_main_page_records()
+    targets = [(
+        WIKI_HIGH_RISK_TITLE,
+        build_high_risk_wikitext(),
+        [int(record["revision_id"]) for record in main_records if record.get("revision_id")],
+        "Sincronizando lista principal de edições de alto risco",
+    )]
+    targets.extend((
+        WIKI_HIGH_RISK_ARCHIVE_PREFIX + day,
+        build_high_risk_daily_wikitext(
             day, [record for record in records if record.get("archive_date") == day]
-        )
+        ),
+        [int(record["revision_id"]) for record in records
+         if record.get("archive_date") == day and record.get("revision_id")],
+        "Sincronizando arquivo de " + day,
+    ) for day in days)
+    queued = 0
+    for title, expected, revision_ids, summary in targets:
         try:
             response = requests.get(
                 WIKIPEDIA_API,
@@ -17324,14 +17372,15 @@ def reconcile_recent_high_risk_daily_pages():
             if current is None and not page.get("missing"):
                 raise RuntimeError("Conteúdo remoto indisponível")
             if current == expected:
-                # Record an existing archive even if created manually or before
-                # the local publication hash was initialized.
+                # Record the remotely verified page even if it was created
+                # manually or before the local publication hash was initialized.
                 with WIKI_WRITE_LOCK:
                     state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": []})
                     state.setdefault("published_hashes", {})[title] = hashlib.sha256(
                         expected.encode("utf-8")
                     ).hexdigest()
                     atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+                mark_high_risk_candidates_published(revision_ids)
                 continue
             # Clear stale local hash so a missed publication can be retried.
             with WIKI_WRITE_LOCK:
@@ -17339,15 +17388,12 @@ def reconcile_recent_high_risk_daily_pages():
                 state.setdefault("published_hashes", {}).pop(title, None)
                 atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
             if queue_high_risk_wiki_edit(
-                title, expected, "Sincronizando estado das revisões de alto risco",
-                publication_revision_ids=[
-                    int(record["revision_id"]) for record in records
-                    if record.get("archive_date") == day and record.get("revision_id")
-                ],
+                title, expected, summary,
+                publication_revision_ids=revision_ids,
             ):
                 queued += 1
         except Exception as exc:
-            print("⚠️ Reconciliação horária do arquivo", day, safe_exception(exc))
+            print("⚠️ Reconciliação horária da página", title, safe_exception(exc))
     return queued
 
 
@@ -17357,6 +17403,7 @@ def queue_high_risk_wiki_pages():
     publication_ids = revalidate_approved_high_risk_candidates()
     refresh_pending_high_risk_block_states()
     sync_high_risk_archive()
+    normalize_high_risk_archive_dates()
     archived = ptwiki_publishable_high_risk_records()
     queued_any = queue_high_risk_wiki_edit(
         WIKI_HIGH_RISK_TITLE,
