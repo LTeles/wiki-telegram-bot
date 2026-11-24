@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.1"
-BOT_BUILD = "4.2.1-high-risk-candidate-enqueue-decoupled"
+BOT_VERSION = "4.2.2"
+BOT_BUILD = "4.2.2-daily-pattern-model-cache"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2850,6 +2850,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.2": "Usa cache do modelo experimental de padrões entre atualizações da página principal; o retreinamento e a publicação seguem o ciclo diário. Mantém o aprendizado fora do cálculo de risco e inclui os ajustes de enfileiramento da 4.2.1.",
     "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Mantém candidatos com verificação inconclusiva no arquivo e na página principal como pendentes, com controles de avaliação manual; sincroniza arquivos diários, preserva cards resolvidos e colore o índice por pendências e faixa de risco. Sem alteração dos alertas.",
     "4.1": "Amplia o aprendizado por contexto sem limite de exemplos, persiste modelo e catálogo, separa avaliações manuais de falsos positivos e adiciona página de padrões e consultas /padroes, /aprendizado e /analisepadrao. O aprendizado permanece informativo.",
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
@@ -15106,6 +15107,8 @@ HIGH_RISK_PATTERN_MODEL_FILE = data_path("pattern_model.json")
 HIGH_RISK_PATTERN_VALIDATION_FILE = data_path("pattern_validation.json")
 HIGH_RISK_PATTERN_CATALOG_FILE = data_path("pattern_catalog.json")
 HIGH_RISK_PATTERN_PERSIST_LOCK = threading.Lock()
+HIGH_RISK_PATTERN_MODEL_CACHE = None
+HIGH_RISK_PATTERN_MODEL_CACHE_LOCK = threading.RLock()
 HIGH_RISK_PATTERN_CONTEXT_MIN = 20
 HIGH_RISK_PATTERN_MIN_MATCH = 0.03
 HIGH_RISK_PATTERN_MIN_MARGIN = 0.01
@@ -15230,14 +15233,25 @@ def build_high_risk_pattern_model(records):
     return model
 
 def train_high_risk_pattern_model():
-    with high_risk_archive_lock:
-        records = [dict(item) for item in high_risk_archive.values()]
-    model = build_high_risk_pattern_model(records)
-    try:
-        persist_high_risk_pattern_model(model)
-    except Exception as exc:
-        print("Falha ao persistir padrões:", safe_exception(exc))
-    return model
+    global HIGH_RISK_PATTERN_MODEL_CACHE
+    with HIGH_RISK_PATTERN_MODEL_CACHE_LOCK:
+        with high_risk_archive_lock:
+            records = [dict(item) for item in high_risk_archive.values()]
+        model = build_high_risk_pattern_model(records)
+        try:
+            persist_high_risk_pattern_model(model)
+        except Exception as exc:
+            print("Falha ao persistir padrões:", safe_exception(exc))
+        HIGH_RISK_PATTERN_MODEL_CACHE = model
+        return model
+
+
+def cached_high_risk_pattern_model():
+    """Return the last trained model; train only when the cache is empty."""
+    with HIGH_RISK_PATTERN_MODEL_CACHE_LOCK:
+        if HIGH_RISK_PATTERN_MODEL_CACHE is not None:
+            return HIGH_RISK_PATTERN_MODEL_CACHE
+        return train_high_risk_pattern_model()
 
 
 def persist_high_risk_pattern_model(model):
@@ -15423,7 +15437,7 @@ def process_pattern_command(command, argument, chat_id):
             if record is None:
                 send_telegram_message("Revisão não encontrada no arquivo de alto risco.", chat_id=chat_id)
                 return
-            result = classify_high_risk_pattern(record, train_high_risk_pattern_model())
+            result = classify_high_risk_pattern(record, cached_high_risk_pattern_model())
             label = {"vandalismo": "indevida", "sem_vandalismo": "legítima"}.get(result["label"], "inconclusiva")
             features = high_risk_pattern_features(record)
             structural = sorted(f for f in features if ":word:" not in f and ":pair:" not in f)
@@ -15826,7 +15840,7 @@ def build_high_risk_entry_template_wikitext():
 
 def build_high_risk_page(records, heading, introduction, include_dynamic_learning=True):
     eligible = select_high_risk_records(records)
-    pattern_model = train_high_risk_pattern_model() if include_dynamic_learning else {}
+    pattern_model = cached_high_risk_pattern_model() if include_dynamic_learning else {}
     pattern_counts = pattern_model.get("counts", {})
     lines = [
         "__NOINDEX__",
