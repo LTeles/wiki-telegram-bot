@@ -34,7 +34,7 @@ def data_path(filename):
 # =========================================================
 
 BOT_VERSION = "4.2"
-BOT_BUILD = "4.2-pattern-validation-visible-deferred"
+BOT_BUILD = "4.2-pattern-validation-inconclusive-controls"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2850,7 +2850,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
-    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Mantém candidatos com verificação inconclusiva no arquivo e na página principal enquanto pendentes; sincroniza arquivos diários, preserva cards resolvidos e colore o índice por pendências e faixa de risco. Sem alteração dos alertas.",
+    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Mantém candidatos com verificação inconclusiva no arquivo e na página principal como pendentes, com controles de avaliação manual; sincroniza arquivos diários, preserva cards resolvidos e colore o índice por pendências e faixa de risco. Sem alteração dos alertas.",
     "4.1": "Amplia o aprendizado por contexto sem limite de exemplos, persiste modelo e catálogo, separa avaliações manuais de falsos positivos e adiciona página de padrões e consultas /padroes, /aprendizado e /analisepadrao. O aprendizado permanece informativo.",
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
     "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
@@ -15657,9 +15657,10 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
 
     preview = high_risk_diff_excerpt(record)
     action, actor, _ = high_risk_action(record)
+    record_status = record.get("status")
     false_positive_available = (high_risk_false_positive_is_available(record)
         and not record.get("false_positive_at")
-        and record.get("status") in (None, "pending", "manual_clean"))
+        and record_status in (None, "pending", "manual_clean", "verification_inconclusive"))
     false_positive_deadline = high_risk_false_positive_deadline(record)
     false_positive_until = (
         datetime.fromtimestamp(false_positive_deadline, timezone.utc).strftime(
@@ -15667,8 +15668,13 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         )
         if false_positive_deadline > 0 else ""
     )
-    template_status = record.get("status") or "pending"
-    if template_status == "verification_inconclusive":
+    # Inconclusive cases remain pending. The page's action script uses this
+    # data attribute to decide whether to render manual-review controls.
+    template_status = (
+        "pending" if record_status in (None, "verification_inconclusive")
+        else record_status
+    )
+    if record_status == "verification_inconclusive":
         status_text = "Verificação inconclusiva · continua pendente"
     elif action:
         status_text = (
@@ -15678,7 +15684,7 @@ def build_high_risk_edit_line(record, pattern_model=None, include_pattern=True):
         status_text = "Pendente de revisão"
     else:
         status_text = "Pendente de revisão · prazo para falso positivo encerrado"
-    if template_status == "manual_clean" and record.get("false_positive_at"):
+    if record_status == "manual_clean" and record.get("false_positive_at"):
         status_text += " · Falso positivo reportado"
     pattern_line = high_risk_pattern_annotation(record, pattern_model or {}) if include_pattern else ""
     background = high_risk_background(record)
