@@ -12,6 +12,7 @@ import secrets
 import math
 import base64
 import hashlib
+import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from datetime import datetime, timezone, timedelta
@@ -33,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.2"
-BOT_BUILD = "4.2.2-daily-pattern-model-cache"
+BOT_VERSION = "4.2.3"
+BOT_BUILD = "4.2.3-persistent-daily-pattern-publication"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2850,6 +2851,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.3": "Garante no máximo uma atualização diária do catálogo experimental entre reinícios e instâncias simultâneas, com estado persistente e nova tentativa após falhas.",
     "4.2.2": "Usa cache do modelo experimental de padrões entre atualizações da página principal; o retreinamento e a publicação seguem o ciclo diário. Mantém o aprendizado fora do cálculo de risco e inclui os ajustes de enfileiramento da 4.2.1.",
     "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Mantém candidatos com verificação inconclusiva no arquivo e na página principal como pendentes, com controles de avaliação manual; sincroniza arquivos diários, preserva cards resolvidos e colore o índice por pendências e faixa de risco. Sem alteração dos alertas.",
     "4.1": "Amplia o aprendizado por contexto sem limite de exemplos, persiste modelo e catálogo, separa avaliações manuais de falsos positivos e adiciona página de padrões e consultas /padroes, /aprendizado e /analisepadrao. O aprendizado permanece informativo.",
@@ -15106,6 +15108,10 @@ HIGH_RISK_PATTERN_VERSION = 3
 HIGH_RISK_PATTERN_MODEL_FILE = data_path("pattern_model.json")
 HIGH_RISK_PATTERN_VALIDATION_FILE = data_path("pattern_validation.json")
 HIGH_RISK_PATTERN_CATALOG_FILE = data_path("pattern_catalog.json")
+HIGH_RISK_PATTERN_PUBLICATION_STATE_FILE = data_path("pattern_publication_state.json")
+HIGH_RISK_PATTERN_PUBLICATION_LOCK_FILE = data_path("pattern_publication.lock")
+HIGH_RISK_PATTERN_PUBLICATION_INTERVAL_SECONDS = 24 * 60 * 60
+HIGH_RISK_PATTERN_PUBLICATION_LEASE_SECONDS = 30 * 60
 HIGH_RISK_PATTERN_PERSIST_LOCK = threading.Lock()
 HIGH_RISK_PATTERN_MODEL_CACHE = None
 HIGH_RISK_PATTERN_MODEL_CACHE_LOCK = threading.RLock()
@@ -15404,16 +15410,91 @@ def pattern_publication_worker():
     while True:
         try:
             if high_risk_publish_enabled() and not high_risk_writing_paused():
-                train_high_risk_pattern_model()
-                try:
-                    run_pattern_validation()
-                except Exception as exc:
-                    print("Falha na validação de padrões:", safe_exception(exc))
-                queue_wiki_edit(WIKI_PATTERN_TITLE, build_pattern_wikitext(pattern_catalog_snapshot()), "Atualizando catálogo de padrões de edições")
+                publication_token = claim_pattern_publication_slot()
+                if publication_token:
+                    published = False
+                    try:
+                        train_high_risk_pattern_model()
+                        try:
+                            run_pattern_validation()
+                        except Exception as exc:
+                            print("Falha na validação de padrões:", safe_exception(exc))
+                        queue_wiki_edit(
+                            WIKI_PATTERN_TITLE,
+                            build_pattern_wikitext(pattern_catalog_snapshot()),
+                            "Atualizando catálogo de padrões de edições",
+                        )
+                        published = True
+                    finally:
+                        finish_pattern_publication_slot(publication_token, published)
         except Exception as exc:
             print("⚠️ Falha na publicação de padrões:", safe_exception(exc))
-        # Recalcula e publica o catálogo uma vez por dia.
-        time.sleep(86400)
+        # Reavalia a agenda; o estado persistente evita nova publicação após
+        # reinício do processo e o lease impede duas instâncias simultâneas.
+        time.sleep(300)
+
+
+def claim_pattern_publication_slot(now=None):
+    """Claim the daily publication across restarts and concurrent processes."""
+    now = float(now if now is not None else time.time())
+    lock_directory = os.path.dirname(HIGH_RISK_PATTERN_PUBLICATION_LOCK_FILE) or "."
+    os.makedirs(lock_directory, exist_ok=True)
+    with open(HIGH_RISK_PATTERN_PUBLICATION_LOCK_FILE, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        state = load_json(HIGH_RISK_PATTERN_PUBLICATION_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        try:
+            last_success = float(state.get("last_success_at") or 0)
+            lease_until = float(state.get("lease_until") or 0)
+        except (TypeError, ValueError, OverflowError):
+            last_success = lease_until = 0
+        if last_success <= 0:
+            # Migra a agenda sem provocar nova publicação logo após atualizar
+            # o código: o catálogo persistido já registra a última execução.
+            catalog = load_json(HIGH_RISK_PATTERN_CATALOG_FILE, {})
+            generated_at = catalog.get("generated_at") if isinstance(catalog, dict) else None
+            try:
+                last_success = datetime.fromisoformat(
+                    str(generated_at).replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                last_success = 0
+            if last_success > 0:
+                state["last_success_at"] = last_success
+                atomic_write_json(HIGH_RISK_PATTERN_PUBLICATION_STATE_FILE, state)
+        if now - last_success < HIGH_RISK_PATTERN_PUBLICATION_INTERVAL_SECONDS:
+            return None
+        if lease_until > now:
+            return None
+        token = f"{os.getpid()}:{threading.get_ident()}:{now:.6f}"
+        state.update({
+            "lease_token": token,
+            "lease_until": now + HIGH_RISK_PATTERN_PUBLICATION_LEASE_SECONDS,
+            "started_at": now,
+        })
+        atomic_write_json(HIGH_RISK_PATTERN_PUBLICATION_STATE_FILE, state)
+        return token
+
+
+def finish_pattern_publication_slot(token, succeeded, now=None):
+    now = float(now if now is not None else time.time())
+    lock_directory = os.path.dirname(HIGH_RISK_PATTERN_PUBLICATION_LOCK_FILE) or "."
+    os.makedirs(lock_directory, exist_ok=True)
+    with open(HIGH_RISK_PATTERN_PUBLICATION_LOCK_FILE, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        state = load_json(HIGH_RISK_PATTERN_PUBLICATION_STATE_FILE, {})
+        if not isinstance(state, dict) or state.get("lease_token") != token:
+            return False
+        state.pop("lease_token", None)
+        state["lease_until"] = 0
+        if succeeded:
+            state["last_success_at"] = now
+            state.pop("last_error_at", None)
+        else:
+            state["last_error_at"] = now
+        atomic_write_json(HIGH_RISK_PATTERN_PUBLICATION_STATE_FILE, state)
+        return True
 
 
 def process_pattern_command(command, argument, chat_id):
