@@ -34,7 +34,7 @@ def data_path(filename):
 # =========================================================
 
 BOT_VERSION = "4.2"
-BOT_BUILD = "4.2-pattern-validation-main-pending"
+BOT_BUILD = "4.2-pattern-validation-visible-deferred"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2850,7 +2850,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
-    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Corrige criação e sincronização dos arquivos diários, preserva cards resolvidos, colore o índice por pendências e mantém verificações inconclusivas visíveis como pendentes. Sem alteração dos alertas.",
+    "4.2": "Adiciona validação temporal retrospectiva, métricas por domínio, comparação com Revert Risk e comando /validacao. Mantém candidatos com verificação inconclusiva no arquivo e na página principal enquanto pendentes; sincroniza arquivos diários, preserva cards resolvidos e colore o índice por pendências e faixa de risco. Sem alteração dos alertas.",
     "4.1": "Amplia o aprendizado por contexto sem limite de exemplos, persiste modelo e catálogo, separa avaliações manuais de falsos positivos e adiciona página de padrões e consultas /padroes, /aprendizado e /analisepadrao. O aprendizado permanece informativo.",
     "2.46": "Tempo de reversão, desfechos, classificações, saúde operacional, tendências e histórico diário de versões.",
     "2.49": "Aprendizagem supervisionada de padrões nos desfechos da lista de alto risco; semelhança informativa, sem alterar a pontuação.",
@@ -16233,6 +16233,89 @@ def _archive_approved_candidate(candidate):
     )
 
 
+def _archive_deferred_candidate(candidate, result, now=None):
+    """Keep delayed cases visible when verification is inconclusive or terminal."""
+    now = float(now if now is not None else time.time())
+    revision_id = str(candidate["revision_id"])
+    posted = _candidate_posted_record(revision_id)
+    evidence = result.get("evidence") if isinstance(result, dict) else None
+    if not isinstance(evidence, dict):
+        evidence = {}
+
+    reason = str((result or {}).get("reason") or "")
+    reason_status = {
+        "manually_patrolled": "patrolled",
+        "reverted_tag": "reverted",
+        "superseded": "resolved_no_action",
+        "deleted": "deleted",
+        "reverted": "reverted",
+        "self_reverted": "self_reverted",
+        "patrolled": "patrolled",
+        "resolved_no_action": "resolved_no_action",
+        "false_positive": "false_positive",
+        "manual_vandalism": "manual_vandalism",
+        "manual_clean": "manual_clean",
+    }
+    posted_status = posted.get("status") if isinstance(posted, dict) else None
+    if posted_status and high_risk_action(posted)[0] is not None:
+        status = posted_status
+    elif result.get("decision") == "suppress" and reason in reason_status:
+        status = reason_status[reason]
+    else:
+        # A defer, missing evidence, or unknown suppression is still pending.
+        status = "verification_inconclusive"
+
+    with high_risk_archive_lock:
+        existing = high_risk_archive.get(revision_id)
+        old = dict(existing) if isinstance(existing, dict) else {}
+        record = dict(old or candidate)
+        if not old:
+            record.update({key: value for key, value in candidate.items() if value is not None})
+            record["revision_id"] = int(candidate["revision_id"])
+            record["revision_timestamp"] = candidate.get("revision_timestamp")
+            record["posted_at"] = candidate.get("detected_at") or now
+            record["archive_date"] = high_risk_record_date(record)
+        if isinstance(posted, dict):
+            record.update({key: value for key, value in posted.items() if value is not None})
+        record["revision_id"] = int(candidate["revision_id"])
+        record["revision_timestamp"] = candidate.get("revision_timestamp")
+        record["status"] = status
+        record["ptwiki_delay_verified"] = True
+        record["ptwiki_verified_at"] = candidate.get("last_checked_at") or now
+        record["ptwiki_verification"] = result
+        record["last_checked_at"] = now
+        record["archive_date"] = record.get("archive_date") or high_risk_record_date(record)
+
+        if status == "verification_inconclusive":
+            record["prepublish_status_inferred"] = True
+        else:
+            record.pop("prepublish_status_inferred", None)
+
+        actor_fields = {
+            "reverted": ("reverted_by", "reverted_at"),
+            "patrolled": ("patrolled_by", "patrolled_at"),
+            "deleted": ("deleted_by", "deleted_at"),
+            "resolved_no_action": ("resolved_by", "resolved_at"),
+            "false_positive": ("false_positive_by", "false_positive_at"),
+            "manual_vandalism": ("manual_reviewer", "manual_reviewed_at"),
+            "manual_clean": ("manual_reviewer", "manual_reviewed_at"),
+        }
+        actor_key, timestamp_key = actor_fields.get(status, (None, None))
+        if actor_key and evidence.get("actor"):
+            record[actor_key] = evidence["actor"]
+        if timestamp_key and evidence.get("timestamp"):
+            record[timestamp_key] = evidence["timestamp"]
+        high_risk_archive[revision_id] = record
+        changed = record != old
+
+    if changed:
+        save_high_risk_archive()
+        queue_high_risk_daily_archive_update(
+            record["archive_date"],
+            "Arquivando revisão inconclusiva ou resolvida em " + record["archive_date"],
+        )
+
+
 def _cleanup_high_risk_candidate_state(state, now):
     cutoff = now - WIKI_HIGH_RISK_DECISION_RETENTION_SECONDS
     state["items"] = {
@@ -16297,6 +16380,8 @@ def process_due_high_risk_candidates(now=None, limit=10):
             candidate = dict(live)
         if approved_for_publication:
             _archive_approved_candidate(candidate)
+        elif decision in {"defer", "suppress"}:
+            _archive_deferred_candidate(candidate, result, now=now)
         print("🧭 Revalidação de alto risco:", key, "→", candidate.get("state"), "|", result.get("reason"))
     return counts
 
