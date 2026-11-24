@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.5"
-BOT_BUILD = "4.2.5-nochange-publication-tracking"
+BOT_VERSION = "4.2.6"
+BOT_BUILD = "4.2.6-fair-high-risk-candidate-scheduling"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2868,6 +2868,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.6": "Prioriza candidatas novas já vencidas sobre revalidações adiadas e ordena tentativas adiadas pelo próximo horário, evitando que o backlog atrase a entrada de cards recentes.",
     "4.2.5": "Distingue edição wiki efetiva de resposta sem alteração (nochange), confirma revisões pelo newrevid e marca como publicadas apenas as revisões realmente incluídas na página principal.",
     "4.2.4": "Reconcilia a página principal e os sete arquivos diários mais recentes com o conteúdo remoto, corrige datas de arquivo e mantém pendências recentes na principal; também aceita positivos CoPE-B sem Revert Risk numérico.",
     "4.2.3": "Garante no máximo uma atualização diária do catálogo experimental entre reinícios e instâncias simultâneas, com estado persistente e nova tentativa após falhas.",
@@ -16470,7 +16471,16 @@ def process_due_high_risk_candidates(now=None, limit=10):
             and float(item.get("eligible_at") or float("inf")) <= now
             and float(item.get("next_check_at") or 0) <= now
         ]
-    due.sort(key=lambda item: (float(item.get("eligible_at") or 0), int(item.get("revision_id") or 0)))
+    # Give every newly due candidate its first verification before retrying
+    # older ambiguous cases. Retried items are ordered by their next due time,
+    # not by the original eligible_at, so a large retry backlog cannot starve
+    # fresh cards indefinitely.
+    due.sort(key=lambda item: (
+        0 if item.get("state") == "waiting" else 1,
+        float(item.get("next_check_at") or item.get("eligible_at") or 0),
+        float(item.get("eligible_at") or 0),
+        int(item.get("revision_id") or 0),
+    ))
     counts = {"checked": 0, "approved": 0, "suppressed": 0, "deferred": 0}
     for candidate in due[:limit]:
         counts["checked"] += 1
