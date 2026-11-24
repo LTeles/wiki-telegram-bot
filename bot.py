@@ -33,8 +33,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2"
-BOT_BUILD = "4.2-pattern-validation-inconclusive-controls"
+BOT_VERSION = "4.2.1"
+BOT_BUILD = "4.2.1-high-risk-candidate-enqueue-decoupled"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -12210,6 +12210,12 @@ def analysis_worker():
                     title
                 )
 
+            # A fila wiki tem critérios próprios (>80% de Revert Risk ou
+            # CoPE-B positivo). Não a condicionar ao limiar de alerta do
+            # Telegram: os redutores contextuais podem baixar o escore final
+            # sem invalidar um Revert Risk alto.
+            enqueue_high_risk_candidate(change, result, diff, cope_b=cope_b)
+
             cope_b_positive = isinstance(cope_b, dict) and cope_b.get("label") == "1"
             if result["score"] >= VANDALISM_THRESHOLD or cope_b_positive:
                 if cope_b_positive and result["score"] < VANDALISM_THRESHOLD:
@@ -12240,10 +12246,6 @@ def analysis_worker():
                             high_score_case.get("remaining", ABUSE_FILTER_TEST_EDIT_LIMIT),
                         )
 
-                # A publicação wiki segue uma fila independente do Telegram.
-                # O helper aplica o limiar estrito (>80%) e persiste a janela
-                # original de duas horas de forma idempotente.
-                enqueue_high_risk_candidate(change, result, diff, cope_b=cope_b)
                 message = format_message(
                     change,
                     result,
@@ -15962,12 +15964,15 @@ def enqueue_high_risk_candidate(change, result, diff, cope_b=None):
     if PTWIKI_HIGH_RISK_MODE == "off":
         return False
     try:
-        risk = float(result.get("revert_risk"))
         revision_id = int((change.get("revision") or {}).get("new"))
     except (TypeError, ValueError, OverflowError):
         return False
     cope_b_positive = isinstance(cope_b, dict) and cope_b.get("label") == "1"
-    if risk <= WIKI_HIGH_RISK_THRESHOLD and not cope_b_positive:
+    try:
+        risk = float(result.get("revert_risk"))
+    except (TypeError, ValueError, OverflowError):
+        risk = None
+    if not cope_b_positive and (risk is None or risk <= WIKI_HIGH_RISK_THRESHOLD):
         return False
     revision_timestamp = _event_revision_timestamp(change)
     byte_delta = None
