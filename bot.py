@@ -13,6 +13,7 @@ import math
 import base64
 import hashlib
 import fcntl
+from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from datetime import datetime, timezone, timedelta
@@ -34,8 +35,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.8"
-BOT_BUILD = "4.2.8-archive-reversal-monitor"
+BOT_VERSION = "4.2.9"
+BOT_BUILD = "4.2.9-telegram-diff-photo"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -44,6 +45,7 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+TELEGRAM_DIFF_PHOTOS = os.environ.get("TELEGRAM_DIFF_PHOTOS", "1").strip() == "1"
 
 WIKIMEDIA_STREAM = "https://stream.wikimedia.org/v2/stream/recentchange"
 WIKIPEDIA_API = "https://pt.wikipedia.org/w/api.php"
@@ -476,6 +478,8 @@ protection_rate_state = {
 }
 
 telegram_queue = queue.Queue()
+telegram_diff_photo_queue = queue.Queue(maxsize=32)
+telegram_diff_photo_ready = threading.Event()
 
 stream_lock = threading.Lock()
 stream_connected = False
@@ -2895,6 +2899,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.9": "Envia uma imagem das linhas alteradas em resposta aos alertas de edição no Telegram quando o diff cabe inteiro na imagem.",
     "4.2.8": "Monitora reversões dos cards da Wikipédia independentemente dos alertas do Telegram e atualiza os arquivos afetados.",
     "4.2.7": "Redesenha o painel Status com atividade e incidentes de 24 horas, histórico semanal e comunicado manual. Reduz falsos positivos de reformulações, discussões, separadores e links internos.",
     "4.2.6": "Prioriza candidatas novas já vencidas sobre revalidações adiadas e ordena tentativas adiadas pelo próximo horário, evitando que o backlog atrase a entrada de cards recentes.",
@@ -8648,6 +8653,127 @@ def pending_alerts_summary_scheduler():
 # TELEGRAM SENDER
 # =========================================================
 
+def telegram_diff_lines(revision_id, parent_id, is_new_page):
+    """Lê as linhas alteradas sem os limites de texto usados pela análise."""
+    if is_new_page:
+        content = _revision_content_for_diff(revision_id)
+        return [("+", content)] if content else []
+    if not parent_id:
+        return []
+
+    body = _fetch_compare_html(parent_id, revision_id, timeout=12)
+    cells = re.findall(
+        r'<td\b[^>]*class=["\'][^"\']*\bdiff-(added|deleted)line\b'
+        r'[^"\']*["\'][^>]*>(.*?)</td>',
+        body,
+        flags=re.I | re.S,
+    )
+    return [
+        (
+            "+" if kind.lower() == "added" else "−",
+            html.unescape(re.sub(r"<[^>]*>", "", cell)),
+        )
+        for kind, cell in cells
+    ]
+
+
+def render_telegram_diff_photo(revision_id, changes, font):
+    """Renderiza todas as linhas alteradas ou devolve None se excederem a imagem."""
+    from PIL import Image, ImageDraw
+
+    width = 1000
+    margin = 28
+    line_height = 34
+    max_lines = 30
+    max_columns = 58
+    if not changes or sum(len(content) for _, content in changes) > max_lines * max_columns:
+        return None
+
+    rows = []
+    for marker, content in changes:
+        for line in content.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = line.expandtabs(4)
+            # Mantém espaços e linhas vazias, inclusive nas edições de formatação.
+            for start in range(0, max(1, len(line)), max_columns):
+                fragment = line[start:start + max_columns]
+                if font.getlength(fragment) > width - 2 * margin - 60:
+                    return None
+                rows.append((marker if start == 0 else "", marker, fragment))
+                if len(rows) > max_lines:
+                    return None
+
+    height = 2 * margin + 48 + line_height * len(rows)
+    image = Image.new("RGB", (width, height), "#ffffff")
+    draw = ImageDraw.Draw(image)
+    draw.text((margin, margin), f"Linhas alteradas · revisão {revision_id}", font=font, fill="#202122")
+    y = margin + 48
+    for marker, change_type, fragment in rows:
+        background, foreground = (
+            ("#edf9ed", "#154f2a") if change_type == "+" else ("#fff0ee", "#822c20")
+        )
+        draw.rectangle((margin, y, width - margin, y + line_height - 1), fill=background)
+        draw.text((margin + 12, y), marker, font=font, fill=foreground)
+        draw.text((margin + 48, y), fragment, font=font, fill=foreground)
+        y += line_height
+
+    photo = BytesIO()
+    image.save(photo, format="PNG")
+    return photo.getvalue()
+
+
+def queue_telegram_diff_photo(item, message):
+    message_id = message.get("message_id")
+    if not telegram_diff_photo_ready.is_set() or not message_id or not item.get("revision_id"):
+        return
+    try:
+        telegram_diff_photo_queue.put_nowait((
+            (message.get("chat") or {}).get("id", TELEGRAM_CHANNEL),
+            message_id,
+            item["revision_id"],
+            item.get("parent_revision_id"),
+            item.get("is_new_page"),
+        ))
+    except queue.Full:
+        print("⚠️ Fila de imagens de diff cheia; alerta publicado apenas em texto.")
+
+
+def telegram_diff_photo_worker():
+    if not TELEGRAM_DIFF_PHOTOS:
+        return
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype("DejaVuSansMono.ttf", 24)
+    except (ImportError, OSError):
+        print("⚠️ Imagens de diff indisponíveis: instale Pillow e a fonte DejaVu Sans Mono.")
+        return
+
+    telegram_diff_photo_ready.set()
+    while True:
+        chat_id, message_id, revision_id, parent_id, is_new_page = telegram_diff_photo_queue.get()
+        try:
+            changes = telegram_diff_lines(revision_id, parent_id, is_new_page)
+            photo = render_telegram_diff_photo(revision_id, changes, font)
+            if photo is None:
+                continue
+            response = requests.post(
+                f"{TELEGRAM_API}/sendPhoto",
+                data={
+                    "chat_id": chat_id,
+                    "reply_parameters": json.dumps({"message_id": message_id}),
+                    "disable_notification": "true",
+                },
+                files={"photo": ("diff.png", photo, "image/png")},
+                timeout=20,
+            )
+            # Um timeout pode ocorrer após a entrega. Evita duplicar a foto.
+            if not response.ok or not response.json().get("ok"):
+                print("⚠️ Imagem de diff não confirmada:", revision_id, "| HTTP:", response.status_code)
+        except Exception as exc:
+            print("⚠️ Falha na imagem de diff:", revision_id, "|", safe_exception(exc))
+        finally:
+            telegram_diff_photo_queue.task_done()
+
+
 def telegram_sender():
     while True:
         item = telegram_queue.get()
@@ -8668,6 +8794,7 @@ def telegram_sender():
                 )
 
                 if item.get("track_revision"):
+                    queue_telegram_diff_photo(item, result)
                     register_posted_edit(
                         item,
                         result
@@ -10322,11 +10449,23 @@ def _content_diff_fallback(old_revision, new_revision):
         return {"added":"","removed":"","has_diff_cells":False,"whitespace_changed":False}
 
 
+def _fetch_compare_html(old_revision, new_revision, timeout=30):
+    response = requests.get(
+        WIKIPEDIA_API,
+        params={
+            "action": "compare", "format": "json", "formatversion": 2,
+            "fromrev": old_revision, "torev": new_revision, "prop": "diff",
+        },
+        headers=HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json().get("compare", {}).get("body", "") or ""
+
+
 def get_revision_diff(old_revision, new_revision):
     try:
-        response = requests.get(WIKIPEDIA_API, params={"action":"compare","format":"json","formatversion":2,"fromrev":old_revision,"torev":new_revision,"prop":"diff"}, headers=HEADERS, timeout=30)
-        response.raise_for_status()
-        diff_html = response.json().get("compare", {}).get("body", "") or ""
+        diff_html = _fetch_compare_html(old_revision, new_revision)
         added_matches = re.findall(r"<td\b[^>]*class=[\"'][^\"']*\bdiff-addedline\b[^\"']*[\"'][^>]*>(.*?)</td>", diff_html, flags=re.I|re.S)
         removed_matches = re.findall(r"<td\b[^>]*class=[\"'][^\"']*\bdiff-deletedline\b[^\"']*[\"'][^>]*>(.*?)</td>", diff_html, flags=re.I|re.S)
         added = "\n".join(clean_html(x) for x in added_matches); removed = "\n".join(clean_html(x) for x in removed_matches)
@@ -12250,6 +12389,8 @@ def tracked_queue_item(
         "edit_comment": change.get("comment") or "Sem resumo",
         "revision_timestamp": _event_revision_timestamp(change),
         "diff_url": build_diff_url(change),
+        "parent_revision_id": revision.get("old"),
+        "is_new_page": change.get("type") == "new",
         "stats_payload": stats_payload,
         "alert_kind": alert_kind,
         "abuse_filter_test_case_id": test_case_id,
@@ -18439,6 +18580,7 @@ def main():
 
     threads = [
         ("telegram-sender", telegram_sender),
+        ("telegram-diff-photo", telegram_diff_photo_worker),
         ("account-creation-monitor", account_creation_log_monitor),
         ("analysis-worker", analysis_worker),
         ("block-worker", block_worker),
