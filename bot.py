@@ -10409,6 +10409,89 @@ def reference_date_priority_adjustment(diff):
     return {"factor": 0.55, "reason": "tradução de datas equivalentes em referência; conteúdo preservado"}
 
 
+def routine_formatting_only(diff):
+    """Reconhece alterações completas limitadas a links simples ou separadores."""
+    from collections import Counter
+
+    old = str(diff.get("removed") or "")
+    new = str(diff.get("added") or "")
+    if not old or not new or max(len(old), len(new)) >= MAX_DIFF_CHARS:
+        return None
+    before = normalized_diff_lines(old)
+    after = normalized_diff_lines(new)
+    if len(before) != len(after) or before == after:
+        return None
+
+    wikilink = re.compile(r"\[\[([^\[\]\n]+)\]\]")
+    bullet = re.compile(r"(\]\])\s*[•·]\s*(?=\[\[)")
+    kinds = set()
+    for old_line, new_line in zip(before, after):
+        if old_line == new_line:
+            continue
+        if re.match(r"^\|\s*[\w -]+\s*=", old_line):
+            without_bullets = lambda line: bullet.sub(r"\1 ", line)
+            if without_bullets(old_line) == without_bullets(new_line):
+                kinds.add("separadores entre itens de campo de predefinição")
+                continue
+
+        # Evita interpretar sintaxe em campos de predefinição como prosa.
+        if old_line.startswith(("|", "!", "{", "}", "<", "#")):
+            return None
+        existing = Counter(match.group() for match in wikilink.finditer(old_line))
+
+        def plain_text(match):
+            link = match.group()
+            if existing[link]:
+                existing[link] -= 1
+                return link
+            label = match.group(1).strip()
+            if not re.fullmatch(r"[\w][\w .,'’()–-]{0,119}", label) or "_" in label:
+                return link
+            prefix = new_line[:match.start()]
+            suffix = new_line[match.end():]
+            if (prefix.count("{{") != prefix.count("}}")
+                    or prefix.count("<") != prefix.count(">")
+                    or len(re.findall(r"<ref\b[^>]*(?<!/)>", prefix, re.I))
+                    != len(re.findall(r"</ref\s*>", prefix, re.I))
+                    or re.search(r"\w$", prefix) or re.match(r"\w", suffix)):
+                return link
+            return label
+
+        restored = " ".join(wikilink.sub(plain_text, new_line).split())
+        if restored != old_line or any(existing.values()):
+            return None
+        kinds.add("adição de links internos ao texto existente")
+    return ", ".join(sorted(kinds))
+
+
+def short_prose_rewording_adjustment(diff):
+    """Mede os trechos substituídos mesmo quando o compare devolve a linha inteira."""
+    old = normalized_diff_lines(diff.get("removed", ""))
+    new = normalized_diff_lines(diff.get("added", ""))
+    if len(old) != 1 or len(new) != 1 or max(len(old[0]), len(new[0])) >= MAX_DIFF_CHARS:
+        return None
+    if old[0].startswith(("|", "!", "{", "}", "<", "=")):
+        return None
+    tokens = re.compile(r"\[\[[^\[\]]*\]\]|\{\{[^{}]*\}\}|<[^>]*>|https?://\S+|\w+|[^\w\s]")
+    before = tokens.findall(old[0])
+    after = tokens.findall(new[0])
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    edits = [(before[i:j], after[k:l]) for tag, i, j, k, l in matcher.get_opcodes() if tag != "equal"]
+    old_words = [word for left, _ in edits for word in left]
+    new_words = [word for _, right in edits for word in right]
+    if not (1 <= len(old_words) <= 4 and 1 <= len(new_words) <= 6
+            and len(edits) <= 3 and matcher.ratio() >= 0.87):
+        return None
+    if any(not word.isalpha() or not word.islower() for word in old_words + new_words):
+        return None
+    changed = " ".join(old_words + new_words)
+    if re.search(r"\b(?:não|nao|nunca|jamais|sem|nenhum[ao]?|nem|compre|clique)\b", changed):
+        return None
+    if profanity_score(" ".join(new_words)):
+        return None
+    return {"factor": 0.50, "reason": "reformulação curta em prosa com contexto preservado"}
+
+
 def isolated_wikilink_priority_adjustment(diff):
     """Desconto apenas para envolver texto existente em um wikilink simples."""
     old = " ".join(normalized_diff_lines(diff.get("removed", "")))
@@ -11067,24 +11150,7 @@ def contextual_priority_calibration(change, diff, strong_signals):
                 and not re.search(r"(?:www\.|@|\b(?:instagram|whatsapp|telegram|compre|contrate|patrocinad[oa]|empresa|servicos?)\b)", added + removed, re.I)
                 and not re.search(r"\[\[|\{\{|<[^>]+>", added + removed)):
             return {"factor": 0.70, "reason": "correção trivial em página de usuário; conferir contexto"}
-    # Community conversations: append-only signed comments, not arbitrary project pages.
-    community = is_discussion_namespace(change)
-    if not community or removed.strip() or not added.strip():
-        return None
-    body = discussion_comment_body(added)
-    if (not looks_like_signed_discussion_comment(added) or len(body) < 12
-            or count_external_links(body) > 1 or max(profanity_score(body), repetition_score(body), nonsense_score(body)) >= 0.75
-            or re.search(r"(?:www\.|\b(?:compre|contrate|patrocinad[oa]|whatsapp|instagram)\b)", body, re.I)):
-        return None
-    help_page = any(x in folded for x in (
-        "ajuda:", "wikipedia:cafe dos novatos", "wikipedia:pedidos/", "wikipedia:esplanada/"))
-    help_request = bool(re.search(
-        r"\b(?:peco ajuda|peço ajuda|preciso de (?:ajuda|orientacao|orientação)|"
-        r"sou nov[oa]|como faco|como faço|agradeco sugestoes|agradeço sugestões|"
-        r"avaliacao|avaliação|podem me ajudar|alguma duvida|alguma dúvida)\b", body, re.I))
-    if help_page and help_request:
-        return {"factor": 0.20, "reason": "relato ou pedido benigno assinado em espaço comunitário/de ajuda"}
-    return {"factor": 0.20, "reason": "comentário assinado e sem sinais suspeitos em página de discussão"}
+    return None
 
 
 def benign_technical_change(diff):
@@ -11254,8 +11320,11 @@ def count_external_links(value):
 
 
 def discussion_comment_body(added):
-    """Retira apenas a assinatura FINAL; não interpreta seu ID/data como prosa."""
-    value = str(added or "")
+    """Extrai a mensagem sem o cabeçalho de orientação e a assinatura final."""
+    value = re.sub(
+        r"^\s*==\s*Pergunta de\s+\[\[(?:User|Usu[aá]rio(?:\(a\))?):[^\]\n]+\]\]"
+        r"\s*\([^\n()]+\)\s*==\s*\n", "", str(added or ""), flags=re.I,
+    )
     # Assinatura expandida termina em data UTC. Preserva a prosa anterior.
     timestamp = re.search(
         r"\b\d{1,2}h\d{2}min\s+de\s+\d{1,2}\s+de\s+"
@@ -11265,35 +11334,39 @@ def discussion_comment_body(added):
     if timestamp:
         prefix = value[:timestamp.start()]
         # Identidade deve aparecer perto do horário; não apaga links arbitrários.
-        identity = list(re.finditer(
-            r"\[\[(?:Usu[aá]rio(?:\(a\))?|Especial:Contribui[^:]*|"
-            r"Usu[aá]rio\s+Discuss[aã]o):", prefix, re.I,
-        ))
-        if identity and len(prefix) - identity[-1].start() <= 450:
-            return prefix[:identity[-1].start()].strip()
-    return value.replace("~~~~", "").strip()
+        signature = re.search(
+            r"[-–—]*\s*\[\[(?:User|Usu[aá]rio(?:\(a\))?|Especial:Contribui[^:\n]*):"
+            r"[^\]\n]{1,200}\]\](?:\s*\(\[\[(?:User talk|Usu[aá]rio(?:\(a\))?"
+            r"\s+Discuss[aã]o):[^\]\n]{1,200}\]\]\))?\s*$",
+            prefix, re.I,
+        )
+        if signature:
+            return prefix[:signature.start()].strip()
+    return re.sub(r"(?<!~)~~~~\s*$", "", value).strip()
 
 
 def contextual_discussion_adjustment(change, diff, strong_signals):
-    """Reduz falsos positivos em respostas assinadas, sem blindar abuso."""
+    """Reduz a prioridade de mensagens rotineiras em páginas de discussão."""
     added = str(diff.get("added", "") or "")
     removed = str(diff.get("removed", "") or "")
     signed = looks_like_signed_discussion_comment(added)
     talk = is_discussion_namespace(change)
-    if talk and signed:
+    if talk:
         body = discussion_comment_body(added)
         # Apenas acréscimos. Não encobre remoção, insultos, spam ou repetição.
         # URLs da assinatura não contam como spam; URLs da mensagem contam.
         links = count_external_links(body)
         body_signals = max(profanity_score(body), repetition_score(body), nonsense_score(body))
         if (not removed.strip() and strong_signals == 0 and body_signals < 0.75
-                and links <= 1 and len(body) >= 12
+                and (signed or re.search(r"[^\W\d_]{2,}", body))
+                and links <= (1 if signed else 0) and len(body) >= 4
+                and (signed or (len(body) <= 1800 and not re.search(r"\{\{|<[^>]+>", body)))
                 and not re.search(r"(?:compre|contrate|patrocinad[oa]|whatsapp|telegram\.me)", body, re.I)):
             return {
                 "multiplier": 0.15,
                 "additive": 0.0,
-                "reason": "comentário assinado e sem sinais suspeitos em espaço de conversa",
-                "kind": "talk_signed_append",
+                "reason": "mensagem acrescentada em discussão sem sinais suspeitos",
+                "kind": "talk_append",
             }
         # Não aplica redutor genérico a edições com remoções ou links externos.
         return None
@@ -11499,13 +11572,13 @@ def analyze_vandalism(change, diff, revert_risk):
     added = diff.get("added", "")
     removed = diff.get("removed", "")
     # Na discussão, avalia a prosa sem os números/links da assinatura final.
-    signal_text = (discussion_comment_body(added)
-                   if is_discussion_namespace(change)
-                   and looks_like_signed_discussion_comment(added)
-                   else added)
+    talk = is_discussion_namespace(change)
+    signal_text = discussion_comment_body(added) if talk else added
 
     profanity = profanity_score(signal_text)
     repetition = repetition_score(signal_text)
+    if talk and re.search(r"\b(\w{2,})(?:\s+\1){7,}\b", signal_text, re.I):
+        repetition = 0.95
     destructive = destructive_score(
         added,
         removed
@@ -11558,6 +11631,11 @@ def analyze_vandalism(change, diff, revert_risk):
                                or whitespace_only_priority_adjustment(diff)
                                or reference_date_priority_adjustment(diff)
                                or isolated_wikilink_priority_adjustment(diff))
+    prose_rewording = None
+    if not talk and change.get("type") != "new" and max(signals) < 0.75:
+        prose_rewording = short_prose_rewording_adjustment(diff)
+        if prose_rewording:
+            cosmetic_adjustment = prose_rewording
     children_adjustment = children_count_priority_adjustment(change, diff)
     if children_adjustment and children_adjustment.get("factor") and not cosmetic_adjustment and max(signals) < 0.75:
         cosmetic_adjustment = children_adjustment
@@ -11592,8 +11670,6 @@ def analyze_vandalism(change, diff, revert_risk):
 
     if cosmetic_adjustment:
         context_adjustment = None  # Não acumular descontos para a mesma edição.
-    if context_adjustment and contextual_calibration and context_adjustment.get("kind") == "talk_signed_append":
-        context_adjustment = None  # One contextual discount, never multiply 0.70 by 0.45.
     if context_adjustment:
         score *= float(context_adjustment.get("multiplier", 1.0))
         score += float(context_adjustment.get("additive", 0.0))
@@ -11680,6 +11756,9 @@ def analyze_vandalism(change, diff, revert_risk):
         "context_adjustment": context_adjustment,
         "promotional_adjustment": promotional_adjustment,
         "reference_removal_adjustment": reference_removal,
+        "routine_text_adjustment": bool(
+            prose_rewording or (context_adjustment and context_adjustment["kind"] == "talk_append")
+        ),
     }
 
 
@@ -12188,6 +12267,11 @@ def analysis_worker():
                     new_revision
                 )
 
+                formatting = routine_formatting_only(diff)
+                if formatting:
+                    print("🧩 Alteração de formatação ignorada:", formatting, "|", title)
+                    continue
+
                 result = analyze_vandalism(
                     change,
                     diff,
@@ -12235,8 +12319,7 @@ def analysis_worker():
 
             # A fila wiki tem critérios próprios (>80% de Revert Risk ou
             # CoPE-B positivo). Não a condicionar ao limiar de alerta do
-            # Telegram: os redutores contextuais podem baixar o escore final
-            # sem invalidar um Revert Risk alto.
+            # Telegram. A fila aplica sua própria triagem de edições rotineiras.
             enqueue_high_risk_candidate(change, result, diff, cope_b=cope_b)
 
             cope_b_positive = isinstance(cope_b, dict) and cope_b.get("label") == "1"
@@ -16094,6 +16177,9 @@ def enqueue_high_risk_candidate(change, result, diff, cope_b=None):
         risk = None
     if not cope_b_positive and (risk is None or risk <= WIKI_HIGH_RISK_THRESHOLD):
         return False
+    if (not cope_b_positive and result.get("routine_text_adjustment")
+            and result["score"] < VANDALISM_THRESHOLD):
+        return False
     revision_timestamp = _event_revision_timestamp(change)
     byte_delta = None
     lengths = change.get("length")
@@ -16833,7 +16919,7 @@ def build_high_risk_wikitext(now=None, records=None):
         visible,
         "Edições com alto risco de erro",
         "Esta lista inclui edições da Wikipédia em português com Revert Risk "
-        f"superior a {WIKI_HIGH_RISK_THRESHOLD:.0%} ou classificadas como positivas pelo CoPE-B.",
+        f"superior a {WIKI_HIGH_RISK_THRESHOLD:.0%} ou classificadas como positivas pelo CoPE-B, após a triagem de alterações rotineiras.",
     )
 
 
