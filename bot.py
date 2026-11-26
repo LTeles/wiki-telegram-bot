@@ -35,8 +35,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.9"
-BOT_BUILD = "4.2.9-telegram-diff-photo"
+BOT_VERSION = "4.2.10"
+BOT_BUILD = "4.2.10-telegram-diff-diagnostics"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2899,6 +2899,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.10": "Usa uma fonte embutida como alternativa para imagens de diff e registra o resultado de cada tentativa de publicação.",
     "4.2.9": "Envia uma imagem das linhas alteradas em resposta aos alertas de edição no Telegram quando o diff cabe inteiro na imagem.",
     "4.2.8": "Monitora reversões dos cards da Wikipédia independentemente dos alertas do Telegram e atualiza os arquivos afetados.",
     "4.2.7": "Redesenha o painel Status com atividade e incidentes de 24 horas, histórico semanal e comunicado manual. Reduz falsos positivos de reformulações, discussões, separadores e links internos.",
@@ -8734,26 +8735,44 @@ def queue_telegram_diff_photo(item, message):
             item.get("is_new_page"),
         ))
     except queue.Full:
-        print("⚠️ Fila de imagens de diff cheia; alerta publicado apenas em texto.")
+        print("DIFF_FOTO etapa=fila_cheia | revisão:", item["revision_id"], flush=True)
 
 
 def telegram_diff_photo_worker():
     if not TELEGRAM_DIFF_PHOTOS:
+        print("DIFF_FOTO etapa=desativada | TELEGRAM_DIFF_PHOTOS", flush=True)
         return
     try:
         from PIL import ImageFont
-        font = ImageFont.truetype("DejaVuSansMono.ttf", 24)
-    except (ImportError, OSError):
-        print("⚠️ Imagens de diff indisponíveis: instale Pillow e a fonte DejaVu Sans Mono.")
+    except ImportError as exc:
+        print("DIFF_FOTO etapa=erro_pillow |", safe_exception(exc), flush=True)
         return
 
+    try:
+        font = ImageFont.truetype("DejaVuSansMono.ttf", 24)
+        font_name = "DejaVu Sans Mono"
+    except OSError:
+        try:
+            font = ImageFont.load_default(size=24)
+            font_name = "Pillow"
+        except (TypeError, OSError) as exc:
+            print("DIFF_FOTO etapa=erro_fonte | Atualize Pillow para 10.1 ou superior |",
+                  safe_exception(exc), flush=True)
+            return
+
+    print("DIFF_FOTO etapa=ativa | fonte:", font_name, flush=True)
     telegram_diff_photo_ready.set()
     while True:
         chat_id, message_id, revision_id, parent_id, is_new_page = telegram_diff_photo_queue.get()
         try:
             changes = telegram_diff_lines(revision_id, parent_id, is_new_page)
+            if not changes:
+                print("DIFF_FOTO etapa=sem_linhas | revisão:", revision_id,
+                      "| anterior:", parent_id, flush=True)
+                continue
             photo = render_telegram_diff_photo(revision_id, changes, font)
             if photo is None:
+                print("DIFF_FOTO etapa=excede_imagem | revisão:", revision_id, flush=True)
                 continue
             response = requests.post(
                 f"{TELEGRAM_API}/sendPhoto",
@@ -8766,10 +8785,21 @@ def telegram_diff_photo_worker():
                 timeout=20,
             )
             # Um timeout pode ocorrer após a entrega. Evita duplicar a foto.
-            if not response.ok or not response.json().get("ok"):
-                print("⚠️ Imagem de diff não confirmada:", revision_id, "| HTTP:", response.status_code)
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
+            if response.ok and result.get("ok"):
+                print("DIFF_FOTO etapa=enviada | revisão:", revision_id,
+                      "| alerta:", message_id, flush=True)
+            else:
+                print("DIFF_FOTO etapa=telegram_rejeitou | revisão:", revision_id,
+                      "| HTTP:", response.status_code,
+                      "|", safe_log_text(result.get("description") or "Sem descrição"),
+                      flush=True)
         except Exception as exc:
-            print("⚠️ Falha na imagem de diff:", revision_id, "|", safe_exception(exc))
+            print("DIFF_FOTO etapa=falha | revisão:", revision_id,
+                  "|", safe_exception(exc), flush=True)
         finally:
             telegram_diff_photo_queue.task_done()
 
@@ -10460,7 +10490,10 @@ def _fetch_compare_html(old_revision, new_revision, timeout=30):
         timeout=timeout,
     )
     response.raise_for_status()
-    return response.json().get("compare", {}).get("body", "") or ""
+    data = response.json()
+    if data.get("error"):
+        raise RuntimeError("MediaWiki compare: " + str(data["error"].get("code", "erro")))
+    return data.get("compare", {}).get("body", "") or ""
 
 
 def get_revision_diff(old_revision, new_revision):
