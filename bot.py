@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.6"
-BOT_BUILD = "4.2.6-fair-high-risk-candidate-scheduling"
+BOT_VERSION = "4.2.7"
+BOT_BUILD = "4.2.7-operational-status"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -186,6 +186,10 @@ WIKI_STATUS_INTERVAL_SECONDS = 6 * 60 * 60
 WIKI_WRITE_QUEUE_FILE = data_path("wiki_write_queue.json")
 WIKI_WRITE_CONTROL_FILE = data_path("wiki_write_control.json")
 WIKI_WRITE_LOCK = threading.RLock()
+STATUS_OPERATIONS_LOCK = threading.Lock()
+STATUS_OPERATIONS_FILE = data_path("wiki_status_operations.json")
+STATUS_WINDOW_SECONDS = 24 * 60 * 60
+STATUS_NOTICE_LIMIT = 1000
 GENERAL_PRIORITY_FACTOR = 0.90  # Redução geral de 10% na prioridade, sem alterar o Revert Risk.
 WIKI_PENDING_PAGES_FILE = data_path("wiki_pending_pages.json")
 
@@ -1900,6 +1904,14 @@ def wiki_page_exists(title):
     return not bool(pages[0].get("missing"))
 
 
+def wiki_creation_allowed(title):
+    return WIKI_CREATE_ENABLED and (
+        title in (WIKI_STATUS_TITLE, WIKI_STATISTICS_TITLE, WIKI_ADJUSTMENTS_TITLE, WIKI_PATTERN_TITLE)
+        or wiki_report_creation_allowed(title)
+        or wiki_high_risk_title_is_allowed(title)
+    )
+
+
 def wiki_page_write_context(title):
     """Return the base revision and timestamps needed for conflict-safe writes."""
     _response, data = wikimedia_api_get({
@@ -2029,6 +2041,7 @@ def queue_wiki_edit(
             "summary": summary,
             "write_class": write_class,
             "digest": digest,
+            "queued_at": (current or {}).get("queued_at") or time.time(),
         }
         if publication_revision_ids:
             item["publication_revision_ids"] = sorted({
@@ -2112,18 +2125,13 @@ def wiki_edit_page(title, wikitext, summary, write_class="general"):
         context = wiki_page_write_context(title)
         exists = context["exists"]
         create = not exists
-        if create and not (
-            WIKI_CREATE_ENABLED
-            and (
-                title in (WIKI_STATUS_TITLE, WIKI_STATISTICS_TITLE, WIKI_ADJUSTMENTS_TITLE, WIKI_PATTERN_TITLE)
-                or wiki_report_creation_allowed(title)
-                or wiki_high_risk_title_is_allowed(title)
-            )
-        ):
+        if create and not wiki_creation_allowed(title):
+            record_status_operation("wiki_blocked", "Criação não autorizada")
             print("📄 Página ausente; criação bloqueada:", title)
             return False
         # A deletion log is a hard stop for any attempt to recreate a page.
         if create and get_latest_deletion_log(title):
+            record_status_operation("wiki_blocked", "Página eliminada; recriação automática bloqueada")
             print("⛔ Página eliminada; recriação automática proibida:", title)
             return False
         if not wikimedia_authenticated and not wikimedia_login():
@@ -2221,6 +2229,8 @@ def process_wiki_write_queue_once():
             return False
         try:
             item = prepare_high_risk_write_item(item)
+            if item["title"] == WIKI_STATUS_TITLE:
+                item = {**item, "text": build_wiki_status_wikitext()}
             outcome = wiki_edit_page(
                 item["title"], item["text"], item["summary"],
                 write_class=item.get("write_class", "general"),
@@ -2229,6 +2239,7 @@ def process_wiki_write_queue_once():
             nochange = bool(outcome.get("nochange")) if isinstance(outcome, dict) else False
         except Exception as exc:
             print("⚠️ Falha na escrita wiki:", safe_exception(exc))
+            record_status_operation("wiki_error", wiki_status_write_error(exc))
             state = load_json(WIKI_WRITE_QUEUE_FILE, state)
             state["write_failures"] = [x for x in state.get("write_failures", []) if isinstance(x, (int, float)) and time.time() - x <= 86400][-99:] + [time.time()]
             atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
@@ -2255,6 +2266,16 @@ def process_wiki_write_queue_once():
                 )
             state = load_json(WIKI_WRITE_QUEUE_FILE, state)
             state["last_success_at"] = time.time()
+            if item["title"] == WIKI_STATUS_TITLE:
+                state["status_notice_pending"] = False
+            if not nochange:
+                edits = state.get("status_wiki_edits", {})
+                cutoff = state["last_success_at"] - STATUS_WINDOW_SECONDS
+                state["status_wiki_edits"] = {
+                    **{key: stamp for key, stamp in edits.items() if stamp >= cutoff},
+                    str(outcome["newrevid"]): state["last_success_at"],
+                }
+                state.setdefault("status_edits_since", state["last_success_at"])
             state.setdefault("published_hashes", {})[item["title"]] = hashlib.sha256(
                 item["text"].encode("utf-8")
             ).hexdigest()
@@ -2283,6 +2304,7 @@ def wiki_write_queue_worker():
     mark_wiki_page_pending(WIKI_STATISTICS_TITLE)
     mark_wiki_page_pending("Usuário:TelesGramBot/Sobre")  # Inventário apenas; sem criação/publicação automática.
     # O agendamento usa relógio persistido: reiniciar não provoca publicação extra.
+    initialize_status_coverage()
     while True:
         try:
             if not adjustments_ready and time.time() - last_adjustments_attempt >= 300:
@@ -2316,9 +2338,14 @@ def wiki_write_queue_worker():
                     state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": [], "last_attempt": 0})
                     state["last_status_enqueued"] = time.time()
                     atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+            if (state.get("status_notice_pending") and WIKI_WRITE_ENABLED
+                    and not wiki_writing_paused()
+                    and not any(item.get("title") == WIKI_STATUS_TITLE for item in state.get("pending", []))):
+                queue_status_notice_update()
             # As estatísticas são atualizadas junto com o status, respeitando a mesma fila e limite de escrita.
             process_wiki_write_queue_once()
         except Exception as exc:
+            record_status_operation("scheduler_error", "Falha no agendador de publicação")
             print("⚠️ Falha no agendador de escrita wiki:", safe_exception(exc))
         time.sleep(5)
 
@@ -2868,6 +2895,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.7": "Redesenha o painel Status com atividade e incidentes de 24 horas, histórico semanal e comunicado manual. Reduz falsos positivos de reformulações, discussões, separadores e links internos.",
     "4.2.6": "Prioriza candidatas novas já vencidas sobre revalidações adiadas e ordena tentativas adiadas pelo próximo horário, evitando que o backlog atrase a entrada de cards recentes.",
     "4.2.5": "Distingue edição wiki efetiva de resposta sem alteração (nochange), confirma revisões pelo newrevid e marca como publicadas apenas as revisões realmente incluídas na página principal.",
     "4.2.4": "Reconcilia a página principal e os sete arquivos diários mais recentes com o conteúdo remoto, corrige datas de arquivo e mantém pendências recentes na principal; também aceita positivos CoPE-B sem Revert Risk numérico.",
@@ -3072,50 +3100,200 @@ def wiki_record_release():
             atomic_write_json(WIKI_RELEASE_HISTORY_FILE, {"releases": releases[-150:]})
 
 
-def wiki_daily_release_wikitext():
-    tz = ZoneInfo(REPORT_TIMEZONE)
-    today = datetime.now(tz).date()
+def status_clock(value):
+    if not value:
+        return "Sem registro"
+    return datetime.fromtimestamp(value, ZoneInfo(REPORT_TIMEZONE)).strftime("%d/%m/%Y às %H:%M:%S")
+
+
+def initialize_status_coverage():
+    with STATUS_OPERATIONS_LOCK:
+        state = load_json(STATUS_OPERATIONS_FILE, {})
+        if not state.get("since"):
+            state["since"] = time.time()
+            atomic_write_json(STATUS_OPERATIONS_FILE, state)
+    with WIKI_WRITE_LOCK:
+        state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": []})
+        if not state.get("status_edits_since"):
+            state["status_edits_since"] = time.time()
+            atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+
+
+def record_status_operation(kind, detail=""):
+    # Registra incidentes públicos com descrições controladas.
+    try:
+        now = time.time()
+        with STATUS_OPERATIONS_LOCK:
+            state = load_json(STATUS_OPERATIONS_FILE, {})
+            state.setdefault("since", now)
+            events = [event for event in state.get("events", [])
+                      if event["at"] >= now - STATUS_WINDOW_SECONDS]
+            outage = state.get("stream_outage")
+            if kind == "stream_down":
+                if outage:
+                    return
+                state["stream_outage"] = {"at": now, "detail": detail}
+            elif kind == "stream_up":
+                if not outage:
+                    return
+                events.append({"kind": "stream", **outage, "ended": now, "at": now,
+                               "started": outage["at"]})
+                state.pop("stream_outage", None)
+            else:
+                events.append({"kind": kind, "at": now, "detail": detail})
+            state["events"] = events
+            atomic_write_json(STATUS_OPERATIONS_FILE, state)
+    except Exception as exc:
+        print("⚠️ Falha ao registrar telemetria do Status:", safe_exception(exc))
+
+
+def wiki_status_write_error(exc):
+    if isinstance(exc, requests.Timeout):
+        return "Tempo limite da API Wikimedia"
+    if isinstance(exc, requests.ConnectionError):
+        return "Falha de conexão com a API Wikimedia"
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        return f"Resposta HTTP {response.status_code} da Wikimedia" if response is not None else "Erro HTTP da Wikimedia"
+    message = str(exc).casefold()
+    for marker, label in (
+        ("editconflict", "Conflito de edição"),
+        ("maxlag", "Atraso de replicação na Wikimedia"),
+        ("protectedpage", "Página protegida"),
+        ("spamblacklist", "Filtro de links da Wikipédia"),
+        ("autenticar", "Falha de autenticação"),
+        ("relogin", "Falha ao renovar a sessão"),
+    ):
+        if marker in message:
+            return label
+    return "A escrita não foi confirmada pela API Wikimedia"
+
+
+def wiki_status_release_wikitext(now):
     entries = load_json(WIKI_RELEASE_HISTORY_FILE, {"releases": []}).get("releases", [])
     rows = []
-    for item in entries if isinstance(entries, list) else []:
-        if not isinstance(item, dict):
-            continue
+    for entry in entries:
         try:
-            moment = datetime.fromtimestamp(float(item["timestamp"]), tz)
-        except (KeyError, ValueError, TypeError, OverflowError):
+            stamp = float(entry["timestamp"])
+            if not math.isfinite(stamp) or stamp <= 0 or stamp > now:
+                continue
+        except (KeyError, TypeError, ValueError):
             continue
-        if moment.date() == today:
-            version = str(item.get("version", "")).replace("|", "&#124;")
-            notes = str(item.get("notes", "Sem descrição registrada.")).replace("|", "&#124;").replace("<", "&lt;")
-            rows.append((moment, version, notes))
-    lines = ["=== Atualizações do dia ===", "''Versões registradas pelo bot no volume persistente; histórico anterior não é reconstruído.''",
-             '{| class="wikitable"', "! Horário (Brasília) !! Versão !! Alterações"]
-    for moment, version, notes in sorted(rows, reverse=True):
-        lines.extend(["|-", f"| {moment:%H:%M} || {version} || {notes}"])
-    if not rows:
-        lines.extend(["|-", '| colspan="3" | Nenhuma versão registrada hoje.'])
-    return "\n".join(lines + ["|}"])
+        rows.append((stamp, entry))
+    rows.sort(key=lambda row: row[0], reverse=True)
+    current = next((row for row in rows if row[1].get("build") == BOT_BUILD), None)
+    description = current[1].get("notes") if current else WIKI_RELEASE_NOTES.get(BOT_VERSION)
+    stamp = status_clock(current[0]) if current else "Data ainda não registrada"
+    lines = ["== Versão em execução ==", f"'''{BOT_VERSION}''' · {stamp}",
+             wiki_safe_text(description), "=== Atualizações dos últimos sete dias ==="]
+    recent = [row for row in rows if now - row[0] <= 7 * STATUS_WINDOW_SECONDS and row != current]
+    lines.extend(f"* {status_clock(moment)} · '''{wiki_safe_text(entry.get('version'))}''' — {wiki_safe_text(entry.get('notes'))}"
+                 for moment, entry in recent)
+    if not recent:
+        lines.append("Nenhuma outra versão registrada no período.")
+    return lines
 
 
-def wiki_health_wikitext():
-    now = time.time()
-    with stream_lock:
-        last = last_stream_event_at
-        connected = current_stream_response is not None and last is not None and now - last <= STREAM_STALL_SECONDS
-    state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": []})
-    pending = state.get("pending", [])
-    pending = pending if isinstance(pending, list) else []
-    latest = state.get("last_success_at")
-    failures = state.get("write_failures", [])
-    failures = [x for x in failures if isinstance(x, (int, float)) and now - x <= 86400] if isinstance(failures, list) else []
-    last_label = datetime.fromtimestamp(last, ZoneInfo(REPORT_TIMEZONE)).strftime("%d/%m/%Y %H:%M:%S") if last else "Não registrado"
-    success_label = datetime.fromtimestamp(latest, ZoneInfo(REPORT_TIMEZONE)).strftime("%d/%m/%Y %H:%M:%S") if latest else "Não registrado"
-    return "\n".join(["=== Saúde do robô ===",
-        f"* EventStreams: {wiki_state_label(connected)} (conexão com atividade recente; não garante processamento de todas as edições)",
-        f"* Último evento recebido: {last_label} (horário de Brasília)",
-        f"* Última publicação wiki confirmada: {success_label} (horário de Brasília)",
-        f"* Falhas de escrita wiki nas últimas 24 horas: {len(failures)} (somente falhas registradas desde esta versão)",
-        f"* Páginas na fila de escrita: {len(pending)}"])
+def wiki_status_card_counts(cutoff, now):
+    with high_risk_candidates_lock:
+        published = {
+            str(item.get("revision_id") or key): item.get("published_at")
+            for key, item in _high_risk_candidate_state()["items"].items()
+            if isinstance(item, dict)
+        }
+    records = ptwiki_publishable_high_risk_records()
+    for record in records:
+        if record.get("published_at"):
+            published.setdefault(str(record["revision_id"]), record["published_at"])
+    posted = sum(isinstance(stamp, (float, int)) and cutoff <= stamp <= now
+                 for stamp in published.values())
+    resolved = 0
+    for record in records:
+        first_publication = published.get(str(record.get("revision_id")))
+        _, _, stamp = high_risk_action(record)
+        if isinstance(stamp, str):
+            try:
+                stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+        if (isinstance(stamp, (int, float)) and cutoff <= stamp <= now
+                and isinstance(first_publication, (float, int)) and first_publication <= stamp):
+            resolved += 1
+    return posted, resolved
+
+
+def wiki_status_incidents(now, telemetry, state):
+    cutoff = now - STATUS_WINDOW_SECONDS
+    events = [event for event in telemetry.get("events", []) if cutoff <= event["at"] <= now]
+    outage = telemetry.get("stream_outage")
+    stream = [event for event in events if event["kind"] == "stream"]
+    disconnected_seconds = sum(event["ended"] - max(cutoff, event["started"]) for event in stream)
+    if outage:
+        disconnected_seconds += now - max(cutoff, outage["at"])
+    lines = ["== Incidentes nas últimas 24 horas =="]
+    since = telemetry.get("since")
+    if not since or since > cutoff:
+        lines.append(f"''Cobertura dos incidentes desde {status_clock(since)}.''" if since
+                     else "''Registro de incidentes ainda não iniciado.''")
+    lines.extend([
+        '{| class="wikitable"',
+        "! Componente !! Ocorrências !! Último registro",
+    ])
+    last_stream = outage or (stream[-1] if stream else None)
+    event_label = "Nenhuma interrupção registrada"
+    if last_stream:
+        recovered = f"reconectado às {status_clock(last_stream['ended'])}" if not outage else "em andamento"
+        event_label = f"{last_stream['detail']} · desde {status_clock(last_stream.get('started', last_stream['at']))} · {recovered}"
+    duration = int(disconnected_seconds)
+    lines.extend(["|-", f"| EventStreams || {len(stream) + bool(outage)} · {duration // 60} min {duration % 60} s sem conexão || {event_label}"])
+    for title, kinds in (("Escrita na Wikipédia", {"wiki_error", "wiki_blocked"}),
+                         ("Telegram", {"telegram_error"}),
+                         ("Análise e publicação", {"analysis_error", "scheduler_error"})):
+        failures = [event for event in events if event["kind"] in kinds]
+        latest = "Nenhuma falha registrada"
+        count = len(failures)
+        if title == "Escrita na Wikipédia":
+            legacy = [stamp for stamp in state.get("write_failures", [])
+                      if isinstance(stamp, (int, float)) and cutoff <= stamp < (since or now)]
+            count += len(legacy)
+            if legacy:
+                latest = f"{status_clock(max(legacy))} · causa não registrada"
+        if failures:
+            event = failures[-1]
+            latest = f"{status_clock(event['at'])} · {event['detail']}"
+        lines.extend(["|-", f"| {title} || {count} || {latest}"])
+    return lines + ["|}"]
+
+
+def wiki_status_pages():
+    groups = (
+        ("Painel e relatórios", (WIKI_STATUS_TITLE, WIKI_STATISTICS_TITLE, WIKI_ADJUSTMENTS_TITLE, WIKI_PATTERN_TITLE)),
+        ("Edições de alto risco", (WIKI_HIGH_RISK_TITLE, WIKI_HIGH_RISK_ARCHIVE_INDEX_TITLE,
+                                    WIKI_HIGH_RISK_HEADER_TITLE, WIKI_HIGH_RISK_SUMMARY_TITLE,
+                                    WIKI_HIGH_RISK_ENTRY_TEMPLATE_TITLE, WIKI_HIGH_RISK_MANUAL_TITLE)),
+    )
+    lines = ["== Páginas mantidas pelo bot =="]
+    for label, titles in groups:
+        links = [f"[[{title}|{title.rsplit('/', 1)[-1].replace('_', ' ')}]]" for title in titles]
+        lines.append(f"* '''{label}''': " + " · ".join(links))
+    lines.append("* '''Subpáginas por data''': arquivos de alto risco e relatórios diários (AAAA-MM-DD) e mensais (AAAA-MM).")
+    lines.append("* '''Criação automática''': " + ("habilitada para os destinos acima, sujeita às regras de criação e ao histórico de eliminação."
+                 if WIKI_CREATE_ENABLED else "desabilitada. O bot pode atualizar páginas existentes."))
+    return lines
+
+
+def queue_status_notice_update():
+    return queue_wiki_edit(WIKI_STATUS_TITLE, "Atualização do comunicado pendente.",
+                          "Atualizando comunicado operacional do TelesGramBot", priority=True)
+
+
+def set_wiki_status_notice(argument):
+    with WIKI_WRITE_LOCK:
+        state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": []})
+        state["status_notice"] = {"text": argument, "at": time.time()} if argument else None
+        state["status_notice_pending"] = True
+        atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
+        queue_status_notice_update()
 
 
 def wiki_extended_statistics_wikitext():
@@ -3205,25 +3383,65 @@ def wiki_extended_statistics_wikitext():
 
 
 def build_wiki_status_wikitext():
-    writing_enabled, queued_edits = wiki_write_status_snapshot()
-    pending_titles = wiki_pending_pages_snapshot()
-    pending_lines = "\n".join("* [[" + title + "]]" for title in pending_titles) or "* Nenhuma página registrada"
-    return "\n".join([
-        "== Status do TelesGramBot ==",
-        f"* Versão: {BOT_VERSION}",
-        f"* Escrita na Wikipédia: {wiki_state_label(writing_enabled)}",
-        f"* Criação de subpáginas autorizadas: {wiki_state_label(WIKI_CREATE_ENABLED)}",
-        f"* Edições na fila de publicação: {queued_edits}",
-        f"* Páginas aguardando atualização: {len(pending_titles)}",
-        "* Intervalo mínimo entre tentativas de escrita: 60 minutos",
-        "* Atualização programada do status: a cada 6 horas",
-        wiki_health_wikitext(),
-        wiki_daily_release_wikitext(),
-        "=== Páginas e relatórios ===", pending_lines,
-        f"* [[{WIKI_STATISTICS_TITLE}|Estatísticas, revisores e contas observadas]]",
-        "=== Projetos e dependências ===",
-        "* Criação limitada às páginas Status, Estatísticas e relatórios diários e mensais previstos.",
+    now = time.time()
+    cutoff = now - STATUS_WINDOW_SECONDS
+    with stream_lock:
+        last_event = last_stream_event_at
+        connected = stream_connected and last_event is not None and now - last_event <= STREAM_STALL_SECONDS
+    state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": []})
+    telemetry = load_json(STATUS_OPERATIONS_FILE, {})
+    pending = [item for item in state.get("pending", []) if item.get("title") != WIKI_STATUS_TITLE]
+    editing = WIKI_WRITE_ENABLED and not wiki_writing_paused()
+    posted, resolved = wiki_status_card_counts(cutoff, now)
+    edits = sum(cutoff <= stamp <= now for stamp in state.get("status_wiki_edits", {}).values())
+    last_success = state.get("last_success_at") or 0
+    last_write_failed = any(event["kind"] in {"wiki_error", "wiki_blocked"}
+                            and event["at"] > max(cutoff, last_success)
+                            for event in telemetry.get("events", []))
+    oldest = min((item["queued_at"] for item in pending if item.get("queued_at")), default=None)
+    stalled_queue = oldest is not None and now - oldest >= WIKI_STATUS_INTERVAL_SECONDS
+    health = "🟢 Ativo" if connected and editing and not last_write_failed and not stalled_queue else "🟡 Com problemas"
+    next_update = (state.get("last_status_enqueued") or now) + WIKI_STATUS_INTERVAL_SECONDS
+    edit_since = state.get("status_edits_since")
+    lines = [
+        "__NOTOC__",
+        '{| class="infobox" style="width:20em;max-width:100%;"',
+        '! colspan="2" style="text-align:center;" | Atividade nas últimas 24 horas',
+        "|-", f"| Edições na Wikipédia || '''{edits}'''",
+        "|-", f"| Cards publicados || '''{posted}'''",
+        "|-", f"| Cards resolvidos || '''{resolved}'''",
+        "|-", '| colspan="2" | <small>Cards com publicação registrada.</small>',
+    ]
+    if not edit_since or edit_since > cutoff:
+        coverage = f"Edições contabilizadas desde {status_clock(edit_since)}." if edit_since else "Registro de edições ainda não iniciado."
+        lines.extend(["|-", f'| colspan="2" | <small>{coverage}</small>'])
+    lines.extend([
+        "|}", f"'''{health}''' · {BOT_VERSION}",
+        f"* '''Última atualização do Status''': {status_clock(now)} (Brasília)",
+        f"* '''Próxima atualização prevista''': {status_clock(next_update)} (Brasília)",
+        "* Se o horário previsto já passou, consulte a data acima para avaliar se o Status está desatualizado.",
+        f"* '''EventStreams''': {'com atividade recente' if connected else 'sem atividade recente ou desconectado'} · último evento {status_clock(last_event)}",
+        f"* '''Escrita na Wikipédia''': {wiki_state_label(editing)} · última confirmação {status_clock(state.get('last_success_at'))}",
     ])
+    notice = state.get("status_notice")
+    if notice and notice.get("text"):
+        safe = wiki_safe_text(notice["text"]).translate(str.maketrans({
+            "{": "&#123;", "}": "&#125;", "_": "&#95;", "~": "&#126;",
+        }))
+        safe = wiki_preview_spam_safe_text(safe)
+        lines.extend(["== Comunicado operacional ==",
+                      '<div style="border-inline-start:4px solid #ac6600;padding:.7em 1em;">',
+                      f"'''{status_clock(notice['at'])} (Brasília)'''<br />" + "<br />".join(safe.splitlines()),
+                      "</div>"])
+    lines.extend(wiki_status_incidents(now, telemetry, state))
+    lines.extend(["== Fila de publicação ==", f"'''{len(pending)}''' páginas aguardando escrita."])
+    if oldest is not None:
+        lines.append(f"Item mais antigo na fila desde {status_clock(oldest)}.")
+    for item in pending:
+        waiting = f" · na fila desde {status_clock(item['queued_at'])}" if item.get("queued_at") else ""
+        lines.append(f"* {wiki_page_link(item['title'])}{waiting}")
+    lines += wiki_status_release_wikitext(now) + wiki_status_pages()
+    return "\n".join(lines)
 
 
 def build_wiki_statistics_wikitext():
@@ -8400,7 +8618,10 @@ def telegram_sender():
                         result
                     )
 
+            else:
+                record_status_operation("telegram_error", "Envio ao Telegram não confirmado")
         except Exception as e:
+            record_status_operation("telegram_error", "Falha no envio ao Telegram")
             print("❌ Erro sender:", safe_exception(e))
 
         finally:
@@ -10090,6 +10311,7 @@ def get_revert_risk(revision_id):
             print(f"⚠️ Lift Wing HTTP 422 rev_id={rev_id} lang=pt resposta={detail!r}")
             return None
         if response.status_code == 429:
+            record_status_operation("analysis_error", "Limite de requisições do Revert Risk atingido")
             print(f"⚠️ Rate limit Lift Wing rev_id={rev_id}.")
             return None
         response.raise_for_status()
@@ -10103,6 +10325,7 @@ def get_revert_risk(revision_id):
             return None
         return score
     except Exception as exc:
+        record_status_operation("analysis_error", "Falha na consulta ao Revert Risk")
         print(f"⚠️ Erro Lift Wing rev_id={rev_id}:", safe_exception(exc))
         return None
 
@@ -10184,6 +10407,7 @@ def get_cope_b_assessment(change, diff):
             timeout=(3.05, 6),
         )
         if response.status_code == 429:
+            record_status_operation("analysis_error", "Limite de requisições do CoPE-B atingido")
             delay = _cope_b_retry_delay(response)
             with _cope_b_call_lock:
                 _cope_b_retry_after_until = max(_cope_b_retry_after_until, time.time() + delay)
@@ -10212,6 +10436,7 @@ def get_cope_b_assessment(change, diff):
         return result
     except Exception as exc:
         # Não registrar o corpo enviado, cabeçalhos ou a chave da API.
+        record_status_operation("analysis_error", "Falha na consulta ao CoPE-B")
         print(f"⚠️ Erro CoPE-B rev_id={revision_id}:", safe_exception(exc))
         return None
 
@@ -12381,6 +12606,7 @@ def analysis_worker():
                 )
 
         except Exception as e:
+            record_status_operation("analysis_error", "Falha no processamento de uma edição")
             print(
                 "❌ Erro análise:",
                 safe_exception(e)
@@ -12404,6 +12630,7 @@ def commands_message():
         "🔎 /falsonegativo ID ou LINK — registra uma revisão que o detector deixou passar.\n"
         "🧪 /falsosnegativos — mostra a base de calibração de falsos negativos.\n"
         "📡 /status — mostra o estado do bot.\n"
+        "📢 /comunicado texto — publica um comunicado no Status; /limparcomunicado remove.\n"
         "📊 /padroes — padrões estruturais.\n"
         "🧠 /aprendizado — base de treinamento.\n"
         "📈 /validacao — desempenho retrospectivo.\n"
@@ -12567,6 +12794,8 @@ def process_telegram_command(message, from_channel=False):
         "/resolverfalsonegativo",
         "/pausarwiki",
         "/reiniciarwiki",
+        "/comunicado",
+        "/limparcomunicado",
         "/pausarteste",
         "/reiniciarteste",
     }
@@ -12578,6 +12807,22 @@ def process_telegram_command(message, from_channel=False):
             "⚠️ Este comando administrativo deve ser publicado diretamente no canal configurado.",
             chat_id=chat_id,
         )
+        return
+
+    if command in ("/comunicado", "/limparcomunicado"):
+        if command == "/comunicado" and not (1 <= len(argument) <= STATUS_NOTICE_LIMIT):
+            send_telegram_message(f"Use /comunicado seguido do texto público (até {STATUS_NOTICE_LIMIT} caracteres).", chat_id=chat_id)
+        elif command == "/limparcomunicado" and argument:
+            send_telegram_message("Use /limparcomunicado sem argumentos.", chat_id=chat_id)
+        else:
+            try:
+                set_wiki_status_notice(argument)
+            except Exception as exc:
+                print("⚠️ Falha ao preparar comunicado:", safe_exception(exc))
+                send_telegram_message("Não foi possível confirmar o enfileiramento do comunicado. Tente novamente.", chat_id=chat_id)
+                return
+            response = "Comunicado salvo." if argument else "Comunicado removido."
+            send_telegram_message(response + " A atualização pública do Status entrou na fila de escrita.", chat_id=chat_id)
         return
 
     if command in ("/pausarwiki", "/reiniciarwiki"):
@@ -14826,6 +15071,7 @@ def eventstream_watchdog():
                     stream_connected = False
 
         if response_to_close:
+            record_status_operation("stream_down", "Fluxo sem eventos recentes")
             try:
                 response_to_close.close()
             except Exception:
@@ -14893,6 +15139,7 @@ def wikimedia_loop():
                 stream_connected = True
                 last_stream_event_at = time.time()
 
+            record_status_operation("stream_up")
             client = SSEClient(response)
 
             print("✅ EventStreams conectado.")
@@ -15010,6 +15257,7 @@ def wikimedia_loop():
                 except Exception:
                     pass
 
+        record_status_operation("stream_down", "Conexão interrompida ou indisponível")
         print("🔄 Reconectando em 5 segundos...")
         time.sleep(5)
 
@@ -16765,16 +17013,18 @@ def prepare_high_risk_write_item(item):
         except ValueError:
             valid_day = False
         if valid_day:
-            prepared["text"] = build_high_risk_daily_wikitext(
-                day,
-                [record for record in archived if record.get("archive_date") == day],
-            )
+            day_records = [record for record in archived if record.get("archive_date") == day]
+            prepared["text"] = build_high_risk_daily_wikitext(day, day_records)
+            prepared["publication_revision_ids"] = [
+                record["revision_id"] for record in select_high_risk_records(day_records)
+            ]
     return prepared
 
 
 def mark_high_risk_candidates_published(revision_ids, published_at=None):
     published_at = float(published_at or time.time())
     wanted = {str(int(value)) for value in revision_ids}
+    first_publications = {}
     changed = False
     with high_risk_candidates_lock:
         state = _high_risk_candidate_state()
@@ -16783,9 +17033,21 @@ def mark_high_risk_candidates_published(revision_ids, published_at=None):
             if isinstance(item, dict) and item.get("state") == "approved":
                 item["state"] = "published"
                 item["published_at"] = published_at
+                first_publications[key] = published_at
                 changed = True
+            elif isinstance(item, dict) and item.get("published_at"):
+                first_publications[key] = item["published_at"]
         if changed:
             _save_high_risk_candidate_state(state)
+    archive_changed = False
+    with high_risk_archive_lock:
+        for key, stamp in first_publications.items():
+            record = high_risk_archive.get(key)
+            if isinstance(record, dict) and not record.get("published_at"):
+                record["published_at"] = stamp
+                archive_changed = True
+    if archive_changed:
+        save_high_risk_archive()
     return changed
 
 
