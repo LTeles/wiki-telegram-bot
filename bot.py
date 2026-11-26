@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.7"
-BOT_BUILD = "4.2.7-operational-status"
+BOT_VERSION = "4.2.8"
+BOT_BUILD = "4.2.8-archive-reversal-monitor"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2895,6 +2895,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.8": "Monitora reversões dos cards da Wikipédia independentemente dos alertas do Telegram e atualiza os arquivos afetados.",
     "4.2.7": "Redesenha o painel Status com atividade e incidentes de 24 horas, histórico semanal e comunicado manual. Reduz falsos positivos de reformulações, discussões, separadores e links internos.",
     "4.2.6": "Prioriza candidatas novas já vencidas sobre revalidações adiadas e ordena tentativas adiadas pelo próximo horário, evitando que o backlog atrase a entrada de cards recentes.",
     "4.2.5": "Distingue edição wiki efetiva de resposta sem alteração (nochange), confirma revisões pelo newrevid e marca como publicadas apenas as revisões realmente incluídas na página principal.",
@@ -6963,10 +6964,9 @@ def get_revision_tags_batch(revision_ids):
         response.raise_for_status()
         data = response.json()
 
-        result = {
-            value: set()
-            for value in ids
-        }
+        if data.get("error"):
+            return {}
+        result = {}
 
         for page in (
             data
@@ -7523,28 +7523,27 @@ def _select_direct_undo_candidates(active, tags_by_revision, now=None):
     if now is None:
         now = time.monotonic()
 
-    active_ids = {int(record["revision_id"]) for record in active}
     tagged = []
     remaining = []
     for record in active:
         revision_id = int(record["revision_id"])
         tags = tags_by_revision.get(revision_id) or []
-        if "mw-reverted" in tags:
+        if set(tags) & {"mw-reverted", "revertido"}:
             tagged.append(record)
         else:
             remaining.append(record)
 
     candidates = set()
     with _direct_undo_check_lock:
-        for revision_id in list(_direct_undo_last_checked):
-            if revision_id not in active_ids:
+        for revision_id, checked_at in list(_direct_undo_last_checked.items()):
+            if now - checked_at >= DIRECT_UNDO_RECHECK_SECONDS:
                 _direct_undo_last_checked.pop(revision_id, None)
 
         for record in remaining:
             revision_id = int(record["revision_id"])
-            # O fallback destina-se apenas a revisões cuja consulta em lote
-            # não retornou etiqueta alguma.
-            if tags_by_revision.get(revision_id):
+            # Etiquetas de edição móvel e outras são comuns em revisões revertidas.
+            # Só consulta o fallback quando a revisão foi retornada pela API.
+            if revision_id not in tags_by_revision:
                 continue
             last_checked = _direct_undo_last_checked.get(revision_id)
             if (
@@ -7585,7 +7584,7 @@ def _process_posted_statuses(
             revision_id
         )
 
-        if tags and "mw-reverted" in tags:
+        if set(tags or ()) & {"mw-reverted", "revertido"}:
             new_status = "reverted"
             reversal_source = "tag"
         elif revision_id in direct_undo_candidates:
@@ -7610,7 +7609,7 @@ def _process_posted_statuses(
                 reversal_diagnostic("reversao_identificada", revision_id,
                                     origem=reversal_source)
                 test_case_id = record.get("abuse_filter_test_case_id")
-                if test_case_id and not record.get("abuse_filter_test_trigger"):
+                if test_case_id and not record.get("archive_only") and not record.get("abuse_filter_test_trigger"):
                     test_observation_escalated = escalate_abuse_filter_test_case(
                         test_case_id,
                         record.get("username") or "",
@@ -7641,6 +7640,11 @@ def _process_posted_statuses(
             if new_status in ("reverted", "self_reverted"):
                 reversal_diagnostic("reversao_confirmada", revision_id,
                                     status=new_status, autor_identificado=bool(reverter))
+
+            if record.get("archive_only"):
+                if new_status in ("reverted", "self_reverted"):
+                    apply_archive_reversal(revision_id, new_status, reverter, time.time())
+                continue
 
             patroller = None
             if new_status == "patrolled":
@@ -7687,6 +7691,10 @@ def _process_posted_statuses(
             save_posted_edits()
             changed_any = True
             if new_status in ("reverted", "self_reverted"):
+                try:
+                    apply_archive_reversal(revision_id, new_status, reverter, live["reverted_at"])
+                except Exception as exc:
+                    print("⚠️ Falha ao atualizar arquivo após reversão:", safe_exception(exc))
                 reversal_diagnostic("telegram_edicao_iniciada", revision_id)
                 telegram_edit_started = time.monotonic()
             success = edit_telegram_message(
@@ -7839,8 +7847,47 @@ def _posted_status_maintenance():
         time.sleep(30)
 
 
+def recent_archive_reversal_candidates(excluded, now):
+    cutoff = datetime.fromtimestamp(now, timezone.utc).date() - timedelta(days=6)
+    with high_risk_archive_lock:
+        return [
+            {**record, "archive_only": True}
+            for key, record in high_risk_archive.items()
+            if key not in excluded and record.get("revision_id")
+            and record.get("ptwiki_delay_verified") is True
+            and str(record.get("archive_date") or "") >= cutoff.isoformat()
+            and record.get("status") not in {
+                "reverted", "self_reverted", "deleted", "resolved_no_action",
+                "false_positive", "manual_clean", "manual_vandalism",
+            }
+        ]
+
+
+def apply_archive_reversal(revision_id, status, reverter, reverted_at):
+    key = str(revision_id)
+    with high_risk_archive_lock:
+        record = high_risk_archive.get(key)
+        if not isinstance(record, dict) or record.get("ptwiki_delay_verified") is not True:
+            return False
+        if record.get("status") in {
+            "reverted", "self_reverted", "deleted", "resolved_no_action",
+            "false_positive", "manual_clean", "manual_vandalism",
+        }:
+            return False
+        record["status"] = status
+        record["reverted_at"] = reverted_at
+        if reverter:
+            record["reverted_by"] = reverter
+        record.pop("prepublish_status_inferred", None)
+        day = record.get("archive_date")
+    save_high_risk_archive()
+    queue_high_risk_daily_archive_update(day, "Atualizando reversão confirmada no arquivo")
+    return True
+
+
 def _posted_edit_status_monitor_loop():
     print("✅ Consultas de reversões independentes a cada 30s.")
+    archive_cursor = 0
     next_check = time.monotonic()
     last_revision_check_at = None
     while True:
@@ -7856,6 +7903,14 @@ def _posted_edit_status_monitor_loop():
                       if item.get("status") not in (
                           "reverted", "self_reverted", "deleted",
                           "resolved_no_action", "false_positive")]
+        archive = recent_archive_reversal_candidates(
+            {str(item["revision_id"]) for item in active}, time.time()
+        )
+        if archive:
+            archive_cursor %= len(archive)
+            batch_size = min(REVISION_TAG_BATCH_SIZE, len(archive))
+            active.extend((archive + archive)[archive_cursor:archive_cursor + batch_size])
+            archive_cursor += batch_size
         if not active:
             continue
         reversal_diagnostic("ciclo_iniciado", pendentes=len(active),
@@ -17073,10 +17128,10 @@ def sync_high_risk_archive():
                 "account_block_state",
             ):
                 if key in record:
-                    if (
-                        key == "status"
-                        and record.get(key) is None
-                        and archived.get("prepublish_status_inferred") is True
+                    if key == "status" and (
+                        record.get(key) is None and archived.get("prepublish_status_inferred") is True
+                        or archived.get("status") in {"reverted", "self_reverted"}
+                        and record.get(key) in {None, "patrolled", "verification_inconclusive"}
                     ):
                         continue
                     updated[key] = record.get(key)
