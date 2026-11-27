@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.9"
-BOT_BUILD = "4.2.9-batch-manual-review"
+BOT_VERSION = "4.2.11"
+BOT_BUILD = "4.2.11-batch-progress"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2279,6 +2279,7 @@ def process_wiki_write_queue_once():
             state.setdefault("published_hashes", {})[item["title"]] = hashlib.sha256(
                 item["text"].encode("utf-8")
             ).hexdigest()
+            remember_high_risk_archive_existence(state, item["title"], exists=True)
             atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
             # Never remove a newer, coalesced update of the same page.
             if queued_item in state.get("pending", []):
@@ -2895,6 +2896,8 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.11": "Mostra o andamento das avaliações em lote e libera o retorno antes da sincronização externa.",
+    "4.2.10": "Mantém links e cores do calendário enquanto os arquivos diários são sincronizados.",
     "4.2.9": "Permite enviar várias avaliações manuais com uma única autenticação.",
     "4.2.8": "Monitora reversões dos cards da Wikipédia independentemente dos alertas do Telegram e atualiza os arquivos afetados.",
     "4.2.7": "Redesenha o painel Status com atividade e incidentes de 24 horas, histórico semanal e comunicado manual. Reduz falsos positivos de reformulações, discussões, separadores e links internos.",
@@ -17304,22 +17307,39 @@ def high_risk_archive_days(records):
     return sorted(days)
 
 
+def high_risk_archive_day_from_title(title):
+    if not isinstance(title, str) or not title.startswith(WIKI_HIGH_RISK_ARCHIVE_PREFIX):
+        return None
+    day = title[len(WIKI_HIGH_RISK_ARCHIVE_PREFIX):]
+    try:
+        if datetime.strptime(day, "%Y-%m-%d").strftime("%Y-%m-%d") == day:
+            return day
+    except ValueError:
+        pass
+    return None
+
+
+def remember_high_risk_archive_existence(state, title, exists):
+    day = high_risk_archive_day_from_title(title)
+    if day is None:
+        return
+    confirmed = set(state.get("confirmed_high_risk_archive_days") or [])
+    if exists:
+        confirmed.add(day)
+    else:
+        confirmed.discard(day)
+    state["confirmed_high_risk_archive_days"] = sorted(confirmed)
+
+
 def high_risk_archive_created_days():
-    """Return daily archives whose publication was confirmed or remotely verified."""
+    """Track existence separately from whether the last published text is current."""
     state = load_json(WIKI_WRITE_QUEUE_FILE, {})
-    published = state.get("published_hashes", {}) if isinstance(state, dict) else {}
-    prefix = WIKI_HIGH_RISK_ARCHIVE_PREFIX
-    created = set()
-    if isinstance(published, dict):
-        for title in published:
-            if not isinstance(title, str) or not title.startswith(prefix):
-                continue
-            day = title[len(prefix):]
-            try:
-                if datetime.strptime(day, "%Y-%m-%d").strftime("%Y-%m-%d") == day:
-                    created.add(day)
-            except ValueError:
-                continue
+    if not isinstance(state, dict):
+        return set()
+    # Legacy queue files already have successful publications recorded as hashes.
+    published = state.get("published_hashes") or {}
+    created = set(state.get("confirmed_high_risk_archive_days") or [])
+    created.update(day for title in published if (day := high_risk_archive_day_from_title(title)))
     return created
 
 
@@ -17409,9 +17429,8 @@ def build_high_risk_header_wikitext(records):
 
 
 def build_high_risk_archive_index_wikitext(records):
-    days = high_risk_archive_days(records)
-    available = set(days)
     created_days = high_risk_archive_created_days()
+    days = set(high_risk_archive_days(records)) | created_days
     months = sorted({day[:7] for day in days}, reverse=True)
     lines = [
         "__NOINDEX__",
@@ -17439,7 +17458,7 @@ def build_high_risk_archive_index_wikitext(records):
                     continue
                 day = f"{year:04d}-{month:02d}-{day_number:02d}"
                 day_bg = high_risk_archive_day_background(day, records, created_days)
-                if day in available and day in created_days:
+                if day in created_days:
                     cells.append(
                         f'style="background:{day_bg}" | '
                         + f"[[{WIKI_HIGH_RISK_ARCHIVE_PREFIX}{day}|'''{day_number}''']]"
@@ -17544,7 +17563,7 @@ def fetch_ptwiki_manual_decisions():
         params.update(cont)
     return decisions
 
-def apply_high_risk_manual_decision(decision, *, refresh=True):
+def apply_high_risk_manual_decision(decision, *, refresh=True, skip_unchanged=False):
     revision_id = str(int(decision["revision_id"]))
     actor = str(decision.get("actor") or "")
     decision_revid = int(decision.get("decision_revision_id") or 0)
@@ -17603,6 +17622,8 @@ def apply_high_risk_manual_decision(decision, *, refresh=True):
                 record.pop("false_positive_at", None)
                 record.pop("false_positive_by", None)
                 record.pop("manual_previous_status", None)
+        if skip_unchanged and not changed_status:
+            return False
         record["manual_decision_revid"] = decision_revid
         record["manual_seen_revid"] = decision_revid
     save_high_risk_archive()
@@ -17631,7 +17652,8 @@ def apply_high_risk_manual_decision(decision, *, refresh=True):
                 live["resolved_by"] = None
                 live.pop("resolution", None)
             live["manual_decision_revid"] = decision_revid
-    save_posted_edits()
+    if isinstance(live, dict) or not skip_unchanged:
+        save_posted_edits()
 
     if action in ("vandalism", "clean") and changed_status:
         resolved_ts = time.time()
@@ -17830,6 +17852,7 @@ def reconcile_recent_high_risk_daily_pages():
                     state.setdefault("published_hashes", {})[title] = hashlib.sha256(
                         expected.encode("utf-8")
                     ).hexdigest()
+                    remember_high_risk_archive_existence(state, title, exists=True)
                     atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
                 mark_high_risk_candidates_published(revision_ids)
                 continue
@@ -17837,6 +17860,7 @@ def reconcile_recent_high_risk_daily_pages():
             with WIKI_WRITE_LOCK:
                 state = load_json(WIKI_WRITE_QUEUE_FILE, {"pending": []})
                 state.setdefault("published_hashes", {}).pop(title, None)
+                remember_high_risk_archive_existence(state, title, exists=current is not None)
                 atomic_write_json(WIKI_WRITE_QUEUE_FILE, state)
             if queue_high_risk_wiki_edit(
                 title, expected, summary,
@@ -18163,6 +18187,8 @@ def apply_wiki_false_positive(revid, actor):
 
 
 MANUAL_REVIEW_BATCH_LIMIT = 50
+manual_review_batches = {}
+manual_review_batches_lock = threading.Lock()
 
 
 def parse_manual_review_batch(raw):
@@ -18179,11 +18205,12 @@ def parse_manual_review_batch(raw):
     return reviews
 
 
-def process_oauth_manual_review_batch(state_item, profile):
+def process_oauth_manual_review_batch(state_item, profile, report_progress):
     username, groups = _verified_oauth_reviewer(profile)
     reviews = parse_manual_review_batch(state_item["reviews"])
     applied = []
-    for revid, action in reviews.items():
+    report_progress(0, 0)
+    for processed, (revid, action) in enumerate(reviews.items(), start=1):
         with high_risk_archive_lock:
             previous = high_risk_archive.get(revid) or {}
             decision_revid = max(
@@ -18196,28 +18223,80 @@ def process_oauth_manual_review_batch(state_item, profile):
                 "revision_id": int(revid), "action": action, "actor": username,
                 "groups": sorted(groups), "decision_revision_id": decision_revid,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-            }, refresh=False)
+            }, refresh=False, skip_unchanged=True)
             if changed:
                 applied.append(revid)
         except Exception as exc:
             print("⚠️ Falha na revisão do lote:", revid, safe_exception(exc))
-    if applied:
-        try:
-            queue_high_risk_manual_refreshes(applied)
-        except Exception as exc:
-            print("⚠️ Falha ao priorizar publicação do lote:", safe_exception(exc))
-        threading.Thread(
-            target=update_batch_review_telegram, args=(applied,), daemon=True,
-        ).start()
+        report_progress(processed, len(applied))
     return applied
 
 
-def update_batch_review_telegram(revision_ids):
+def update_batch_review_publications(revision_ids):
+    try:
+        queue_high_risk_manual_refreshes(revision_ids)
+    except Exception as exc:
+        print("⚠️ Falha ao priorizar publicação do lote:", safe_exception(exc))
     for revid in revision_ids:
         try:
             update_manual_review_telegram(revid)
         except Exception as exc:
             print("⚠️ Falha ao atualizar revisão no Telegram:", revid, safe_exception(exc))
+
+
+def start_manual_review_batch(state, code):
+    token = secrets.token_urlsafe(32)
+    job = {
+        "total": len(state["reviews"]),
+        "processed": 0,
+        "applied": 0,
+        "phase": "auth",
+        "started": time.monotonic(),
+    }
+    with manual_review_batches_lock:
+        expired = [
+            key for key, item in manual_review_batches.items()
+            if item.get("finished", float("inf")) + MANUAL_REVIEW_STATE_TTL < job["started"]
+        ]
+        for key in expired:
+            del manual_review_batches[key]
+        manual_review_batches[token] = job
+
+    def report_progress(processed, applied):
+        with manual_review_batches_lock:
+            job.update(phase="review", processed=processed, applied=applied)
+
+    def run():
+        try:
+            profile = _oauth_exchange(code)
+            applied = process_oauth_manual_review_batch(state, profile, report_progress)
+            result = {
+                "telesgram_review": "batch", "reviewed": ",".join(applied),
+                "skipped": job["total"] - len(applied),
+            }
+        except PermissionError:
+            applied = []
+            result = {"telesgram_review": "denied"}
+        except Exception as exc:
+            print("❌ Processamento do lote:", safe_exception(exc))
+            applied = []
+            result = {"telesgram_review": "failed"}
+        separator = "&" if "?" in state["return_to"] else "?"
+        with manual_review_batches_lock:
+            job.update(
+                redirect=state["return_to"] + separator + urlencode(result),
+                finished=time.monotonic(),
+            )
+        if applied:
+            update_batch_review_publications(applied)
+
+    try:
+        threading.Thread(target=run, daemon=True).start()
+    except RuntimeError:
+        with manual_review_batches_lock:
+            manual_review_batches.pop(token, None)
+        raise
+    return token
 
 
 def process_oauth_manual_review(state_item, profile):
@@ -18253,7 +18332,8 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
     server_version = "TelesGramBot/3.0"
 
     def log_message(self, fmt, *args):
-        print("🌐 Revisão manual:", safe_log_text(fmt % args))
+        if urlparse(self.path).path != "/review/progress":
+            print("🌐 Revisão manual:", safe_log_text(fmt % args))
 
     def _redirect(self, url):
         self.send_response(302)
@@ -18261,9 +18341,11 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
-    def _html(self, status, title, message):
+    def _html(self, status, title, message, *, refresh=False):
         body = ("<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
-                "<title>" + html.escape(title) + "</title><body style='font-family:system-ui;padding:2rem'>"
+                "<meta name='referrer' content='no-referrer'>"
+                + ("<meta http-equiv='refresh' content='2'>" if refresh else "")
+                + "<title>" + html.escape(title) + "</title><body style='font-family:system-ui;padding:2rem'>"
                 "<h2>" + html.escape(title) + "</h2><p>" + html.escape(message) + "</p></body>").encode()
         self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store")
@@ -18274,6 +18356,24 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
         q = parse_qs(parsed.query)
         if parsed.path == "/health":
             return self._html(200, "TelesGramBot 3.01", "Servidor de revisão manual ativo.")
+        if parsed.path == "/review/progress":
+            token = (q.get("id") or [""])[0]
+            with manual_review_batches_lock:
+                job = dict(manual_review_batches.get(token) or {})
+            if not job:
+                return self._html(410, "Progresso indisponível",
+                                  "Volte à Wikipédia e confira as avaliações registradas.")
+            if job.get("redirect"):
+                return self._redirect(job["redirect"])
+            elapsed = int(time.monotonic() - job["started"])
+            if job["phase"] == "auth":
+                message = "Verificando a autorização Wikimedia."
+            else:
+                message = (
+                    f'{job["processed"]} de {job["total"]} verificadas. '
+                    f'{job["applied"]} registradas.'
+                )
+            return self._html(200, "Avaliações em andamento", f"{message} Tempo decorrido {elapsed} s.", refresh=True)
         if parsed.path == "/oauth/login":
             return self._html(410, "Fluxo antigo desativado", "Inicie a revisão pelos botões da página de alto risco.")
         if parsed.path == "/oauth/callback":
@@ -18284,15 +18384,10 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
                 return self._redirect(state["return_to"] + ("&" if "?" in state["return_to"] else "?") + "telesgram_review=cancelled")
             code = (q.get("code") or [""])[0]
             try:
-                profile = _oauth_exchange(code)
                 if state["action"] == "batch":
-                    applied = process_oauth_manual_review_batch(state, profile)
-                    separator = "&" if "?" in state["return_to"] else "?"
-                    result = urlencode({
-                        "telesgram_review": "batch", "reviewed": ",".join(applied),
-                        "skipped": len(state["reviews"]) - len(applied),
-                    })
-                    return self._redirect(state["return_to"] + separator + result)
+                    token = start_manual_review_batch(state, code)
+                    return self._redirect("/review/progress?" + urlencode({"id": token}))
+                profile = _oauth_exchange(code)
                 username = process_oauth_manual_review(state, profile)
                 target = state["return_to"] + ("&" if "?" in state["return_to"] else "?") + urlencode({"telesgram_review":"ok", "reviewer":username})
                 return self._redirect(target)
