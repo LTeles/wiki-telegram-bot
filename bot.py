@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.8"
-BOT_BUILD = "4.2.8-archive-reversal-monitor"
+BOT_VERSION = "4.2.9"
+BOT_BUILD = "4.2.9-batch-manual-review"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2895,6 +2895,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.9": "Permite enviar várias avaliações manuais com uma única autenticação.",
     "4.2.8": "Monitora reversões dos cards da Wikipédia independentemente dos alertas do Telegram e atualiza os arquivos afetados.",
     "4.2.7": "Redesenha o painel Status com atividade e incidentes de 24 horas, histórico semanal e comunicado manual. Reduz falsos positivos de reformulações, discussões, separadores e links internos.",
     "4.2.6": "Prioriza candidatas novas já vencidas sobre revalidações adiadas e ordena tentativas adiadas pelo próximo horário, evitando que o backlog atrase a entrada de cards recentes.",
@@ -17543,7 +17544,7 @@ def fetch_ptwiki_manual_decisions():
         params.update(cont)
     return decisions
 
-def apply_high_risk_manual_decision(decision):
+def apply_high_risk_manual_decision(decision, *, refresh=True):
     revision_id = str(int(decision["revision_id"]))
     actor = str(decision.get("actor") or "")
     decision_revid = int(decision.get("decision_revision_id") or 0)
@@ -17564,28 +17565,31 @@ def apply_high_risk_manual_decision(decision):
         save_high_risk_archive()
         print(f"⚠️ Revisão manual ignorada: {actor} sem grupo autorizado (revid {revision_id}).")
         return False
-    with high_risk_archive_lock:
-        archived = high_risk_archive.get(revision_id)
-        if not isinstance(archived, dict):
-            return False
-        current_status = archived.get("status")
-        previous_status = archived.get("manual_previous_status")
     action = decision["action"]
-    if action == "undo" and current_status == "manual_clean" and archived.get("false_positive_at"):
-        return False  # Desmarcar o falso positivo primeiro pelo Telegram.
-    changed_status = False
-    new_status = current_status
-    if action in ("vandalism", "clean") and high_risk_action(archived)[0] is None:
-        new_status = "manual_vandalism" if action == "vandalism" else "manual_clean"
-        changed_status = True
-    elif action == "undo" and (current_status in ("manual_vandalism", "manual_clean") or (current_status == "false_positive" and archived.get("manual_reviewer") and "manual_previous_status" in archived)):
-        new_status = previous_status
-        changed_status = True
     reviewed_at = decision.get("timestamp") or datetime.now(timezone.utc).isoformat()
     with high_risk_archive_lock:
         record = high_risk_archive.get(revision_id)
-        if not isinstance(record, dict):
+        if not isinstance(record, dict) or record.get("ptwiki_delay_verified") is not True:
             return False
+        if decision_revid <= max(
+            int(record.get("manual_decision_revid") or 0),
+            int(record.get("manual_seen_revid") or 0),
+        ):
+            return False
+        current_status = record.get("status")
+        changed_status = False
+        new_status = current_status
+        if action == "undo" and current_status == "manual_clean" and record.get("false_positive_at"):
+            return False  # Desmarcar o falso positivo primeiro pelo Telegram.
+        if action in ("vandalism", "clean") and high_risk_action(record)[0] is None:
+            new_status = "manual_vandalism" if action == "vandalism" else "manual_clean"
+            changed_status = True
+        elif action == "undo" and (
+            current_status in ("manual_vandalism", "manual_clean")
+            or (current_status == "false_positive" and record.get("manual_reviewer") and "manual_previous_status" in record)
+        ):
+            new_status = record.get("manual_previous_status")
+            changed_status = True
         if action in ("vandalism", "clean") and changed_status:
             record["manual_previous_status"] = current_status
             record["status"] = new_status
@@ -17654,7 +17658,7 @@ def apply_high_risk_manual_decision(decision):
             print("⚠️ Falha ao registrar resolução automática da revisão Wiki:", safe_exception(exc))
 
     print(f"✅ Revisão manual processada: revid {revision_id} · {action} · {actor}")
-    if changed_status:
+    if changed_status and refresh:
         queue_high_risk_manual_refresh(revision_id)
         update_manual_review_telegram(revision_id)
     return changed_status
@@ -17691,11 +17695,19 @@ def update_manual_review_telegram(revision_id):
     return success
 
 def queue_high_risk_manual_refresh(revision_id):
-    """Prioriza a página que o revisor acabou de alterar visualmente."""
-    revision_id = str(int(revision_id))
+    return queue_high_risk_manual_refreshes([revision_id])
+
+
+def queue_high_risk_manual_refreshes(revision_ids):
+    """Prioriza a lista principal e cada arquivo diário afetado uma vez."""
     with high_risk_archive_lock:
-        record = dict(high_risk_archive.get(revision_id) or {})
-    if record.get("ptwiki_delay_verified") is not True:
+        records = [
+            high_risk_archive.get(str(int(revid))) or {}
+            for revid in revision_ids
+        ]
+        records = [record for record in records if record.get("ptwiki_delay_verified") is True]
+        days = {str(record.get("archive_date") or "") for record in records}
+    if not records:
         return False
     archived = ptwiki_publishable_high_risk_records()
     # A lista principal pode deixar de conter o item depois da resolução.
@@ -17705,8 +17717,9 @@ def queue_high_risk_manual_refresh(revision_id):
         "Atualizando revisão manual na lista de alto risco",
         priority=True,
     )
-    day = str(record.get("archive_date") or "")
-    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", day):
+    for day in sorted(days):
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", day):
+            continue
         day_records = [x for x in archived if x.get("archive_date") == day]
         queue_high_risk_wiki_edit(
             WIKI_HIGH_RISK_ARCHIVE_PREFIX + day,
@@ -17998,13 +18011,18 @@ def _safe_return_url(value):
     return "https://pt.wikipedia.org/wiki/Usu%C3%A1rio:TelesGramBot/Edi%C3%A7%C3%B5es_de_alto_risco"
 
 
-def _new_oauth_state(revid, action, return_to):
+def _new_oauth_state(revid, action, return_to, *, reviews=None):
     token = secrets.token_urlsafe(32)
     now = time.time()
     with manual_review_state_lock:
         states = _load_oauth_states()
         states = {k:v for k,v in states.items() if now - float(v.get("created_at", 0)) < MANUAL_REVIEW_STATE_TTL}
-        states[token] = {"revid": int(revid), "action": action, "return_to": _safe_return_url(return_to), "created_at": now}
+        item = {"action": action, "return_to": _safe_return_url(return_to), "created_at": now}
+        if reviews is None:
+            item["revid"] = int(revid)
+        else:
+            item["reviews"] = reviews
+        states[token] = item
         _save_oauth_states(states)
     return token
 
@@ -18144,6 +18162,64 @@ def apply_wiki_false_positive(revid, actor):
     return True
 
 
+MANUAL_REVIEW_BATCH_LIMIT = 50
+
+
+def parse_manual_review_batch(raw):
+    items = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(items, dict) or not 1 <= len(items) <= MANUAL_REVIEW_BATCH_LIMIT:
+        raise ValueError("Quantidade de avaliações inválida")
+    reviews = {}
+    for revid, action in items.items():
+        if not isinstance(revid, str) or not re.fullmatch(r"[1-9][0-9]{0,15}", revid):
+            raise ValueError("Revisão inválida")
+        if action not in ("clean", "vandalism"):
+            raise ValueError("Ação inválida para envio em lote")
+        reviews[revid] = action
+    return reviews
+
+
+def process_oauth_manual_review_batch(state_item, profile):
+    username, groups = _verified_oauth_reviewer(profile)
+    reviews = parse_manual_review_batch(state_item["reviews"])
+    applied = []
+    for revid, action in reviews.items():
+        with high_risk_archive_lock:
+            previous = high_risk_archive.get(revid) or {}
+            decision_revid = max(
+                int(time.time() * 1000),
+                int(previous.get("manual_decision_revid") or 0) + 1,
+                int(previous.get("manual_seen_revid") or 0) + 1,
+            )
+        try:
+            changed = apply_high_risk_manual_decision({
+                "revision_id": int(revid), "action": action, "actor": username,
+                "groups": sorted(groups), "decision_revision_id": decision_revid,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }, refresh=False)
+            if changed:
+                applied.append(revid)
+        except Exception as exc:
+            print("⚠️ Falha na revisão do lote:", revid, safe_exception(exc))
+    if applied:
+        try:
+            queue_high_risk_manual_refreshes(applied)
+        except Exception as exc:
+            print("⚠️ Falha ao priorizar publicação do lote:", safe_exception(exc))
+        threading.Thread(
+            target=update_batch_review_telegram, args=(applied,), daemon=True,
+        ).start()
+    return applied
+
+
+def update_batch_review_telegram(revision_ids):
+    for revid in revision_ids:
+        try:
+            update_manual_review_telegram(revid)
+        except Exception as exc:
+            print("⚠️ Falha ao atualizar revisão no Telegram:", revid, safe_exception(exc))
+
+
 def process_oauth_manual_review(state_item, profile):
     username = str(profile.get("username") or "").strip()
     if not username or profile.get("blocked"):
@@ -18209,6 +18285,14 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
             code = (q.get("code") or [""])[0]
             try:
                 profile = _oauth_exchange(code)
+                if state["action"] == "batch":
+                    applied = process_oauth_manual_review_batch(state, profile)
+                    separator = "&" if "?" in state["return_to"] else "?"
+                    result = urlencode({
+                        "telesgram_review": "batch", "reviewed": ",".join(applied),
+                        "skipped": len(state["reviews"]) - len(applied),
+                    })
+                    return self._redirect(state["return_to"] + separator + result)
                 username = process_oauth_manual_review(state, profile)
                 target = state["return_to"] + ("&" if "?" in state["return_to"] else "?") + urlencode({"telesgram_review":"ok", "reviewer":username})
                 return self._redirect(target)
@@ -18255,10 +18339,11 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
                 else:
                     form = parse_qs(raw)
                     payload = {key: (values[0] if values else "") for key, values in form.items()}
-                revid = int(payload.get("revid"))
                 action = str(payload.get("action") or "")
-                if action not in ("clean", "vandalism", "falsepos", "undo"):
+                if action not in ("clean", "vandalism", "falsepos", "undo", "batch"):
                     raise ValueError("Ação inválida")
+                reviews = parse_manual_review_batch(payload.get("reviews")) if action == "batch" else None
+                revid = None if reviews is not None else int(payload.get("revid"))
                 if action == "falsepos":
                     record, availability = get_high_risk_false_positive_record(
                         revid
@@ -18275,7 +18360,7 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
                             "Alerta não encontrado",
                             "Não encontrei os dados deste alerta de alto risco.",
                         )
-                state = _new_oauth_state(revid, action, payload.get("return_to"))
+                state = _new_oauth_state(revid, action, payload.get("return_to"), reviews=reviews)
                 auth_url = OAUTH_AUTHORIZE_URL + "?" + urlencode({
                     "client_id": OAUTH_CLIENT_ID,
                     "response_type": "code",
