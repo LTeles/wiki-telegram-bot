@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.11"
-BOT_BUILD = "4.2.11-batch-progress"
+BOT_VERSION = "4.2.12"
+BOT_BUILD = "4.2.12-card-removal"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2896,6 +2896,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.12": "Permite retirar cards com conteúdo inadequado da lista e dos arquivos de alto risco.",
     "4.2.11": "Mostra o andamento das avaliações em lote e libera o retorno antes da sincronização externa.",
     "4.2.10": "Mantém links e cores do calendário enquanto os arquivos diários são sincronizados.",
     "4.2.9": "Permite enviar várias avaliações manuais com uma única autenticação.",
@@ -16391,8 +16392,7 @@ def load_high_risk_archive():
 
 def save_high_risk_archive():
     with high_risk_archive_lock:
-        snapshot = dict(high_risk_archive)
-    atomic_write_json(HIGH_RISK_ARCHIVE_FILE, snapshot)
+        atomic_write_json(HIGH_RISK_ARCHIVE_FILE, high_risk_archive)
 
 
 def get_high_risk_false_positive_record(revision_id, now=None):
@@ -16749,6 +16749,8 @@ def _archive_approved_candidate(candidate):
     record["ptwiki_verification"] = candidate.get("decision")
     record["archive_date"] = high_risk_record_date(record)
     with high_risk_archive_lock:
+        if (high_risk_archive.get(revision_id) or {}).get("wiki_removed"):
+            return
         high_risk_archive[revision_id] = record
     save_high_risk_archive()
     queue_high_risk_daily_archive_update(
@@ -16791,6 +16793,8 @@ def _archive_deferred_candidate(candidate, result, now=None):
 
     with high_risk_archive_lock:
         existing = high_risk_archive.get(revision_id)
+        if (existing or {}).get("wiki_removed"):
+            return
         old = dict(existing) if isinstance(existing, dict) else {}
         record = dict(old or candidate)
         if not old:
@@ -16974,7 +16978,7 @@ def revalidate_approved_high_risk_candidates(now=None):
             _save_high_risk_candidate_state(state)
         with high_risk_archive_lock:
             archived = high_risk_archive.get(str(revision_id))
-            if isinstance(archived, dict):
+            if isinstance(archived, dict) and not archived.get("wiki_removed"):
                 posted = _candidate_posted_record(revision_id)
                 posted_status = posted.get("status") if posted else None
                 if posted_status and high_risk_action(posted)[0] is not None:
@@ -17102,7 +17106,7 @@ def mark_high_risk_candidates_published(revision_ids, published_at=None):
     with high_risk_archive_lock:
         for key, stamp in first_publications.items():
             record = high_risk_archive.get(key)
-            if isinstance(record, dict) and not record.get("published_at"):
+            if isinstance(record, dict) and not record.get("wiki_removed") and not record.get("published_at"):
                 record["published_at"] = stamp
                 archive_changed = True
     if archive_changed:
@@ -17118,6 +17122,8 @@ def sync_high_risk_archive():
         # Never introduce a new revision here. Admission to the public archive
         # happens only after the two-hour verifier approves the candidate.
         for revision_id, archived in list(high_risk_archive.items()):
+            if archived.get("wiki_removed"):
+                continue
             record = current.get(str(revision_id))
             if not isinstance(record, dict):
                 continue
@@ -17155,7 +17161,7 @@ def normalize_high_risk_archive_dates():
     affected_days = set()
     with high_risk_archive_lock:
         for record in high_risk_archive.values():
-            if not isinstance(record, dict):
+            if not isinstance(record, dict) or record.get("wiki_removed"):
                 continue
             expected_day = high_risk_record_date(record)
             current_day = str(record.get("archive_date") or "")
@@ -17727,7 +17733,10 @@ def queue_high_risk_manual_refreshes(revision_ids):
             high_risk_archive.get(str(int(revid))) or {}
             for revid in revision_ids
         ]
-        records = [record for record in records if record.get("ptwiki_delay_verified") is True]
+        records = [
+            record for record in records
+            if record.get("ptwiki_delay_verified") is True or record.get("wiki_removed")
+        ]
         days = {str(record.get("archive_date") or "") for record in records}
     if not records:
         return False
@@ -17995,6 +18004,7 @@ def testwiki_write_once():
 def ptwiki_high_risk_worker():
     last_manual_review_check = 0.0
     last_archive_reconcile = 0.0
+    restored_removals = False
     while True:
         try:
             if time.time() - last_manual_review_check >= HIGH_RISK_MANUAL_REVIEW_INTERVAL_SECONDS:
@@ -18003,6 +18013,14 @@ def ptwiki_high_risk_worker():
                 last_manual_review_check = time.time()
             process_due_high_risk_candidates()
             queue_high_risk_wiki_pages()
+            if not restored_removals and high_risk_publish_enabled() and not high_risk_writing_paused():
+                with high_risk_archive_lock:
+                    removed = [
+                        revid for revid, record in high_risk_archive.items()
+                        if record.get("wiki_removed")
+                    ]
+                queue_high_risk_manual_refreshes(removed)
+                restored_removals = True
             if time.time() - last_archive_reconcile >= HIGH_RISK_HOURLY_RECONCILE_SECONDS:
                 # Retry on next loop if the scan itself fails.
                 reconcile_recent_high_risk_daily_pages()
@@ -18299,6 +18317,29 @@ def start_manual_review_batch(state, code):
     return token
 
 
+def remove_high_risk_wiki_card(revid):
+    """Discard the public card payload and keep only its exclusion marker."""
+    key = str(int(revid))
+    # Serialize against the queue worker so a previously prepared card cannot
+    # be written after the removal has been recorded.
+    with WIKI_WRITE_LOCK:
+        with high_risk_archive_lock:
+            previous = high_risk_archive.get(key) or {}
+            if not previous.get("wiki_removed"):
+                if previous.get("ptwiki_delay_verified") is not True:
+                    raise ValueError("Cartão indisponível")
+                high_risk_archive[key] = {
+                    "wiki_removed": True,
+                    "archive_date": previous.get("archive_date") or high_risk_record_date(previous),
+                }
+                try:
+                    atomic_write_json(HIGH_RISK_ARCHIVE_FILE, high_risk_archive)
+                except Exception:
+                    high_risk_archive[key] = previous
+                    raise
+        queue_high_risk_manual_refresh(revid)
+
+
 def process_oauth_manual_review(state_item, profile):
     username = str(profile.get("username") or "").strip()
     if not username or profile.get("blocked"):
@@ -18308,8 +18349,11 @@ def process_oauth_manual_review(state_item, profile):
         raise PermissionError("Conta sem grupo autorizado na Wikipédia em português")
     revid = int(state_item["revid"])
     action = str(state_item["action"])
-    if action not in ("clean", "vandalism", "falsepos", "undo"):
+    if action not in ("clean", "vandalism", "falsepos", "undo", "remove"):
         raise ValueError("Ação inválida")
+    if action == "remove":
+        remove_high_risk_wiki_card(revid)
+        return username
     if action == "falsepos":
         apply_wiki_false_positive(revid, username)
         return username
@@ -18389,7 +18433,12 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
                     return self._redirect("/review/progress?" + urlencode({"id": token}))
                 profile = _oauth_exchange(code)
                 username = process_oauth_manual_review(state, profile)
-                target = state["return_to"] + ("&" if "?" in state["return_to"] else "?") + urlencode({"telesgram_review":"ok", "reviewer":username})
+                result = (
+                    {"telesgram_review": "removed", "reviewed": state["revid"]}
+                    if state["action"] == "remove"
+                    else {"telesgram_review": "ok", "reviewer": username}
+                )
+                target = state["return_to"] + ("&" if "?" in state["return_to"] else "?") + urlencode(result)
                 return self._redirect(target)
             except PermissionError as exc:
                 return self._html(403, "Revisão não autorizada", str(exc))
@@ -18435,7 +18484,7 @@ class ManualReviewHTTPHandler(BaseHTTPRequestHandler):
                     form = parse_qs(raw)
                     payload = {key: (values[0] if values else "") for key, values in form.items()}
                 action = str(payload.get("action") or "")
-                if action not in ("clean", "vandalism", "falsepos", "undo", "batch"):
+                if action not in ("clean", "vandalism", "falsepos", "undo", "batch", "remove"):
                     raise ValueError("Ação inválida")
                 reviews = parse_manual_review_batch(payload.get("reviews")) if action == "batch" else None
                 revid = None if reviews is not None else int(payload.get("revid"))
