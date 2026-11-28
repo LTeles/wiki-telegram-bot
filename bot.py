@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.13"
-BOT_BUILD = "4.2.13-status-utc"
+BOT_VERSION = "4.2.14"
+BOT_BUILD = "4.2.14-adjustment-categories"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2896,6 +2896,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.14": "Reclassifica registros recentes e permite indicar as categorias das próximas versões.",
     "4.2.13": "Exibe em UTC todos os horários da página Status.",
     "4.2.12": "Permite retirar cards com conteúdo inadequado da lista e dos arquivos de alto risco.",
     "4.2.11": "Mostra o andamento das avaliações em lote e libera o retorno antes da sincronização externa.",
@@ -3012,12 +3013,73 @@ def fetch_wiki_page_wikitext(title):
     return str(slot.get("content") or "")
 
 
+WIKI_RELEASE_CATEGORIES = {
+    "4.2.14": ("WIKI-UI",),
+    "4.2.13": ("WIKI-UI",),
+    "4.2.12": ("WIKI-UI",),
+    "4.2.11": ("WIKI-UI", "CORE"),
+    "4.2.10": ("FIX", "WIKI-UI"),
+    "4.2.9": ("WIKI-UI",),
+    "4.2.8": ("CORE",),
+    "4.2.7": ("WIKI-UI", "RISK-CAL"),
+    "4.2.6": ("CORE",),
+    "4.2.5": ("FIX", "CORE"),
+    "4.2.4": ("FIX", "CORE"),
+    "4.2.3": ("CORE",),
+    "4.2.2": ("CORE",),
+    "4.2.1": ("CORE",),
+    "4.2": ("METRIC", "WIKI-UI"),
+    "4.1": ("CORE", "WIKI-UI", "TG"),
+    "4.0": ("CORE",),
+    "3.58": ("WIKI-UI",),
+    "3.57": ("WIKI-UI",),
+    "3.56": ("WIKI-UI",),
+}
+
+WIKI_RELEASE_CATEGORY_ICONS = {
+    "WIKI-UI": "🖥️", "CORE": "⚙️", "TG": "💬", "FIX": "🐛",
+    "METRIC": "📊", "RISK-CAL": "🎯", "SEC": "🛡️", "INFRA": "🚀",
+}
+
+
+def wiki_release_category_labels(categories):
+    return " · ".join(
+        f"{WIKI_RELEASE_CATEGORY_ICONS.get(category, '📋')} '''{category}'''"
+        for category in categories
+    )
+
+
+def reclassify_wiki_adjustments(wikitext):
+    """Update only generic labels on known log rows; keep dates and descriptions."""
+    pattern = r"""(?m)^(\* <span style="color:#[0-9a-fA-F]{6}">[^\n<]+</span> )⚙️ '''CORE'''( \[v([\d.]+)\][^\n]*)$"""
+
+    def update(match):
+        prefix, tail, version = match.groups()
+        categories = WIKI_RELEASE_CATEGORIES.get(version)
+        # Earlier deployments reused these numbers for the Telegram diff feature.
+        if version == "4.2.9" and "imagem das linhas alteradas" in tail:
+            categories = ("TG",)
+        elif version == "4.2.10" and "imagens de diff" in tail:
+            categories = ("FIX", "TG")
+        if not categories:
+            return match[0]
+        return prefix + wiki_release_category_labels(categories) + tail
+
+    return re.sub(pattern, update, wikitext)
+
+
 def queue_current_adjustments_log():
     """Prepara o registro curto desta versão; a fila global decide quando a ptwiki pode ser editada."""
     marker = f"[v{BOT_VERSION}]"
     current = fetch_wiki_page_wikitext(WIKI_ADJUSTMENTS_TITLE)
+    reclassified = reclassify_wiki_adjustments(current)
     if marker in current:
-        return False
+        if reclassified == current:
+            return False
+        return queue_wiki_edit(
+            WIKI_ADJUSTMENTS_TITLE, reclassified,
+            "Reclassificando ajustes recentes do TelesGramBot",
+        )
     now_utc = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M")
     version_entries = {
         "3.32": [
@@ -3059,13 +3121,17 @@ def queue_current_adjustments_log():
             ("#3366cc", "⏱️", "WIKI-RATE", "CHANGED", "As edições de alto risco passam a ser mais frequentes, com limite global de até três edições por minuto."),
         ],
     }
-    specs = version_entries.get(BOT_VERSION, [
-        ("#72777d", "⚙️", "CORE", "CHANGED", WIKI_RELEASE_NOTES.get(BOT_VERSION, "Ajustes internos do bot.")),
-    ])
-    entries = [
-        f"* <span style=\"color:{color}\">{now_utc}</span> {emoji} '''{code}''' {marker} {status} — {message}"
-        for color, emoji, code, status, message in specs[:3]
-    ]
+    specs = version_entries.get(BOT_VERSION)
+    if specs is None:
+        categories = WIKI_RELEASE_CATEGORIES.get(BOT_VERSION, ("Sem categoria",))
+        labels = wiki_release_category_labels(categories)
+        message = WIKI_RELEASE_NOTES.get(BOT_VERSION, "Ajustes internos do bot.")
+        entries = [f'* <span style="color:#72777d">{now_utc}</span> {labels} {marker} CHANGED — {message}']
+    else:
+        entries = [
+            f"* <span style=\"color:{color}\">{now_utc}</span> {emoji} '''{code}''' {marker} {status} — {message}"
+            for color, emoji, code, status, message in specs[:3]
+        ]
     header = "== Registro de ajustes =="
     legend = (
         "<small>'''Categorias:''' "
@@ -3079,7 +3145,7 @@ def queue_current_adjustments_log():
         "🚀 INFRA = infraestrutura.<br>"
         "''Datas e horários em UTC.''</small>"
     )
-    body = current.strip()
+    body = reclassified.strip()
     if body.startswith(header):
         body = body[len(header):].lstrip()
         body = re.sub(r"^<small>'''Categorias:'''[\s\S]*?</small>\s*", "", body, count=1)
