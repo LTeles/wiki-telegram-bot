@@ -34,8 +34,8 @@ def data_path(filename):
 # CONFIGURAÇÃO
 # =========================================================
 
-BOT_VERSION = "4.2.12"
-BOT_BUILD = "4.2.12-card-removal"
+BOT_VERSION = "4.2.13"
+BOT_BUILD = "4.2.13-status-utc"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL_ID", "@ptwiki")
@@ -2896,6 +2896,7 @@ def build_wiki_observations_wikitext():
 
 # Histórico explícito: nunca inferir notas de versões anteriores.
 WIKI_RELEASE_NOTES = {
+    "4.2.13": "Exibe em UTC todos os horários da página Status.",
     "4.2.12": "Permite retirar cards com conteúdo inadequado da lista e dos arquivos de alto risco.",
     "4.2.11": "Mostra o andamento das avaliações em lote e libera o retorno antes da sincronização externa.",
     "4.2.10": "Mantém links e cores do calendário enquanto os arquivos diários são sincronizados.",
@@ -3109,7 +3110,7 @@ def wiki_record_release():
 def status_clock(value):
     if not value:
         return "Sem registro"
-    return datetime.fromtimestamp(value, ZoneInfo(REPORT_TIMEZONE)).strftime("%d/%m/%Y às %H:%M:%S")
+    return datetime.fromtimestamp(value, timezone.utc).strftime("%d/%m/%Y às %H:%M:%S UTC")
 
 
 def initialize_status_coverage():
@@ -3423,8 +3424,8 @@ def build_wiki_status_wikitext():
         lines.extend(["|-", f'| colspan="2" | <small>{coverage}</small>'])
     lines.extend([
         "|}", f"'''{health}''' · {BOT_VERSION}",
-        f"* '''Última atualização do Status''': {status_clock(now)} (Brasília)",
-        f"* '''Próxima atualização prevista''': {status_clock(next_update)} (Brasília)",
+        f"* '''Última atualização do Status''': {status_clock(now)}",
+        f"* '''Próxima atualização prevista''': {status_clock(next_update)}",
         "* Se o horário previsto já passou, consulte a data acima para avaliar se o Status está desatualizado.",
         f"* '''EventStreams''': {'com atividade recente' if connected else 'sem atividade recente ou desconectado'} · último evento {status_clock(last_event)}",
         f"* '''Escrita na Wikipédia''': {wiki_state_label(editing)} · última confirmação {status_clock(state.get('last_success_at'))}",
@@ -3437,7 +3438,7 @@ def build_wiki_status_wikitext():
         safe = wiki_preview_spam_safe_text(safe)
         lines.extend(["== Comunicado operacional ==",
                       '<div style="border-inline-start:4px solid #ac6600;padding:.7em 1em;">',
-                      f"'''{status_clock(notice['at'])} (Brasília)'''<br />" + "<br />".join(safe.splitlines()),
+                      f"'''{status_clock(notice['at'])}'''<br />" + "<br />".join(safe.splitlines()),
                       "</div>"])
     lines.extend(wiki_status_incidents(now, telemetry, state))
     lines.extend(["== Fila de publicação ==", f"'''{len(pending)}''' páginas aguardando escrita."])
